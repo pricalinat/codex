@@ -36,6 +36,16 @@ from .confidence_analysis import (
     UncertaintyType,
     analyze_confidence,
 )
+from .ingestion_pipeline import (
+    IngestionHandler,
+    IngestionProgress,
+    PipelineConfig,
+    PipelineResult,
+    ProcessingResult,
+    SourceConfig,
+    UnifiedIngestionPipeline,
+    create_unified_pipeline,
+)
 from .models import AnalysisResult, FailureRecord, FixSuggestion
 from .prompt_strategy import (
     AnalysisPromptConfig,
@@ -215,4 +225,13 @@ __all__ = [
     "OCRResult",
     "ProcessedArtifact",
     "TableExtractor",
+    # Unified ingestion pipeline exports
+    "IngestionHandler",
+    "IngestionProgress",
+    "PipelineConfig",
+    "PipelineResult",
+    "ProcessingResult",
+    "SourceConfig",
+    "UnifiedIngestionPipeline",
+    "create_unified_pipeline",
 ]

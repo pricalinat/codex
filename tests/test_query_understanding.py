@@ -2,7 +2,7 @@
 
 import pytest
 
-from test_analysis_assistant.query_understanding import (
+from src.test_analysis_assistant.query_understanding import (
     ContextualVariant,
     IntentClassification,
     QueryIntent,

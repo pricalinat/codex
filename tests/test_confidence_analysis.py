@@ -2,7 +2,7 @@
 
 import pytest
 
-from test_analysis_assistant.confidence_analysis import (
+from src.test_analysis_assistant.confidence_analysis import (
     CalibrationMetrics,
     ConfidenceBand,
     ConfidenceInterval,
@@ -150,7 +150,7 @@ class TestConfidenceIntervalAnalyzer:
 
     def test_analyze_with_retrieval_evidence(self):
         """Test confidence analysis with retrieval evidence."""
-        from test_analysis_assistant.retrieval import QueryPlan, SourceType
+        from src.test_analysis_assistant.retrieval import QueryPlan, SourceType
 
         analyzer = ConfidenceIntervalAnalyzer()
 
@@ -176,7 +176,7 @@ class TestConfidenceIntervalAnalyzer:
 
     def test_analyze_with_analysis_result(self):
         """Test confidence analysis with analysis result."""
-        from test_analysis_assistant.models import AnalysisResult, FailureCluster, FailureRecord
+        from src.test_analysis_assistant.models import AnalysisResult, FailureCluster, FailureRecord
 
         analyzer = ConfidenceIntervalAnalyzer()
 
@@ -225,7 +225,7 @@ class TestConfidenceIntervalAnalyzer:
 
     def test_wide_interval(self):
         """Test wide interval detection."""
-        from test_analysis_assistant.retrieval import QueryPlan, SourceType
+        from src.test_analysis_assistant.retrieval import QueryPlan, SourceType
 
         analyzer = ConfidenceIntervalAnalyzer()
 
@@ -262,7 +262,7 @@ class TestAnalyzeConfidence:
 
     def test_with_context_chunks(self):
         """Test with context chunks."""
-        from test_analysis_assistant.retrieval import Chunk, SourceType
+        from src.test_analysis_assistant.retrieval import Chunk, SourceType
 
         # Create mock chunks
         mock_chunks = [
@@ -313,7 +313,7 @@ class TestEdgeCases:
 
     def test_recommendations_for_missing_sources(self):
         """Test recommendations include missing sources."""
-        from test_analysis_assistant.retrieval import QueryPlan, SourceType
+        from src.test_analysis_assistant.retrieval import QueryPlan, SourceType
 
         analyzer = ConfidenceIntervalAnalyzer()
 
