@@ -2308,5 +2308,279 @@ class TestHybridRetrievalEngine(unittest.TestCase):
         self.assertIn("ocr", prompt.lower())
 
 
+class TestQueryExpansion(unittest.TestCase):
+    """Tests for query expansion functionality."""
+
+    def test_query_expander_basic(self):
+        """Test basic query expansion with synonyms."""
+        from src.test_analysis_assistant.retrieval import QueryExpander
+
+        expander = QueryExpander(max_expansions=5)
+        expanded = expander.expand("test failure")
+
+        # Should include original tokens plus synonyms
+        self.assertIn("test", expanded)
+        self.assertIn("failure", expanded)
+        # Should have added some synonyms
+        self.assertGreater(len(expanded), 2)
+
+    def test_query_expander_expands_failure_synonyms(self):
+        """Test that failure synonyms are expanded."""
+        from src.test_analysis_assistant.retrieval import QueryExpander
+
+        expander = QueryExpander(max_expansions=10)
+        expanded = expander.expand("failure")
+
+        # Should include failure and its synonyms
+        self.assertIn("failure", expanded)
+        synonyms = {"fail", "error", "broken", "crash", "defect", "bug"}
+        found_synonyms = [s for s in expanded if s in synonyms]
+        self.assertGreater(len(found_synonyms), 0)
+
+    def test_query_expander_expands_error_synonyms(self):
+        """Test that error synonyms are expanded."""
+        from src.test_analysis_assistant.retrieval import QueryExpander
+
+        expander = QueryExpander(max_expansions=10)
+        expanded = expander.expand("error")
+
+        # Should include error and its synonyms
+        self.assertIn("error", expanded)
+        synonyms = {"exception", "failure", "fault", "problem", "issue"}
+        found_synonyms = [s for s in expanded if s in synonyms]
+        self.assertGreater(len(found_synonyms), 0)
+
+    def test_query_expander_max_expansions_limit(self):
+        """Test that max_expansions limits the number of added terms."""
+        from src.test_analysis_assistant.retrieval import QueryExpander
+
+        expander = QueryExpander(max_expansions=2)
+        expanded = expander.expand("test failure error")
+
+        # Original tokens: test, failure, error (3 tokens)
+        # Should add at most 2 more
+        self.assertLessEqual(len(expanded), 5)
+
+    def test_query_expander_expand_query_text(self):
+        """Test expand_query_text returns a string."""
+        from src.test_analysis_assistant.retrieval import QueryExpander
+
+        expander = QueryExpander()
+        result = expander.expand_query_text("test failure")
+
+        self.assertIsInstance(result, str)
+        self.assertIn("test", result)
+        self.assertIn("failure", result)
+
+    def test_expand_query_convenience_function(self):
+        """Test the expand_query convenience function."""
+        from src.test_analysis_assistant.retrieval import expand_query
+
+        result = expand_query("test error")
+
+        self.assertIsInstance(result, list)
+        self.assertIn("test", result)
+        self.assertIn("error", result)
+
+
+class TestEnhancedIntentDetection(unittest.TestCase):
+    """Tests for enhanced intent detection."""
+
+    def test_detect_intents_failure_clustering(self):
+        """Test detection of failure clustering intent."""
+        from src.test_analysis_assistant.retrieval import detect_intents
+
+        intents = detect_intents("cluster similar failures pattern recurring")
+
+        intent_names = [name for name, _ in intents]
+        self.assertIn("failure_clustering", intent_names)
+
+    def test_detect_intents_root_cause(self):
+        """Test detection of root cause intent."""
+        from src.test_analysis_assistant.retrieval import detect_intents
+
+        intents = detect_intents("root cause analysis hypothesis why")
+
+        intent_names = [name for name, _ in intents]
+        self.assertIn("root_cause", intent_names)
+
+    def test_detect_intents_test_gap(self):
+        """Test detection of test gap intent."""
+        from src.test_analysis_assistant.retrieval import detect_intents
+
+        intents = detect_intents("missing test coverage gap untested")
+
+        intent_names = [name for name, _ in intents]
+        self.assertIn("test_gap", intent_names)
+
+    def test_detect_intents_risk_prioritization(self):
+        """Test detection of risk prioritization intent."""
+        from src.test_analysis_assistant.retrieval import detect_intents
+
+        intents = detect_intents("risk priority blocking release p0 critical")
+
+        intent_names = [name for name, _ in intents]
+        self.assertIn("risk_prioritization", intent_names)
+
+    def test_detect_intents_actionable_plan(self):
+        """Test detection of actionable plan intent."""
+        from src.test_analysis_assistant.retrieval import detect_intents
+
+        intents = detect_intents("actionable plan mitigation next steps roadmap")
+
+        intent_names = [name for name, _ in intents]
+        self.assertIn("actionable_plan", intent_names)
+
+    def test_detect_intents_code_analysis(self):
+        """Test detection of code analysis intent."""
+        from src.test_analysis_assistant.retrieval import detect_intents
+
+        intents = detect_intents("code function class module implementation logic")
+
+        intent_names = [name for name, _ in intents]
+        self.assertIn("code_analysis", intent_names)
+
+    def test_detect_intents_returns_confidence_scores(self):
+        """Test that detect_intents returns confidence scores."""
+        from src.test_analysis_assistant.retrieval import detect_intents
+
+        intents = detect_intents("test failure")
+
+        self.assertIsInstance(intents, list)
+        for name, confidence in intents:
+            self.assertIsInstance(name, str)
+            self.assertIsInstance(confidence, float)
+            self.assertGreaterEqual(confidence, 0.0)
+            self.assertLessEqual(confidence, 1.0)
+
+    def test_get_source_priority_for_intent(self):
+        """Test source priority retrieval for specific intents."""
+        from src.test_analysis_assistant.retrieval import (
+            SourceType,
+            get_source_priority_for_intent,
+        )
+
+        priority = get_source_priority_for_intent("test_gap")
+
+        self.assertIsInstance(priority, list)
+        self.assertGreater(len(priority), 0)
+        # First priority should be requirements for test_gap
+        self.assertEqual(priority[0], SourceType.REQUIREMENTS)
+
+    def test_get_source_priority_for_unknown_intent(self):
+        """Test source priority for unknown intent returns defaults."""
+        from src.test_analysis_assistant.retrieval import get_source_priority_for_intent
+
+        priority = get_source_priority_for_intent("unknown_intent")
+
+        # Should return default priorities
+        self.assertIsInstance(priority, list)
+        self.assertGreater(len(priority), 0)
+
+
+class TestComprehensiveConfidenceScoring(unittest.TestCase):
+    """Tests for comprehensive confidence scoring."""
+
+    def test_compute_comprehensive_confidence_basic(self):
+        """Test basic comprehensive confidence computation."""
+        from src.test_analysis_assistant.retrieval import (
+            Chunk,
+            SourceType,
+            compute_comprehensive_confidence,
+        )
+
+        chunk = Chunk(
+            chunk_id="test-1",
+            source_id="test-source",
+            source_type=SourceType.REQUIREMENTS,
+            modality="text",
+            text="Test failure analysis content",
+            token_count=10,
+            metadata={"extraction_confidence": 0.9},
+        )
+
+        confidence = compute_comprehensive_confidence(
+            chunk=chunk,
+            query_tokens=["test", "failure", "analysis"],
+            matched_terms=["test", "failure"],
+            score_breakdown={"lexical": 0.5},
+            rank=0,
+            total_results=5,
+            intent_confidence=0.8,
+            source_diversity_bonus=0.5,
+        )
+
+        self.assertGreater(confidence, 0.0)
+        self.assertLessEqual(confidence, 1.0)
+
+    def test_compute_comprehensive_confidence_no_matches(self):
+        """Test confidence with no matched terms returns zero."""
+        from src.test_analysis_assistant.retrieval import (
+            Chunk,
+            SourceType,
+            compute_comprehensive_confidence,
+        )
+
+        chunk = Chunk(
+            chunk_id="test-2",
+            source_id="test-source",
+            source_type=SourceType.KNOWLEDGE,
+            modality="text",
+            text="Unrelated content",
+            token_count=5,
+            metadata={},
+        )
+
+        confidence = compute_comprehensive_confidence(
+            chunk=chunk,
+            query_tokens=["test", "failure"],
+            matched_terms=[],
+            score_breakdown={},
+            rank=0,
+            total_results=5,
+        )
+
+        self.assertEqual(confidence, 0.0)
+
+    def test_compute_comprehensive_confidence_high_rank_decay(self):
+        """Test that higher ranks get lower confidence."""
+        from src.test_analysis_assistant.retrieval import (
+            Chunk,
+            SourceType,
+            compute_comprehensive_confidence,
+        )
+
+        chunk = Chunk(
+            chunk_id="test-3",
+            source_id="test-source",
+            source_type=SourceType.CODE_SNIPPET,
+            modality="code",
+            text="def test_func(): pass",
+            token_count=8,
+            metadata={"extraction_confidence": 0.9},
+        )
+
+        confidence_rank_0 = compute_comprehensive_confidence(
+            chunk=chunk,
+            query_tokens=["test", "function"],
+            matched_terms=["test"],
+            score_breakdown={},
+            rank=0,
+            total_results=10,
+        )
+
+        confidence_rank_5 = compute_comprehensive_confidence(
+            chunk=chunk,
+            query_tokens=["test", "function"],
+            matched_terms=["test"],
+            score_breakdown={},
+            rank=5,
+            total_results=10,
+        )
+
+        # Higher rank should have lower confidence
+        self.assertGreater(confidence_rank_0, confidence_rank_5)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4262,3 +4262,309 @@ def _build_source_summary_chunks(chunks: Sequence[Chunk]) -> List[Chunk]:
         )
 
     return summary_chunks
+
+
+# =============================================================================
+# Query Expansion Module - Improves recall through synonym expansion
+# =============================================================================
+
+# Domain-specific synonyms for test analysis
+_TEST_ANALYSIS_SYNONYMS: Dict[str, Set[str]] = {
+    "failure": {"fail", "error", "broken", "crash", "defect", "bug", "issue"},
+    "test": {"testing", "spec", "check", "validation", "assertion"},
+    "assertion": {"assert", "check", "verify", "validate", "expect"},
+    "error": {"exception", "failure", "fault", "problem", "issue"},
+    "exception": {"error", "failure", "fault", "throw", "raised"},
+    "timeout": {"timed_out", "timeout_error", "elapsed", "duration", "slow"},
+    "permission": {"access", "denied", "unauthorized", "forbidden", "auth"},
+    "authentication": {"auth", "login", "credential", "token", "session"},
+    "connection": {"connect", "network", "socket", "link", "endpoint"},
+    "database": {"db", "sql", "query", "storage", "data"},
+    "memory": {"ram", "heap", "allocation", "leak", "out_of_memory"},
+    "performance": {"speed", "latency", "throughput", "optimization", "slow"},
+    "coverage": {"tested", "covered", "untested", "gap", "missing"},
+    "requirement": {"req", "specification", "spec", "need", "feature"},
+    "root_cause": {"cause", "origin", "source", "reason", "why"},
+    "risk": {"danger", "threat", "blocking", "critical", "severity"},
+    "actionable": {"mitigation", "fix", "solution", "remediation", "plan"},
+    "cluster": {"group", "pattern", "category", "similar", "related"},
+    "hypothesis": {"theory", "guess", "assumption", "likely", "possible"},
+    "missing": {"absent", "not_found", "undefined", "none", "unavailable"},
+    "invalid": {"wrong", "bad", "incorrect", "malformed", "corrupt"},
+    "unexpected": {"unexpected", "unanticipated", "surprise", "edge_case"},
+}
+
+# Semantic expansion terms for test analysis
+_SEMANTIC_EXPANSIONS: Dict[str, List[str]] = {
+    "module_not_found": ["import", "missing_module", "dependency", "install", "package"],
+    "type_error": ["type_mismatch", "unsupported_operand", "cannot", "conversion"],
+    "assertion_error": ["assert", "expected", "actual", "comparison", "equality"],
+    "connection_error": ["connect", "refused", "timeout", "network", "host"],
+    "permission_error": ["access_denied", "unauthorized", "forbidden", "auth"],
+    "syntax_error": ["parse", "invalid_syntax", "expected", "token"],
+    "value_error": ["invalid_value", "wrong_value", "illegal", "parameter"],
+    "runtime_error": ["execution", "occurred", "failed", "during"],
+}
+
+
+class QueryExpander:
+    """Expands queries using synonyms and semantic expansions for better recall.
+
+    This class provides query expansion capabilities to improve retrieval recall
+    by adding synonyms, related terms, and domain-specific expansions.
+    """
+
+    def __init__(
+        self,
+        max_expansions: int = 10,
+        include_semantic: bool = True,
+        expansion_weight: float = 0.3,
+    ) -> None:
+        """Initialize the query expander.
+
+        Args:
+            max_expansions: Maximum number of expansion terms to add
+            include_semantic: Whether to include semantic expansions
+            expansion_weight: Weight for expansion terms in scoring
+        """
+        self._max_expansions = max_expansions
+        self._include_semantic = include_semantic
+        self._expansion_weight = expansion_weight
+
+    @property
+    def expansion_weight(self) -> float:
+        """Return the weight for expansion terms."""
+        return self._expansion_weight
+
+    def expand(self, query_text: str) -> List[str]:
+        """Expand query with synonyms and related terms.
+
+        Args:
+            query_text: Original query text
+
+        Returns:
+            List of expanded query terms including original and synonyms
+        """
+        tokens = _tokenize(query_text)
+        original_tokens = set(tokens)
+        expanded_tokens: List[str] = list(original_tokens)
+
+        # Add synonym expansions
+        for token in tokens:
+            normalized = token.lower()
+            if normalized in _TEST_ANALYSIS_SYNONYMS:
+                synonyms = _TEST_ANALYSIS_SYNONYMS[normalized]
+                for syn in synonyms:
+                    if syn not in original_tokens:
+                        expanded_tokens.append(syn)
+
+        # Add semantic expansions based on detected patterns
+        if self._include_semantic:
+            query_lower = query_text.lower()
+            for pattern, expansions in _SEMANTIC_EXPANSIONS.items():
+                if pattern.replace("_", " ") in query_lower or pattern in query_lower:
+                    for exp in expansions:
+                        if exp not in original_tokens:
+                            expanded_tokens.append(exp)
+
+        # Limit total expansions
+        if len(expanded_tokens) > len(original_tokens) + self._max_expansions:
+            # Keep original tokens, add expansions up to limit
+            original_count = len(original_tokens)
+            remaining = self._max_expansions
+            final_tokens = list(original_tokens)
+            for token in expanded_tokens:
+                if token not in original_tokens and remaining > 0:
+                    final_tokens.append(token)
+                    remaining -= 1
+            expanded_tokens = final_tokens
+
+        return expanded_tokens
+
+    def expand_query_text(self, query_text: str) -> str:
+        """Expand query text into a larger query string.
+
+        Args:
+            query_text: Original query text
+
+        Returns:
+            Expanded query string with synonyms
+        """
+        expanded = self.expand(query_text)
+        return " ".join(expanded)
+
+
+def expand_query(query_text: str, max_expansions: int = 10) -> List[str]:
+    """Convenience function to expand a query.
+
+    Args:
+        query_text: Original query text
+        max_expansions: Maximum number of expansion terms
+
+    Returns:
+        List of expanded query terms
+    """
+    expander = QueryExpander(max_expansions=max_expansions)
+    return expander.expand(query_text)
+
+
+# =============================================================================
+# Enhanced Intent Detection - More sophisticated intent patterns
+# =============================================================================
+
+# Enhanced intent patterns with weights
+_ENHANCED_INTENT_PATTERNS: Dict[str, Dict[str, Any]] = {
+    "failure_clustering": {
+        "keywords": {"cluster", "group", "pattern", "recurring", "flaky", "flake", "similar", "duplicate"},
+        "weight": 1.0,
+        "source_priority": [SourceType.REPOSITORY, SourceType.CODE_SNIPPET, SourceType.SYSTEM_ANALYSIS],
+    },
+    "root_cause": {
+        "keywords": {"root", "cause", "traceback", "hypothesis", "why", "because", "origin", "source"},
+        "weight": 1.0,
+        "source_priority": [SourceType.CODE_SNIPPET, SourceType.SYSTEM_ANALYSIS, SourceType.REPOSITORY],
+    },
+    "test_gap": {
+        "keywords": {"gap", "missing", "coverage", "untested", "negative", "edge", "boundary", "uncovered"},
+        "weight": 1.0,
+        "source_priority": [SourceType.REQUIREMENTS, SourceType.SYSTEM_ANALYSIS, SourceType.REPOSITORY],
+    },
+    "risk_prioritization": {
+        "keywords": {"risk", "prioritize", "priority", "blocking", "release", "p0", "critical", "severity"},
+        "weight": 1.0,
+        "source_priority": [SourceType.REQUIREMENTS, SourceType.SYSTEM_ANALYSIS, SourceType.KNOWLEDGE],
+    },
+    "actionable_plan": {
+        "keywords": {"plan", "mitigation", "next", "actions", "roadmap", "fix", "solution", "remediation"},
+        "weight": 1.0,
+        "source_priority": [SourceType.REQUIREMENTS, SourceType.SYSTEM_ANALYSIS, SourceType.CODE_SNIPPET],
+    },
+    "code_analysis": {
+        "keywords": {"code", "function", "class", "module", "implementation", "logic", "algorithm"},
+        "weight": 0.8,
+        "source_priority": [SourceType.CODE_SNIPPET, SourceType.REPOSITORY, SourceType.SYSTEM_ANALYSIS],
+    },
+    "environment": {
+        "keywords": {"environment", "config", "setup", "installation", "dependency", "version", "python"},
+        "weight": 0.9,
+        "source_priority": [SourceType.SYSTEM_ANALYSIS, SourceType.REPOSITORY, SourceType.KNOWLEDGE],
+    },
+}
+
+
+def detect_intents(query_text: str) -> List[Tuple[str, float]]:
+    """Detect intents from query text with confidence weights.
+
+    Args:
+        query_text: The query text to analyze
+
+    Returns:
+        List of (intent_name, confidence) tuples sorted by confidence
+    """
+    tokens = set(_tokenize(query_text.lower()))
+    intent_scores: List[Tuple[str, float]] = []
+
+    for intent_name, intent_config in _ENHANCED_INTENT_PATTERNS.items():
+        keywords = intent_config["keywords"]
+        weight = intent_config["weight"]
+
+        matches = tokens.intersection(keywords)
+        if matches:
+            # Score is proportion of matched keywords times weight
+            score = (len(matches) / len(keywords)) * weight
+            intent_scores.append((intent_name, min(score, 1.0)))
+
+    # Sort by score descending
+    intent_scores.sort(key=lambda x: -x[1])
+    return intent_scores
+
+
+def get_source_priority_for_intent(intent: str) -> List[SourceType]:
+    """Get source type priority for a specific intent.
+
+    Args:
+        intent: The intent name
+
+    Returns:
+        List of source types in priority order
+    """
+    if intent in _ENHANCED_INTENT_PATTERNS:
+        return _ENHANCED_INTENT_PATTERNS[intent]["source_priority"]
+    return [
+        SourceType.REQUIREMENTS,
+        SourceType.SYSTEM_ANALYSIS,
+        SourceType.CODE_SNIPPET,
+        SourceType.REPOSITORY,
+        SourceType.KNOWLEDGE,
+    ]
+
+
+# =============================================================================
+# Improved confidence scoring with more factors
+# =============================================================================
+
+def compute_comprehensive_confidence(
+    chunk: Chunk,
+    query_tokens: List[str],
+    matched_terms: List[str],
+    score_breakdown: Dict[str, float],
+    rank: int,
+    total_results: int,
+    intent_confidence: float = 0.5,
+    source_diversity_bonus: float = 0.0,
+) -> float:
+    """Compute comprehensive confidence with multiple factors.
+
+    This function computes a comprehensive confidence score that considers
+    multiple factors including: match quality, position, source reliability,
+    extraction quality, and intent alignment.
+
+    Args:
+        chunk: The retrieved chunk
+        query_tokens: Original query tokens
+        matched_terms: Terms that matched in the chunk
+        score_breakdown: Detailed score breakdown from retrieval
+        rank: Position in ranked results (0-indexed)
+        total_results: Total number of results
+        intent_confidence: Confidence from intent detection (0-1)
+        source_diversity_bonus: Bonus for source diversity (0-1)
+
+    Returns:
+        Comprehensive confidence score (0-1)
+    """
+    if not matched_terms or total_results == 0:
+        return 0.0
+
+    # Base match quality (0-0.3)
+    match_ratio = len(matched_terms) / max(len(query_tokens), 1)
+    match_quality = min(match_ratio * 0.3, 0.3)
+
+    # Position decay (0-0.15) - higher ranks get more confidence
+    position_factor = 1.0 / (1.0 + rank * 0.1)
+    position_score = position_factor * 0.15
+
+    # Source reliability (0-0.15)
+    reliability = _source_reliability(chunk)
+    reliability_score = reliability * 0.15
+
+    # Extraction quality (0-0.15)
+    extraction = _extraction_quality(chunk)
+    extraction_score = extraction * 0.15
+
+    # Intent alignment (0-0.15)
+    intent_score = intent_confidence * 0.15
+
+    # Source diversity bonus (0-0.1)
+    diversity_score = source_diversity_bonus * 0.1
+
+    # Combine scores
+    total = (
+        match_quality
+        + position_score
+        + reliability_score
+        + extraction_score
+        + intent_score
+        + diversity_score
+    )
+
+    return min(round(total, 4), 1.0)
