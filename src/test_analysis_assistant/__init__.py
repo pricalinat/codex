@@ -15,7 +15,13 @@ from .code_chunker import (
     detect_language,
 )
 from .models import AnalysisResult, FailureRecord, FixSuggestion
-from .rag_analyzer import RAGAnalyzer, RAGAnalysisResult, RetrievalInsight, rag_analyze
+from .rag_analyzer import (
+    ChunkerType,
+    RAGAnalyzer,
+    RAGAnalysisResult,
+    RetrievalInsight,
+    rag_analyze,
+)
 from .retrieval import (
     CodeAwareIngestor,
     DummyEmbeddingProvider,
@@ -26,6 +32,7 @@ from .retrieval import (
     SourceType,
     TFIDFEmbeddingProvider,
     build_analysis_prompt,
+    compute_enhanced_confidence,
     create_code_aware_engine,
     create_hybrid_engine,
 )
@@ -47,6 +54,7 @@ from .store import (
 __all__ = [
     "analyze_report_text",
     "AnalysisResult",
+    "ChunkerType",
     "FailureRecord",
     "FixSuggestion",
     "IngestDocument",
@@ -57,6 +65,7 @@ __all__ = [
     "RetrievalEngine",
     "SourceType",
     "build_analysis_prompt",
+    "compute_enhanced_confidence",
     "rag_analyze",
     "HybridRetrievalEngine",
     "DummyEmbeddingProvider",

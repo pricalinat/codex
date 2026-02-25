@@ -17,6 +17,85 @@ from src.test_analysis_assistant.retrieval import (
 
 
 class TestRetrievalPipeline(unittest.TestCase):
+    def test_retrieve_evidence_reports_missing_modalities(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication regressions are release blocking and require triage.",
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table risk matrix for authentication gaps",
+            top_k=2,
+        )
+
+        self.assertTrue(len(evidence.ranked_chunks) > 0)
+        self.assertIn("table", evidence.missing_modalities)
+        self.assertIn("image", evidence.missing_modalities)
+        self.assertIn("image_ocr_stub", evidence.missing_modalities)
+        self.assertIn(evidence.confidence_band, {"low", "medium", "high"})
+
+    def test_query_with_expansion_brings_goal_complementary_source(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-traceback",
+                source_type=SourceType.REPOSITORY,
+                content="Traceback analysis shows root cause in authentication token parser.",
+            ),
+            IngestDocument(
+                source_id="sys-debug",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Failure diagnostics and traceback processing for flaky integration failures.",
+            ),
+            IngestDocument(
+                source_id="req-plan",
+                source_type=SourceType.REQUIREMENTS,
+                content="Actionable mitigation plan and risk prioritization steps for release readiness.",
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        baseline = engine.query("traceback root cause for failing tests", top_k=2, diversify=False)
+        expanded = engine.query_with_expansion(
+            "traceback root cause for failing tests",
+            top_k=3,
+            diversify=False,
+        )
+
+        baseline_sources = {item.chunk.source_id for item in baseline}
+        expanded_sources = {item.chunk.source_id for item in expanded}
+        self.assertNotIn("req-plan", baseline_sources)
+        self.assertIn("req-plan", expanded_sources)
+
+    def test_retrieve_evidence_computes_aggregate_confidence(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication risk requires prioritization and missing test coverage review.",
+            ),
+            IngestDocument(
+                source_id="repo-auth",
+                source_type=SourceType.REPOSITORY,
+                content="Root cause in login flow with missing negative test paths.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence("auth risk prioritization", top_k=2)
+
+        self.assertGreaterEqual(evidence.aggregate_confidence, 0.0)
+        self.assertLessEqual(evidence.aggregate_confidence, 1.0)
+        self.assertIn(evidence.confidence_band, {"low", "medium", "high"})
+
     def test_multisource_ingestor_reads_repository_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -2,11 +2,13 @@
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
 
 from .analyzer import analyze_report_text
 from .models import AnalysisResult, FailureCluster, FixSuggestion
 from .retrieval import (
+    CodeAwareIngestor,
     DummyEmbeddingProvider,
     HybridRetrievalEngine,
     IngestDocument,
@@ -17,6 +19,13 @@ from .retrieval import (
     build_analysis_prompt,
     create_hybrid_engine,
 )
+
+
+class ChunkerType(str, Enum):
+    """Type of chunking strategy to use."""
+    BASIC = "basic"  # Simple fixed-size text chunking
+    CODE_AWARE = "code_aware"  # Code-structure-aware chunking
+    AUTO = "auto"  # Auto-detect content type and use appropriate chunker
 
 
 @dataclass
@@ -121,6 +130,7 @@ class RAGAnalyzer:
         chunk_overlap: int = 40,
         use_hybrid: bool = True,
         lexical_weight: float = 0.5,
+        chunker_type: ChunkerType = ChunkerType.AUTO,
     ) -> None:
         if use_hybrid:
             self._engine = create_hybrid_engine(
@@ -130,15 +140,74 @@ class RAGAnalyzer:
             )
         else:
             self._engine = RetrievalEngine(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        self._ingestor = MultiSourceIngestor(self._engine)
+        self._chunker_type = chunker_type
+        self._chunk_size = chunk_size
+        self._chunk_overlap = chunk_overlap
+
+        # Set up ingestor based on chunker type
+        if chunker_type == ChunkerType.CODE_AWARE:
+            self._ingestor = CodeAwareIngestor(
+                self._engine,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            self._code_ingestor: Optional[CodeAwareIngestor] = self._ingestor
+            self._basic_ingestor: Optional[MultiSourceIngestor] = None
+        elif chunker_type == ChunkerType.AUTO:
+            # Auto mode: we'll use both and pick appropriate
+            self._code_ingestor = CodeAwareIngestor(
+                self._engine,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            self._basic_ingestor = MultiSourceIngestor(self._engine)
+            self._ingestor = self._basic_ingestor  # Default to basic
+        else:
+            self._ingestor = MultiSourceIngestor(self._engine)
+            self._basic_ingestor = self._ingestor
+            self._code_ingestor = None
         self._initialized = False
+
+    def _select_ingestor(self, source_type: SourceType, source_id: str) -> Any:
+        """Select appropriate ingestor based on source type and content.
+
+        Args:
+            source_type: The type of source being ingested
+            source_id: The source identifier (file path)
+
+        Returns:
+            The appropriate ingestor instance
+        """
+        if self._chunker_type == ChunkerType.CODE_AWARE:
+            return self._ingestor
+        if self._chunker_type == ChunkerType.AUTO:
+            # Auto-select based on source type and file extension
+            if source_type in (SourceType.REPOSITORY, SourceType.CODE_SNIPPET):
+                # Check if it's a code file
+                if self._is_code_file(source_id):
+                    return self._code_ingestor
+            return self._basic_ingestor
+        return self._ingestor
+
+    def _is_code_file(self, source_id: str) -> bool:
+        """Check if source is a code file based on extension.
+
+        Args:
+            source_id: Source identifier (file path)
+
+        Returns:
+            True if appears to be a code file
+        """
+        code_extensions = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rs', '.c', '.cpp', '.h'}
+        lower_id = source_id.lower()
+        return any(lower_id.endswith(ext) for ext in code_extensions)
 
     def initialize_corpus(
         self,
         repo_path: Optional[str] = None,
-        requirements_docs: Optional[Sequence[str]] = None,
-        system_analysis_docs: Optional[Sequence[str]] = None,
-        knowledge_docs: Optional[Sequence[str]] = None,
+        requirements_docs: Optional[Sequence[tuple]] = None,
+        system_analysis_docs: Optional[Sequence[tuple]] = None,
+        knowledge_docs: Optional[Sequence[tuple]] = None,
     ) -> int:
         """Initialize the retrieval corpus with various document sources.
 
@@ -159,12 +228,14 @@ class RAGAnalyzer:
 
         if requirements_docs:
             for source_id, content in requirements_docs:
-                chunks = self._ingestor.ingest_requirements_markdown(source_id, content)
+                ingestor = self._select_ingestor(SourceType.REQUIREMENTS, source_id)
+                chunks = ingestor.ingest_requirements_markdown(source_id, content)
                 total_chunks += len(chunks)
 
         if system_analysis_docs:
             for source_id, content in system_analysis_docs:
-                chunks = self._ingestor.ingest_raw(
+                ingestor = self._select_ingestor(SourceType.SYSTEM_ANALYSIS, source_id)
+                chunks = ingestor.ingest_raw(
                     source_id=source_id,
                     source_type=SourceType.SYSTEM_ANALYSIS,
                     content=content,
@@ -173,7 +244,8 @@ class RAGAnalyzer:
 
         if knowledge_docs:
             for source_id, content in knowledge_docs:
-                chunks = self._ingestor.ingest_raw(
+                ingestor = self._select_ingestor(SourceType.KNOWLEDGE, source_id)
+                chunks = ingestor.ingest_raw(
                     source_id=source_id,
                     source_type=SourceType.KNOWLEDGE,
                     content=content,
@@ -226,11 +298,20 @@ class RAGAnalyzer:
         all_evidence_sources: List[str] = []
         test_gaps: List[str] = []
         risk_factors: Dict[str, Any] = {"factors": [], "overall_risk": "low"}
+        missing_artifacts = {"source_types": set(), "modalities": set()}
+        retrieval_confidences: List[float] = []
 
         for query in queries:
-            ranked = self._engine.query(query, top_k=5, diversify=True)
+            evidence = self._engine.retrieve_evidence(query, top_k=5, diversify=True)
+            ranked = evidence.ranked_chunks
             if not ranked:
                 continue
+
+            retrieval_confidences.append(evidence.aggregate_confidence)
+            for missing_source in evidence.missing_source_types:
+                missing_artifacts["source_types"].add(missing_source.value)
+            for missing_modality in evidence.missing_modalities:
+                missing_artifacts["modalities"].add(missing_modality)
 
             # Track evidence sources
             all_evidence_sources.extend(item.chunk.source_id for item in ranked)
@@ -264,21 +345,39 @@ class RAGAnalyzer:
                 risk_factors["overall_risk"] = "high"
             elif severity_counts.get("medium", 0) > 0:
                 risk_factors["overall_risk"] = "medium"
+        if retrieval_confidences:
+            risk_factors["retrieval_confidence"] = round(
+                sum(retrieval_confidences) / len(retrieval_confidences),
+                4,
+            )
+        if missing_artifacts["source_types"] or missing_artifacts["modalities"]:
+            risk_factors["missing_evidence"] = {
+                "source_types": sorted(missing_artifacts["source_types"]),
+                "modalities": sorted(missing_artifacts["modalities"]),
+            }
 
         # Generate structured test gaps and requirement traces
         structured_gaps = self._analyze_test_gaps(base_result)
         requirement_traces = self._trace_requirements(base_result)
 
         # Build augmented prompt for LLM
-        ranked_for_prompt = self._engine.query(
+        prompt_evidence = self._engine.retrieve_evidence(
             "failure clustering root cause test gap risk prioritization",
             top_k=10,
             diversify=True,
         )
+        ranked_for_prompt = prompt_evidence.ranked_chunks
         augmented_prompt = build_analysis_prompt(
             question=query_for_context or "Analyze test failures with context from retrieved documents",
             ranked_context=ranked_for_prompt,
         )
+        if prompt_evidence.missing_source_types or prompt_evidence.missing_modalities:
+            augmented_prompt += (
+                "\n\nMissing retrieval evidence: "
+                f"source_types={[s.value for s in prompt_evidence.missing_source_types]} "
+                f"modalities={prompt_evidence.missing_modalities} "
+                f"(confidence_band={prompt_evidence.confidence_band})"
+            )
 
         return RAGAnalysisResult(
             base_result=base_result,
@@ -539,6 +638,7 @@ def rag_analyze(
     query: Optional[str] = None,
     use_hybrid: bool = True,
     lexical_weight: float = 0.5,
+    chunker_type: ChunkerType = ChunkerType.AUTO,
 ) -> RAGAnalysisResult:
     """Convenience function for RAG-augmented analysis.
 
@@ -549,11 +649,16 @@ def rag_analyze(
         query: Optional additional query
         use_hybrid: Whether to use hybrid (lexical + semantic) retrieval
         lexical_weight: Weight for lexical search when using hybrid mode (0-1)
+        chunker_type: Chunker strategy (basic, code_aware, auto)
 
     Returns:
         RAGAnalysisResult with augmented insights
     """
-    analyzer = RAGAnalyzer(use_hybrid=use_hybrid, lexical_weight=lexical_weight)
+    analyzer = RAGAnalyzer(
+        use_hybrid=use_hybrid,
+        lexical_weight=lexical_weight,
+        chunker_type=chunker_type,
+    )
 
     # Initialize corpus
     if repo_path or requirements_docs:

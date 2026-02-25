@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .code_chunker import CodeAwareChunker, CodeChunk, CodeLanguage
 
@@ -57,6 +57,19 @@ class QueryPlan:
     intent_labels: List[str] = field(default_factory=list)
     preferred_source_types: List[SourceType] = field(default_factory=list)
     preferred_modalities: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RetrievalEvidence:
+    query_text: str
+    query_plan: QueryPlan
+    ranked_chunks: List[RankedChunk] = field(default_factory=list)
+    covered_source_types: List[SourceType] = field(default_factory=list)
+    covered_modalities: List[str] = field(default_factory=list)
+    missing_source_types: List[SourceType] = field(default_factory=list)
+    missing_modalities: List[str] = field(default_factory=list)
+    aggregate_confidence: float = 0.0
+    confidence_band: str = "low"
 
 
 @dataclass
@@ -244,6 +257,169 @@ class RetrievalEngine:
             item.confidence = round(max(0.0, min(1.0, confidence * decay)), 4)
 
         return top
+
+    def query_with_expansion(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        diversify: bool = True,
+        max_variants: int = 4,
+    ) -> List[RankedChunk]:
+        """Run intent-aware query expansion with reciprocal-rank fusion.
+
+        This is a degraded but usable fallback for richer retrieval when
+        embedding-heavy expansion is unavailable.
+        """
+        variants = self._expand_query_variants(query_text, max_variants=max_variants)
+        if len(variants) == 1:
+            return self.query(query_text, top_k=top_k, diversify=diversify)
+
+        aggregate: Dict[str, Dict[str, Any]] = {}
+        per_variant_limit = max(top_k, 3)
+
+        for variant_query, weight in variants:
+            ranked = self.query(variant_query, top_k=per_variant_limit, diversify=False)
+            for rank, item in enumerate(ranked):
+                key = item.chunk.chunk_id
+                entry = aggregate.setdefault(
+                    key,
+                    {
+                        "chunk": item.chunk,
+                        "best_score": item.score,
+                        "best_confidence": item.confidence,
+                        "rrf": 0.0,
+                        "hits": 0,
+                        "terms": set(),
+                        "score_breakdown": dict(item.score_breakdown),
+                    },
+                )
+                entry["best_score"] = max(entry["best_score"], item.score)
+                entry["best_confidence"] = max(entry["best_confidence"], item.confidence)
+                entry["hits"] += 1
+                entry["rrf"] += weight * (1.0 / (50.0 + rank + 1.0))
+                entry["terms"].update(item.matched_terms)
+
+        if not aggregate:
+            return []
+
+        fused: List[RankedChunk] = []
+        max_rrf = max(entry["rrf"] for entry in aggregate.values()) or 1.0
+        for key, entry in aggregate.items():
+            rrf_norm = entry["rrf"] / max_rrf
+            score = (entry["best_score"] * 0.65) + (rrf_norm * 0.35)
+            breakdown = dict(entry["score_breakdown"])
+            breakdown["fusion_rrf"] = round(rrf_norm, 4)
+            breakdown["fusion_hits"] = float(entry["hits"])
+            fused.append(
+                RankedChunk(
+                    chunk=entry["chunk"],
+                    score=score,
+                    confidence=entry["best_confidence"],
+                    matched_terms=sorted(entry["terms"]),
+                    score_breakdown=breakdown,
+                )
+            )
+
+        fused.sort(
+            key=lambda item: (
+                -item.score,
+                -len(item.matched_terms),
+                item.chunk.source_id,
+                item.chunk.chunk_id,
+            )
+        )
+
+        selected = _select_diverse_top(fused, max(1, top_k)) if diversify else fused[: max(1, top_k)]
+        if not selected:
+            return []
+
+        max_score = selected[0].score
+        for rank, item in enumerate(selected):
+            normalized = item.score / max(max_score, 1e-9)
+            decayed = max(0.0, 1.0 - (rank * 0.08))
+            blended = (item.confidence * 0.62) + (normalized * 0.38)
+            item.confidence = round(max(0.0, min(1.0, blended * decayed)), 4)
+
+        return selected
+
+    def retrieve_evidence(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        diversify: bool = True,
+        use_expansion: bool = True,
+    ) -> RetrievalEvidence:
+        plan = self.build_query_plan(query_text)
+        ranked = (
+            self.query_with_expansion(query_text, top_k=top_k, diversify=diversify)
+            if use_expansion
+            else self.query(query_text, top_k=top_k, diversify=diversify)
+        )
+        covered_sources = _dedupe([item.chunk.source_type for item in ranked])
+        covered_modalities = _dedupe([item.chunk.modality for item in ranked])
+        missing_sources = [stype for stype in plan.preferred_source_types if stype not in covered_sources]
+        missing_modalities = [modality for modality in plan.preferred_modalities if modality not in covered_modalities]
+
+        aggregate_confidence = _aggregate_confidence(ranked)
+        if aggregate_confidence >= 0.72:
+            band = "high"
+        elif aggregate_confidence >= 0.45:
+            band = "medium"
+        else:
+            band = "low"
+
+        return RetrievalEvidence(
+            query_text=query_text,
+            query_plan=plan,
+            ranked_chunks=ranked,
+            covered_source_types=covered_sources,
+            covered_modalities=covered_modalities,
+            missing_source_types=missing_sources,
+            missing_modalities=missing_modalities,
+            aggregate_confidence=aggregate_confidence,
+            confidence_band=band,
+        )
+
+    def _expand_query_variants(self, query_text: str, max_variants: int = 4) -> List[Tuple[str, float]]:
+        plan = self.build_query_plan(query_text)
+        variants: List[Tuple[str, float]] = [(query_text, 1.0)]
+
+        intent_expansions = {
+            "failure_clustering": "cluster recurring flaky failure patterns and shared signatures",
+            "root_cause": "root cause traceback hypothesis and failure origin",
+            "test_gap": "missing test coverage negative and edge case scenarios",
+            "risk_prioritization": "release risk severity prioritization p0 blocking issues",
+            "actionable_plan": "actionable mitigation plan next steps and owner assignments",
+        }
+        for intent in plan.intent_labels:
+            expansion = intent_expansions.get(intent)
+            if expansion:
+                variants.append((f"{query_text} {expansion}", 0.82))
+
+        # Always add one cross-goal pivot query to increase cross-source evidence
+        # coverage when the corpus is sparse or vocabulary is fragmented.
+        variants.append(
+            (
+                "failure clustering root cause test gap risk prioritization actionable plan",
+                0.45,
+            )
+        )
+
+        if "table" in plan.preferred_modalities:
+            variants.append((f"{query_text} table matrix evidence", 0.60))
+        if "image" in plan.preferred_modalities or "image_ocr_stub" in plan.preferred_modalities:
+            variants.append((f"{query_text} image ocr diagram evidence", 0.60))
+
+        deduped: List[Tuple[str, float]] = []
+        seen = set()
+        for variant in variants:
+            if variant[0] in seen:
+                continue
+            seen.add(variant[0])
+            deduped.append(variant)
+            if len(deduped) >= max(1, max_variants):
+                break
+        return deduped
 
 
 class MultiSourceIngestor:
@@ -457,6 +633,58 @@ class CodeAwareIngestor:
         if chunks:
             self._engine._chunks.extend(chunks)
         return chunks
+
+    def ingest_requirements_markdown(self, source_id: str, markdown: str) -> List[Chunk]:
+        """Ingest requirements markdown document.
+
+        Args:
+            source_id: Source identifier
+            markdown: Markdown content
+
+        Returns:
+            List of Chunk objects
+        """
+        # For markdown/requirements, use basic text chunking via the engine
+        # but add metadata indicating it's a requirement
+        return self._engine.ingest_documents([
+            IngestDocument(
+                source_id=source_id,
+                source_type=SourceType.REQUIREMENTS,
+                content=markdown,
+                modality="markdown_mixed",
+                metadata={"format": "markdown"},
+            )
+        ])
+
+    def ingest_raw(
+        self,
+        source_id: str,
+        source_type: SourceType,
+        content: Any,
+        modality: str = "text",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """Ingest raw content.
+
+        Args:
+            source_id: Source identifier
+            source_type: Type of source
+            content: Content to ingest
+            modality: Content modality
+            metadata: Optional metadata
+
+        Returns:
+            List of Chunk objects
+        """
+        return self._engine.ingest_documents([
+            IngestDocument(
+                source_id=source_id,
+                source_type=source_type,
+                content=content,
+                modality=modality,
+                metadata=metadata or {},
+            )
+        ])
 
 
 def create_code_aware_engine(
@@ -737,6 +965,183 @@ def _extraction_quality(chunk: Chunk) -> float:
     except (TypeError, ValueError):
         return 0.7
     return max(0.0, min(1.0, numeric))
+
+
+def _position_score(chunk: Chunk, total_chunks: int = 100) -> float:
+    """Score based on chunk position in document.
+
+    Earlier chunks tend to contain more important information
+    like introductions, key concepts, and setup.
+
+    Args:
+        chunk: The chunk to score
+        total_chunks: Approximate total chunks in the corpus
+
+    Returns:
+        Position score between 0 and 1
+    """
+    # Extract position from chunk_id or metadata
+    start_line = chunk.metadata.get("start_line", 1)
+    chunk_index = chunk.metadata.get("unit_index", 0)
+
+    # Earlier chunks get higher scores
+    # Use a decay factor based on position
+    position_factor = 1.0 / (1.0 + 0.01 * chunk_index)
+
+    # Also consider start_line - earlier lines get slight boost
+    line_factor = 1.0 / (1.0 + 0.001 * max(0, start_line - 1))
+
+    return 0.3 * position_factor + 0.2 * line_factor + 0.5
+
+
+def _source_authority(chunk: Chunk) -> float:
+    """Score based on source authority and reliability.
+
+    Different source types have different reliability levels
+    for test analysis purposes.
+
+    Args:
+        chunk: The chunk to score
+
+    Returns:
+        Authority score between 0 and 1
+    """
+    # Base authority by source type
+    authority_by_type = {
+        SourceType.REQUIREMENTS: 1.0,  # Requirements are authoritative
+        SourceType.SYSTEM_ANALYSIS: 0.95,  # System docs are authoritative
+        SourceType.CODE_SNIPPET: 0.9,  # Code is factual
+        SourceType.REPOSITORY: 0.85,  # Repo code is factual
+        SourceType.KNOWLEDGE: 0.7,  # Knowledge docs may vary
+    }
+    base_authority = authority_by_type.get(chunk.source_type, 0.75)
+
+    # Adjust by modality - code modality is more precise
+    modality_bonus = 0.0
+    if chunk.modality == "code":
+        modality_bonus = 0.1
+
+    # Adjust by unit type if available (for code-aware chunks)
+    unit_type = chunk.metadata.get("unit_type")
+    if unit_type == "class":
+        modality_bonus += 0.05  # Classes are often key abstractions
+    elif unit_type == "function":
+        modality_bonus += 0.03  # Functions are important
+
+    return min(1.0, base_authority + modality_bonus)
+
+
+def _chunk_completeness(chunk: Chunk, avg_chunk_size: int = 360) -> float:
+    """Score based on chunk completeness.
+
+    Chunks that are well-formed and complete (not truncated)
+    are more reliable.
+
+    Args:
+        chunk: The chunk to score
+        avg_chunk_size: Expected average chunk size
+
+    Returns:
+        Completeness score between 0 and 1
+    """
+    token_count = chunk.token_count
+    if token_count == 0:
+        return 0.1
+
+    # Ideal chunks are close to average size
+    size_ratio = token_count / avg_chunk_size
+    if 0.5 <= size_ratio <= 1.2:
+        completeness = 1.0
+    elif size_ratio < 0.5:
+        # Very small chunks might be incomplete
+        completeness = 0.5 + size_ratio
+    else:
+        # Larger chunks might be truncated
+        completeness = max(0.7, 1.0 - 0.1 * (size_ratio - 1.2))
+
+    # Check for truncation indicators
+    text = chunk.text
+    if text.endswith("...") or text.endswith("[truncated]"):
+        completeness *= 0.8
+
+    return max(0.1, min(1.0, completeness))
+
+
+def compute_enhanced_confidence(
+    chunk: Chunk,
+    query_tokens: List[str],
+    matched_terms: List[str],
+    score_breakdown: Dict[str, float],
+    rank: int,
+    total_results: int,
+) -> float:
+    """Compute enhanced confidence score with multiple factors.
+
+    This function combines multiple signals to produce a more accurate
+    confidence score for retrieval results.
+
+    Args:
+        chunk: The retrieved chunk
+        query_tokens: Normalized query tokens
+        matched_terms: Terms that matched in this chunk
+        score_breakdown: Breakdown of retrieval scores
+        rank: Position in results (0-indexed)
+        total_results: Total number of results
+
+    Returns:
+        Enhanced confidence score between 0 and 1
+    """
+    if not chunk or not matched_terms:
+        return 0.0
+
+    # 1. Term coverage (how many query terms are matched)
+    coverage = len(matched_terms) / max(len(query_tokens), 1)
+
+    # 2. Extraction quality from chunk metadata
+    extraction = _extraction_quality(chunk)
+
+    # 3. Position score
+    position = _position_score(chunk)
+
+    # 4. Source authority
+    authority = _source_authority(chunk)
+
+    # 5. Chunk completeness
+    completeness = _chunk_completeness(chunk)
+
+    # 6. Rank-based decay (lower ranks get slight penalty)
+    rank_decay = 1.0 - (rank * 0.08)
+
+    # 7. Score-based confidence from retrieval
+    base_score = score_breakdown.get("lexical", 0.0) + score_breakdown.get("semantic", 0.0)
+    score_confidence = min(1.0, base_score * 2)
+
+    # Weighted combination
+    confidence = (
+        coverage * 0.20 +
+        extraction * 0.18 +
+        position * 0.08 +
+        authority * 0.15 +
+        completeness * 0.12 +
+        score_confidence * 0.17 +
+        rank_decay * 0.10
+    )
+
+    return max(0.0, min(1.0, confidence))
+
+
+def _aggregate_confidence(ranked: Sequence[RankedChunk]) -> float:
+    if not ranked:
+        return 0.0
+    weighted_total = 0.0
+    weight_sum = 0.0
+    for idx, item in enumerate(ranked):
+        weight = 1.0 / (idx + 1.0)
+        weighted_total += item.confidence * weight
+        weight_sum += weight
+    if weight_sum == 0:
+        return 0.0
+    return round(max(0.0, min(1.0, weighted_total / weight_sum)), 4)
 
 
 def _dedupe(items: Sequence[Any]) -> List[Any]:

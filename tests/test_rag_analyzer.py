@@ -1,10 +1,16 @@
 import unittest
 
 from src.test_analysis_assistant.rag_analyzer import (
+    ChunkerType,
     RAGAnalyzer,
     RAGAnalysisResult,
     RetrievalInsight,
     rag_analyze,
+)
+from src.test_analysis_assistant.retrieval import (
+    Chunk,
+    SourceType,
+    compute_enhanced_confidence,
 )
 
 
@@ -109,6 +115,24 @@ class TestRAGAnalyzer(unittest.TestCase):
         self.assertIn("risk_assessment", result_dict)
         self.assertIn("evidence_sources", result_dict)
 
+    def test_analyze_includes_retrieval_confidence_metadata(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_login">
+                <failure type="AssertionError">Expected True, got False</failure>
+            </testcase>
+        </testsuite>"""
+
+        analyzer = RAGAnalyzer()
+        analyzer.add_knowledge(
+            "auth-req",
+            "Authentication release risk requires negative tests and mitigation planning.",
+        )
+        result = analyzer.analyze(test_report, query_for_context="auth release risk")
+
+        self.assertIn("retrieval_confidence", result.risk_assessment)
+        self.assertGreaterEqual(result.risk_assessment["retrieval_confidence"], 0.0)
+        self.assertLessEqual(result.risk_assessment["retrieval_confidence"], 1.0)
+
 
 class TestRAGSeverityAssessment(unittest.TestCase):
     def test_critical_severity_detection(self):
@@ -151,6 +175,174 @@ class TestRAGSeverityAssessment(unittest.TestCase):
             _assess_severity("Some minor documentation issue", "test_gap"),
             "low",
         )
+
+
+class TestChunkerType(unittest.TestCase):
+    def test_chunker_type_enum(self):
+        """Test ChunkerType enum values."""
+        self.assertEqual(ChunkerType.BASIC.value, "basic")
+        self.assertEqual(ChunkerType.CODE_AWARE.value, "code_aware")
+        self.assertEqual(ChunkerType.AUTO.value, "auto")
+
+
+class TestRAGAnalyzerChunkingStrategies(unittest.TestCase):
+    def test_rag_analyzer_basic_chunker(self):
+        """Test RAGAnalyzer with basic chunker."""
+        analyzer = RAGAnalyzer(chunker_type=ChunkerType.BASIC)
+        self.assertIsNotNone(analyzer._engine)
+        self.assertEqual(analyzer._chunker_type, ChunkerType.BASIC)
+        self.assertIsNone(analyzer._code_ingestor)
+
+    def test_rag_analyzer_code_aware_chunker(self):
+        """Test RAGAnalyzer with code-aware chunker."""
+        analyzer = RAGAnalyzer(chunker_type=ChunkerType.CODE_AWARE)
+        self.assertIsNotNone(analyzer._engine)
+        self.assertEqual(analyzer._chunker_type, ChunkerType.CODE_AWARE)
+        self.assertIsNotNone(analyzer._code_ingestor)
+
+    def test_rag_analyzer_auto_chunker(self):
+        """Test RAGAnalyzer with auto chunker selection."""
+        analyzer = RAGAnalyzer(chunker_type=ChunkerType.AUTO)
+        self.assertIsNotNone(analyzer._engine)
+        self.assertEqual(analyzer._chunker_type, ChunkerType.AUTO)
+        self.assertIsNotNone(analyzer._code_ingestor)
+        self.assertIsNotNone(analyzer._basic_ingestor)
+
+    def test_is_code_file_detection(self):
+        """Test file type detection."""
+        analyzer = RAGAnalyzer(chunker_type=ChunkerType.AUTO)
+
+        # Code files
+        self.assertTrue(analyzer._is_code_file("path/to/file.py"))
+        self.assertTrue(analyzer._is_code_file("path/to/file.js"))
+        self.assertTrue(analyzer._is_code_file("path/to/file.ts"))
+        self.assertTrue(analyzer._is_code_file("path/to/file.java"))
+
+        # Non-code files
+        self.assertFalse(analyzer._is_code_file("path/to/file.md"))
+        self.assertFalse(analyzer._is_code_file("path/to/file.txt"))
+        self.assertFalse(analyzer._is_code_file("path/to/file.json"))
+
+    def test_select_ingestor_auto_mode(self):
+        """Test ingestor selection in auto mode."""
+        analyzer = RAGAnalyzer(chunker_type=ChunkerType.AUTO)
+
+        # Code file should use code-aware ingestor
+        code_ingestor = analyzer._select_ingestor(SourceType.REPOSITORY, "path/to/module.py")
+        self.assertEqual(code_ingestor, analyzer._code_ingestor)
+
+        # Non-code file should use basic ingestor
+        basic_ingestor = analyzer._select_ingestor(SourceType.REQUIREMENTS, "doc.md")
+        self.assertEqual(basic_ingestor, analyzer._basic_ingestor)
+
+    def test_rag_analyze_with_code_aware_chunker(self):
+        """Test rag_analyze convenience function with code-aware chunker."""
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_api" name="test_status">
+                <failure type="RuntimeError">Invalid response</failure>
+            </testcase>
+        </testsuite>"""
+
+        result = rag_analyze(
+            test_report_content=test_report,
+            requirements_docs=[("req-1", "API should return 200 OK for health checks.")],
+            query="API test gaps",
+            chunker_type=ChunkerType.CODE_AWARE,
+        )
+
+        self.assertIsInstance(result, RAGAnalysisResult)
+        self.assertEqual(result.base_result.total_failures, 1)
+
+
+class TestEnhancedConfidenceScoring(unittest.TestCase):
+    def test_compute_enhanced_confidence_basic(self):
+        """Test basic enhanced confidence computation."""
+        chunk = Chunk(
+            chunk_id="test-1",
+            source_id="test-source",
+            source_type=SourceType.REQUIREMENTS,
+            modality="text",
+            text="This is a test chunk with important content.",
+            token_count=10,
+            metadata={"unit_index": 0, "start_line": 1, "extraction_confidence": 0.9},
+        )
+
+        query_tokens = ["test", "important", "content"]
+        matched_terms = ["test", "important"]
+        score_breakdown = {"lexical": 0.5, "semantic": 0.3}
+
+        confidence = compute_enhanced_confidence(
+            chunk=chunk,
+            query_tokens=query_tokens,
+            matched_terms=matched_terms,
+            score_breakdown=score_breakdown,
+            rank=0,
+            total_results=5,
+        )
+
+        self.assertGreater(confidence, 0.0)
+        self.assertLessEqual(confidence, 1.0)
+
+    def test_compute_enhanced_confidence_no_matches(self):
+        """Test confidence with no matched terms."""
+        chunk = Chunk(
+            chunk_id="test-2",
+            source_id="test-source",
+            source_type=SourceType.KNOWLEDGE,
+            modality="text",
+            text="Unrelated content here.",
+            token_count=5,
+            metadata={"unit_index": 5, "start_line": 100},
+        )
+
+        query_tokens = ["test", "important"]
+        matched_terms = []
+        score_breakdown = {"lexical": 0.0, "semantic": 0.0}
+
+        confidence = compute_enhanced_confidence(
+            chunk=chunk,
+            query_tokens=query_tokens,
+            matched_terms=matched_terms,
+            score_breakdown=score_breakdown,
+            rank=2,
+            total_results=5,
+        )
+
+        self.assertEqual(confidence, 0.0)
+
+    def test_compute_enhanced_confidence_code_chunk(self):
+        """Test confidence computation for code chunks."""
+        chunk = Chunk(
+            chunk_id="test-3",
+            source_id="path/to/module.py",
+            source_type=SourceType.CODE_SNIPPET,
+            modality="code",
+            text="def authenticate(user): return user.is_valid",
+            token_count=8,
+            metadata={
+                "unit_index": 0,
+                "start_line": 10,
+                "extraction_confidence": 0.95,
+                "unit_type": "function",
+                "unit_name": "authenticate",
+            },
+        )
+
+        query_tokens = ["authenticate", "function", "user"]
+        matched_terms = ["authenticate", "function"]
+        score_breakdown = {"lexical": 0.6, "semantic": 0.4}
+
+        confidence = compute_enhanced_confidence(
+            chunk=chunk,
+            query_tokens=query_tokens,
+            matched_terms=matched_terms,
+            score_breakdown=score_breakdown,
+            rank=0,
+            total_results=3,
+        )
+
+        # Code chunks with good metadata should have high confidence
+        self.assertGreater(confidence, 0.3)
 
 
 if __name__ == "__main__":
