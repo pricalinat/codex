@@ -3,12 +3,16 @@ import tempfile
 from pathlib import Path
 
 from src.test_analysis_assistant.retrieval import (
+    DummyEmbeddingProvider,
+    HybridRetrievalEngine,
     IngestDocument,
     MultiSourceIngestor,
     QueryPlan,
     RetrievalEngine,
     SourceType,
+    TFIDFEmbeddingProvider,
     build_analysis_prompt,
+    create_hybrid_engine,
 )
 
 
@@ -221,6 +225,153 @@ Missing negative authorization tests are release blocking.
         plain_sources = {item.chunk.source_id for item in plain}
         self.assertGreaterEqual(len(diverse_sources), 2)
         self.assertLessEqual(len(plain_sources), 2)
+
+
+class TestTFIDFEmbeddingProvider(unittest.TestCase):
+    def test_tfidf_encodes_texts(self):
+        provider = TFIDFEmbeddingProvider()
+        texts = [
+            "authentication failure causes release blocking",
+            "authorization tests missing negative cases",
+            "performance benchmark rendering path",
+        ]
+        vectors = provider.encode(texts)
+
+        self.assertEqual(len(vectors), 3)
+        # Each vector should be normalized
+        for v in vectors:
+            self.assertEqual(len(v), len(provider._vocabulary))
+            magnitude = sum(x * x for x in v) ** 0.5
+            self.assertAlmostEqual(magnitude, 1.0, places=5)
+
+    def test_tfidf_similarity_ranking(self):
+        provider = TFIDFEmbeddingProvider()
+        texts = [
+            "authentication failure causes release blocking",
+            "authorization tests missing negative cases",
+            "performance benchmark rendering path",
+        ]
+        vectors = provider.encode(texts)
+
+        # Query should be most similar to the first text
+        query = "authentication failure"
+        query_vec = provider.encode([query])[0]
+
+        from src.test_analysis_assistant.retrieval import _cosine_similarity
+        similarities = [_cosine_similarity(query_vec, v) for v in vectors]
+
+        # First text should be most similar
+        self.assertGreater(similarities[0], similarities[1])
+        self.assertGreater(similarities[0], similarities[2])
+
+    def test_tfidf_vocabulary_limits_features(self):
+        provider = TFIDFEmbeddingProvider(max_features=10)
+        texts = [f"word{i} word{i+1} word{i+2}" for i in range(20)]
+        provider.encode(texts)
+
+        self.assertLessEqual(len(provider._vocabulary), 10)
+
+    def test_tfidf_min_df_filters_rare_terms(self):
+        provider = TFIDFEmbeddingProvider(min_df=2)
+        texts = [
+            "uniqueword1 common",
+            "uniqueword2 common",
+            "common",
+        ]
+        provider.encode(texts)
+
+        # "uniqueword1" and "uniqueword2" should not be in vocabulary
+        self.assertNotIn("uniqueword1", provider._vocabulary)
+        self.assertNotIn("uniqueword2", provider._vocabulary)
+
+
+class TestHybridRetrievalEngine(unittest.TestCase):
+    def test_hybrid_engine_with_tfidf(self):
+        docs = [
+            IngestDocument(
+                source_id="req-1",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication failures are release blocking.",
+            ),
+            IngestDocument(
+                source_id="doc-2",
+                source_type=SourceType.KNOWLEDGE,
+                content="UI rendering optimization for dashboard cards.",
+            ),
+        ]
+
+        engine = create_hybrid_engine(
+            embedding_provider=TFIDFEmbeddingProvider(),
+            lexical_weight=0.5,
+        )
+        engine.ingest_documents(docs)
+
+        ranked = engine.query("release blocking authentication", top_k=2, use_hybrid=True)
+
+        self.assertEqual(len(ranked), 2)
+        # First result should be req-1 since it matches "release" and "blocking"
+        self.assertEqual(ranked[0].chunk.source_id, "req-1")
+
+    def test_hybrid_engine_lexical_only_mode(self):
+        docs = [
+            IngestDocument(
+                source_id="req-1",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication failures are release blocking.",
+            ),
+            IngestDocument(
+                source_id="doc-2",
+                source_type=SourceType.KNOWLEDGE,
+                content="UI rendering optimization for dashboard cards.",
+            ),
+        ]
+
+        engine = create_hybrid_engine(embedding_provider=TFIDFEmbeddingProvider())
+        engine.ingest_documents(docs)
+
+        ranked = engine.query("release blocking authentication", top_k=2, use_hybrid=False)
+
+        self.assertEqual(len(ranked), 2)
+        # Even with use_hybrid=False, should return results via lexical path
+        self.assertGreater(ranked[0].score, 0)
+
+    def test_hybrid_engine_score_breakdown_includes_semantic(self):
+        docs = [
+            IngestDocument(
+                source_id="req-1",
+                source_type=SourceType.REQUIREMENTS,
+                content="Test failures require P0 triage.",
+            ),
+        ]
+
+        engine = HybridRetrievalEngine(embedding_provider=TFIDFEmbeddingProvider())
+        engine.ingest_documents(docs)
+
+        ranked = engine.query("P0 triage test failures", top_k=1, use_hybrid=True)
+
+        self.assertIn("semantic", ranked[0].score_breakdown)
+        self.assertGreater(ranked[0].score_breakdown["semantic"], 0)
+
+    def test_create_hybrid_engine_factory(self):
+        engine = create_hybrid_engine(
+            chunk_size=200,
+            chunk_overlap=20,
+            lexical_weight=0.6,
+        )
+
+        self.assertIsInstance(engine, HybridRetrievalEngine)
+        self.assertEqual(engine._lexical_weight, 0.6)
+        self.assertEqual(engine._semantic_weight, 0.4)
+
+    def test_dummy_embedding_provider_still_works(self):
+        provider = DummyEmbeddingProvider()
+        texts = ["test failure", "authentication error", "release blocking"]
+
+        vectors = provider.encode(texts)
+
+        self.assertEqual(len(vectors), 3)
+        # Dummy provider uses 64 dimensions
+        self.assertEqual(len(vectors[0]), 64)
 
 
 if __name__ == "__main__":

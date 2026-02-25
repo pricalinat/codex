@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from dataclasses import dataclass, field
@@ -673,6 +674,108 @@ class DummyEmbeddingProvider(EmbeddingProvider):
             vector.extend([0.0] * (64 - len(vector)))
             vectors.append(vector)
         return vectors
+
+
+class TFIDFEmbeddingProvider(EmbeddingProvider):
+    """TF-IDF based embedding provider for semantic similarity.
+
+    This provider builds a vocabulary from all documents and computes
+    TF-IDF vectors for semantic search. It provides better semantic
+    matching than bag-of-words while remaining lightweight (no external deps).
+    """
+
+    def __init__(self, min_df: int = 1, max_features: int = 512) -> None:
+        """Initialize the TF-IDF provider.
+
+        Args:
+            min_df: Minimum document frequency for vocabulary inclusion
+            max_features: Maximum vocabulary size
+        """
+        self._min_df = min_df
+        self._max_features = max_features
+        self._vocabulary: Dict[str, int] = {}
+        self._idf: Dict[str, float] = {}
+        self._doc_count: int = 0
+
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        """Encode texts using TF-IDF vectors.
+
+        Args:
+            texts: List of text strings to encode
+
+        Returns:
+            List of TF-IDF vectors
+        """
+        if not texts:
+            return []
+
+        # Build vocabulary and compute IDF
+        self._build_vocabulary(texts)
+
+        # Encode each text
+        vectors: List[List[float]] = []
+        for text in texts:
+            vectors.append(self._text_to_vector(text))
+
+        return vectors
+
+    def _build_vocabulary(self, texts: List[str]) -> None:
+        """Build vocabulary from texts and compute IDF scores."""
+        self._doc_count = len(texts)
+
+        # Count document frequencies
+        doc_freq: Dict[str, int] = {}
+        for text in texts:
+            tokens = set(_tokenize(text.lower()))
+            for token in tokens:
+                doc_freq[token] = doc_freq.get(token, 0) + 1
+
+        # Build vocabulary with max_features limit
+        sorted_terms = sorted(
+            doc_freq.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        self._vocabulary = {
+            term: idx for idx, (term, _) in enumerate(sorted_terms)
+            if doc_freq[term] >= self._min_df
+        }
+        self._vocabulary = dict(list(self._vocabulary.items())[:self._max_features])
+
+        # Compute IDF scores
+        self._idf = {}
+        for term, df in doc_freq.items():
+            if term in self._vocabulary:
+                # Smooth IDF to avoid division by zero
+                self._idf[term] = math.log((self._doc_count + 1) / (df + 1)) + 1
+
+    def _text_to_vector(self, text: str) -> List[float]:
+        """Convert text to TF-IDF vector."""
+        tokens = _tokenize(text.lower())
+        term_freq: Dict[str, int] = {}
+
+        # Count term frequencies
+        for token in tokens:
+            if token in self._vocabulary:
+                term_freq[token] = term_freq.get(token, 0) + 1
+
+        # Compute TF-IDF
+        vector = [0.0] * len(self._vocabulary)
+        for token, freq in term_freq.items():
+            idx = self._vocabulary.get(token)
+            if idx is not None:
+                # TF = 1 + log(freq), IDF from precomputed scores
+                tf = 1.0 + math.log(freq) if freq > 0 else 0.0
+                idf = self._idf.get(token, 1.0)
+                vector[idx] = tf * idf
+
+        # Normalize to unit vector
+        magnitude = math.sqrt(sum(v * v for v in vector))
+        if magnitude > 0:
+            vector = [v / magnitude for v in vector]
+
+        return vector
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
