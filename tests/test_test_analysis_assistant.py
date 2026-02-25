@@ -24,6 +24,7 @@ from src.test_analysis_assistant.retrieval import (
     HybridRetrievalEngine,
     RetrievalEngine,
     SourceType,
+    TFIDFEmbeddingProvider,
     create_hybrid_engine,
 )
 
@@ -142,6 +143,23 @@ class TestHybridRetrieval(unittest.TestCase):
         self.assertEqual(len(vectors), 1)
         self.assertEqual(len(vectors[0]), 64)
 
+    def test_tfidf_embedding_provider_basic(self):
+        provider = TFIDFEmbeddingProvider(min_df=1, max_features=128)
+        vectors = provider.encode(["hello world test", "test analysis report"])
+        self.assertEqual(len(vectors), 2)
+        # TF-IDF vectors have variable dimensions based on vocabulary
+        self.assertGreater(len(vectors[0]), 0)
+
+    def test_tfidf_embedding_provider_similarity(self):
+        provider = TFIDFEmbeddingProvider(min_df=1, max_features=128)
+        texts = ["test failure analysis", "test gap detection", "unrelated content"]
+        vectors = provider.encode(texts)
+        # Similar texts should have higher cosine similarity
+        from src.test_analysis_assistant.retrieval import _cosine_similarity
+        sim_fails = _cosine_similarity(vectors[0], vectors[1])
+        sim_unrelated = _cosine_similarity(vectors[0], vectors[2])
+        self.assertGreater(sim_fails, sim_unrelated)
+
     def test_hybrid_engine_ingests_and_queries(self):
         engine = create_hybrid_engine(chunk_size=100, lexical_weight=0.5)
         # Ingest a simple document
@@ -258,6 +276,67 @@ class TestTestGapAnalysis(unittest.TestCase):
         )
         self.assertEqual(trace.requirement_id, "req:001")
         self.assertEqual(len(trace.covered_by_tests), 2)
+
+
+class TestActionablePlan(unittest.TestCase):
+    """Tests for actionable plan generation."""
+
+    def test_generate_actionable_plan_basic(self):
+        from src.test_analysis_assistant.actionable_plan import (
+            ActionablePlan,
+            generate_actionable_plan,
+        )
+
+        result = rag_analyze(
+            test_report_content=SAMPLE_PYTEST_TEXT,
+            use_hybrid=False,
+        )
+        plan = generate_actionable_plan(result)
+        self.assertIsInstance(plan, ActionablePlan)
+        self.assertIsNotNone(plan.title)
+        self.assertIsNotNone(plan.summary)
+        self.assertGreater(len(plan.steps), 0)
+
+    def test_actionable_plan_has_confidence(self):
+        from src.test_analysis_assistant.actionable_plan import generate_actionable_plan
+
+        requirements = [("req:test", "# Test requirement")]
+        result = rag_analyze(
+            test_report_content=SAMPLE_PYTEST_TEXT,
+            requirements_docs=requirements,
+            use_hybrid=False,
+        )
+        plan = generate_actionable_plan(result)
+        self.assertGreaterEqual(plan.overall_confidence, 0.0)
+        self.assertLessEqual(plan.overall_confidence, 1.0)
+
+    def test_actionable_plan_has_risk_level(self):
+        from src.test_analysis_assistant.actionable_plan import generate_actionable_plan
+
+        result = rag_analyze(
+            test_report_content=SAMPLE_PYTEST_TEXT,
+            use_hybrid=False,
+        )
+        plan = generate_actionable_plan(result)
+        self.assertIn(plan.risk_level, ["low", "medium", "high", "critical"])
+
+    def test_build_plan_prompt(self):
+        from src.test_analysis_assistant.actionable_plan import (
+            ActionableStep,
+            ActionablePlan,
+            build_plan_prompt,
+            generate_actionable_plan,
+        )
+
+        result = rag_analyze(
+            test_report_content=SAMPLE_PYTEST_TEXT,
+            use_hybrid=False,
+        )
+        plan = generate_actionable_plan(result)
+        prompt = build_plan_prompt(plan)
+        self.assertIsInstance(prompt, str)
+        self.assertGreater(len(prompt), 0)
+        self.assertIn(plan.title, prompt)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,11 @@
 """Test Analysis Assistant MVP package."""
 
+from .actionable_plan import (
+    ActionablePlan,
+    ActionableStep,
+    build_plan_prompt,
+    generate_actionable_plan,
+)
 from .analyzer import analyze_report_text
 from .models import AnalysisResult, FailureRecord, FixSuggestion
 from .rag_analyzer import RAGAnalyzer, RAGAnalysisResult, RetrievalInsight, rag_analyze
@@ -33,4 +39,8 @@ __all__ = [
     "DummyEmbeddingProvider",
     "TFIDFEmbeddingProvider",
     "create_hybrid_engine",
+    "ActionablePlan",
+    "ActionableStep",
+    "generate_actionable_plan",
+    "build_plan_prompt",
 ]
