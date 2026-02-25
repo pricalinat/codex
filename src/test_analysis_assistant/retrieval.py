@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .code_chunker import CodeAwareChunker, CodeChunk, CodeLanguage
+from .code_chunker import CodeAwareChunker, CodeChunk, CodeLanguage, detect_language, extract_code_units
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
@@ -667,6 +667,7 @@ class MultiSourceIngestor:
         allow = set(ext.lower() for ext in (include_extensions or list(default_extensions)))
 
         docs: List[IngestDocument] = []
+        file_records: List[Dict[str, Any]] = []
         for path in sorted(root.rglob("*")):
             if len(docs) >= max_files:
                 break
@@ -699,6 +700,16 @@ class MultiSourceIngestor:
                     metadata=metadata,
                 )
             )
+            file_records.append(
+                {
+                    "rel_path": rel_path,
+                    "extension": path.suffix.lower(),
+                    "modality": "code" if path.suffix.lower() in _REPO_CODE_EXTENSIONS else modality,
+                    "content": text,
+                }
+            )
+
+        docs.extend(_build_repository_manifest_documents(file_records))
 
         if not docs:
             return []
@@ -786,6 +797,7 @@ class CodeAwareIngestor:
 
         code_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
         chunks: List[Chunk] = []
+        file_records: List[Dict[str, Any]] = []
         files_seen = 0
         for path in sorted(root.rglob("*")):
             if files_seen >= max_files:
@@ -804,6 +816,14 @@ class CodeAwareIngestor:
                 continue
 
             ext = path.suffix.lower()
+            file_records.append(
+                {
+                    "rel_path": rel_path,
+                    "extension": ext,
+                    "modality": "code" if ext in code_exts else _infer_repository_modality(ext),
+                    "content": text,
+                }
+            )
             if ext not in code_exts:
                 modality = _infer_repository_modality(ext)
                 content: Any = text
@@ -851,8 +871,12 @@ class CodeAwareIngestor:
                     },
                 ))
 
-        if chunks:
-            self._engine._chunks.extend(chunks)
+        manifest_docs = _build_repository_manifest_documents(file_records)
+        if manifest_docs:
+            chunks.extend(self._engine.ingest_documents(manifest_docs))
+        code_chunks = [chunk for chunk in chunks if chunk.modality == "code"]
+        if code_chunks:
+            self._engine._chunks.extend(code_chunks)
         return chunks
 
     def ingest_code_snippet(
@@ -1489,6 +1513,101 @@ def _infer_repository_modality(extension: str) -> str:
     if extension in {".csv", ".tsv"}:
         return "table"
     return "text"
+
+
+_REPO_CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
+
+
+def _build_repository_manifest_documents(file_records: Sequence[Dict[str, Any]]) -> List[IngestDocument]:
+    if not file_records:
+        return []
+
+    extension_counts: Dict[str, int] = {}
+    directory_counts: Dict[str, int] = {}
+    file_lines: List[str] = []
+
+    for record in sorted(file_records, key=lambda item: str(item.get("rel_path", ""))):
+        rel_path = str(record.get("rel_path", "")).strip()
+        if not rel_path:
+            continue
+        extension = str(record.get("extension", "")).lower()
+        content = str(record.get("content", ""))
+        modality = str(record.get("modality", "text")).strip() or "text"
+
+        extension_counts[extension] = extension_counts.get(extension, 0) + 1
+        directory = Path(rel_path).parent.as_posix()
+        directory_counts[directory] = directory_counts.get(directory, 0) + 1
+
+        symbols = _extract_repository_symbols(rel_path=rel_path, extension=extension, content=content)
+        symbol_text = ", ".join(symbols[:8]) if symbols else "none"
+        file_lines.append(
+            f"- file={rel_path} ext={extension or 'none'} modality={modality} symbols={symbol_text}"
+        )
+
+    if not file_lines:
+        return []
+
+    top_extensions = sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))
+    top_directories = sorted(directory_counts.items(), key=lambda item: (-item[1], item[0]))
+    extension_summary = ", ".join(f"{ext or '[no_ext]'}:{count}" for ext, count in top_extensions[:8])
+    directory_summary = ", ".join(f"{directory}:{count}" for directory, count in top_directories[:10])
+
+    overview_lines = [
+        "Repository manifest overview",
+        f"total_files={len(file_lines)}",
+        f"extension_distribution={extension_summary}",
+        f"directory_distribution={directory_summary}",
+        "Use this index as a fallback for codewiki-style repository understanding.",
+    ]
+    overview = "\n".join(overview_lines)
+
+    catalog_header = [
+        "Repository file inventory",
+        "Each line captures file path, modality, and detected symbols/headings.",
+    ]
+    catalog = "\n".join(catalog_header + file_lines[:300])
+
+    return [
+        IngestDocument(
+            source_id="repo:__manifest__/overview",
+            source_type=SourceType.REPOSITORY,
+            content=overview,
+            modality="text",
+            metadata={
+                "manifest_type": "repo_overview",
+                "extraction_confidence": 0.9,
+            },
+        ),
+        IngestDocument(
+            source_id="repo:__manifest__/files",
+            source_type=SourceType.REPOSITORY,
+            content=catalog,
+            modality="text",
+            metadata={
+                "manifest_type": "repo_file_inventory",
+                "extraction_confidence": 0.88,
+            },
+        ),
+    ]
+
+
+def _extract_repository_symbols(rel_path: str, extension: str, content: str) -> List[str]:
+    if extension in _REPO_CODE_EXTENSIONS:
+        language = detect_language(rel_path, content)
+        code_units = extract_code_units(content, language)
+        symbols = [
+            f"{unit.unit_type}:{unit.name}"
+            for unit in code_units
+            if unit.unit_type in {"class", "function", "method", "constant"}
+        ]
+        return _dedupe(symbols)[:20]
+
+    if extension in {".md", ".markdown", ".mdx", ".rst"}:
+        headings = re.findall(r"^\s*#{1,6}\s+(.+)$", content, re.MULTILINE)
+        normalized = [f"heading:{heading.strip()}" for heading in headings if heading.strip()]
+        return _dedupe(normalized)[:20]
+
+    return []
 
 
 def _parse_delimited_table(content: str, extension: str) -> Dict[str, Any]:

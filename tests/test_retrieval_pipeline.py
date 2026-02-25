@@ -14,6 +14,7 @@ from src.test_analysis_assistant.retrieval import (
     TFIDFEmbeddingProvider,
     build_analysis_prompt,
     build_analysis_prompt_from_evidence,
+    create_code_aware_engine,
     create_hybrid_engine,
 )
 
@@ -477,6 +478,54 @@ class TestRetrievalPipeline(unittest.TestCase):
             table_text = "\n".join(chunk.text for chunk in chunks if chunk.modality == "table")
             self.assertIn("component=auth", table_text)
             self.assertIn("severity=high", table_text)
+
+    def test_repository_ingestion_emits_repo_manifest_for_structure_retrieval(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "src").mkdir()
+            (root / "src" / "auth_token_parser.py").write_text(
+                (
+                    "def parse_refresh_token(payload):\n"
+                    "    return payload.get('refresh_token')\n"
+                ),
+                encoding="utf-8",
+            )
+            (root / "docs").mkdir()
+            (root / "docs" / "overview.md").write_text(
+                "# System Overview\nAuth token parser runs before session validation.",
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            manifest_chunks = [chunk for chunk in chunks if chunk.metadata.get("manifest_type")]
+            self.assertGreaterEqual(len(manifest_chunks), 1)
+            self.assertTrue(any(chunk.source_id.startswith("repo:__manifest__") for chunk in manifest_chunks))
+
+            ranked = engine.query("parse_refresh_token file inventory", top_k=3, diversify=False)
+            self.assertTrue(any(item.chunk.source_id.startswith("repo:__manifest__") for item in ranked))
+
+    def test_code_aware_repository_ingestion_keeps_repo_manifest_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "service").mkdir()
+            (root / "service" / "auth_handler.py").write_text(
+                (
+                    "class AuthHandler:\n"
+                    "    def validate_session(self, payload):\n"
+                    "        return bool(payload)\n"
+                ),
+                encoding="utf-8",
+            )
+
+            engine, ingestor = create_code_aware_engine()
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            manifest_chunks = [chunk for chunk in chunks if chunk.metadata.get("manifest_type")]
+            self.assertGreaterEqual(len(manifest_chunks), 1)
+            self.assertTrue(any(chunk.source_id.startswith("repo:__manifest__") for chunk in manifest_chunks))
 
     def test_markdown_requirements_extracts_table_and_image_units(self):
         markdown = """
