@@ -541,11 +541,18 @@ class RetrievalEngine:
             if use_expansion
             else self.query(query_text, top_k=candidate_top_k, diversify=diversify)
         )
+        coverage_candidates = list(ranked)
         ranked = _select_coverage_aware_top(
             ranked,
             plan=plan,
             top_k=requested_top_k,
             diversify=diversify,
+        )
+        ranked = _rescue_requested_non_text_modalities(
+            selected=ranked,
+            candidates=coverage_candidates,
+            plan=plan,
+            top_k=requested_top_k,
         )
         corpus_available_sources = _dedupe(list(corpus_profile.source_type_counts.keys()))
         corpus_available_modalities = _dedupe(list(corpus_profile.modality_counts.keys()))
@@ -3497,6 +3504,63 @@ def _select_coverage_aware_top(
             )
         )
     return selected[:top_k]
+
+
+def _rescue_requested_non_text_modalities(
+    selected: Sequence[RankedChunk],
+    candidates: Sequence[RankedChunk],
+    plan: QueryPlan,
+    top_k: int,
+) -> List[RankedChunk]:
+    if top_k <= 1 or not selected or not candidates:
+        return list(selected)
+
+    requested_modalities = [mod for mod in plan.preferred_modalities if mod != "text"]
+    if not requested_modalities:
+        return list(selected)
+
+    selected_modalities = {item.chunk.modality for item in selected}
+    if selected_modalities.intersection(set(requested_modalities)):
+        return list(selected)
+
+    selected_ids = {item.chunk.chunk_id for item in selected}
+    best_candidate: Optional[RankedChunk] = None
+    best_value = float("-inf")
+    top_source = selected[0].chunk.source_id if selected else ""
+
+    for candidate in candidates:
+        if candidate.chunk.chunk_id in selected_ids:
+            continue
+        if candidate.chunk.modality not in requested_modalities:
+            continue
+        value = candidate.score
+        if candidate.chunk.source_id == top_source:
+            value += 0.10
+        if value > best_value:
+            best_value = value
+            best_candidate = candidate
+
+    if best_candidate is None:
+        return list(selected)
+
+    rescued = list(selected)
+    replacement_idx = len(rescued) - 1
+    for idx in range(len(rescued) - 1, -1, -1):
+        modality = rescued[idx].chunk.modality
+        if modality == "text":
+            replacement_idx = idx
+            break
+    rescued[replacement_idx] = best_candidate
+    rescued = rescued[: max(1, top_k)]
+    rescued.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            -len(candidate.matched_terms),
+            candidate.chunk.source_id,
+            candidate.chunk.chunk_id,
+        )
+    )
+    return rescued
 
 
 def _dedupe(items: Sequence[Any]) -> List[Any]:

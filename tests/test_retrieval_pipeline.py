@@ -146,6 +146,40 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("image_ocr_stub", evidence.missing_modalities)
         self.assertIn(evidence.confidence_band, {"low", "medium", "high"})
 
+    def test_retrieve_evidence_rescues_requested_non_text_modality_when_available(self):
+        docs = [
+            IngestDocument(
+                source_id="incident:auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Authentication retries spike after deploy and increase release risk.",
+                    "tables": [{"rows": [{"component": "gateway", "status": "degraded"}]}],
+                    "images": [{"image_path": "/tmp/missing-auth-heatmap.png", "alt_text": ""}],
+                },
+            ),
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication release blocker and risk prioritization guidance.",
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "authentication risk matrix with image and table evidence",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        returned_modalities = {item.chunk.modality for item in evidence.ranked_chunks}
+        self.assertIn("text", returned_modalities)
+        self.assertTrue({"table", "image", "image_ocr_stub"}.intersection(returned_modalities))
+
     def test_retrieve_evidence_reports_unavailable_corpus_coverage(self):
         docs = [
             IngestDocument(
