@@ -259,6 +259,43 @@ Missing negative authorization tests are release blocking.
         result = analyzer.analyze(test_report, query_for_context="auth retry heatmap risk matrix")
         self.assertTrue(any(source.startswith("record:auth-compound") for source in result.evidence_sources))
 
+    def test_initialize_corpus_accepts_bundled_ingestion_record_artifacts(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_refresh">
+                <failure type="RuntimeError">token refresh failure</failure>
+            </testcase>
+        </testsuite>"""
+        analyzer = RAGAnalyzer()
+        indexed = analyzer.initialize_corpus(
+            ingestion_records=[
+                IngestionRecord(
+                    source_id="record:bundle-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "artifacts": [
+                            {"artifact_id": "summary", "content": "Auth retry storms are release blocking."},
+                            {
+                                "artifact_id": "risk-table",
+                                "modality": "table",
+                                "content": {"rows": [{"component": "auth", "risk": "high"}]},
+                            },
+                            {
+                                "artifact_id": "heatmap",
+                                "modality": "image",
+                                "content": {"image_path": "screens/auth.png", "alt_text": "auth retry heatmap"},
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(indexed, 3)
+        result = analyzer.analyze(test_report, query_for_context="auth retry heatmap risk")
+        self.assertTrue(
+            any(source.startswith("record:bundle-auth::artifact:") for source in result.evidence_sources)
+        )
+
     def test_initialize_corpus_routes_code_snippet_records_to_code_aware_chunking(self):
         analyzer = RAGAnalyzer(chunker_type=ChunkerType.CODE_AWARE)
         indexed = analyzer.initialize_corpus(

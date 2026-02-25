@@ -912,6 +912,51 @@ Missing negative authorization tests are release blocking.
         self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in chunks))
         self.assertTrue(all("ingestion_route" in chunk.metadata for chunk in chunks))
 
+    def test_ingest_records_expands_artifact_bundle_payload(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:bundle-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "artifacts": [
+                            {
+                                "artifact_id": "summary",
+                                "content": "Auth retry storms spike on release candidates.",
+                            },
+                            {
+                                "artifact_id": "risk-table",
+                                "content": {"rows": [{"component": "auth", "risk": "high"}]},
+                                "modality": "table",
+                            },
+                            {
+                                "artifact_id": "heatmap",
+                                "content": {
+                                    "image_path": "screens/auth-heatmap.png",
+                                    "alt_text": "auth retry heatmap",
+                                },
+                                "modality": "image",
+                            },
+                        ]
+                    },
+                    metadata={"origin_path": "docs/incidents/auth-bundle.json"},
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(len(chunks), 3)
+        self.assertTrue(any(chunk.modality == "text" for chunk in chunks))
+        self.assertTrue(any(chunk.modality == "table" for chunk in chunks))
+        self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in chunks))
+        self.assertTrue(all(chunk.metadata.get("parent_source_id") == "record:bundle-auth" for chunk in chunks))
+        self.assertTrue(all(chunk.metadata.get("ingestion_route") == "record_bundle" for chunk in chunks))
+        self.assertTrue(
+            any(chunk.source_id == "record:bundle-auth::artifact:summary" for chunk in chunks)
+        )
+
     def test_ingest_records_resolves_markdown_file_reference_payload(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

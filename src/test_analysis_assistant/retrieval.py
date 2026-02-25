@@ -838,7 +838,9 @@ class MultiSourceIngestor:
         records: Sequence[IngestionRecord],
         generate_source_summaries: bool = False,
     ) -> List[Chunk]:
-        docs = [_normalize_ingestion_record(record) for record in records]
+        docs: List[IngestDocument] = []
+        for record in records:
+            docs.extend(_normalize_ingestion_record_to_docs(record))
         if not docs:
             return []
         return self._engine.ingest_documents(
@@ -1466,6 +1468,98 @@ def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:
         modality=normalized_modality,
         metadata=metadata,
     )
+
+
+def _normalize_ingestion_record_to_docs(record: IngestionRecord) -> List[IngestDocument]:
+    bundled_docs = _expand_record_artifacts(record)
+    if bundled_docs:
+        return bundled_docs
+    return [_normalize_ingestion_record(record)]
+
+
+def _expand_record_artifacts(record: IngestionRecord) -> List[IngestDocument]:
+    payload = record.payload
+    if not isinstance(payload, dict):
+        return []
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        return []
+
+    docs: List[IngestDocument] = []
+    parent_source_id = record.source_id
+    parent_metadata = dict(record.metadata)
+
+    for artifact_idx, artifact in enumerate(artifacts):
+        artifact_payload: Any = artifact
+        artifact_modality = "auto"
+        artifact_source_type = record.source_type
+        artifact_id = str(artifact_idx)
+        child_source_id = f"{parent_source_id}::artifact:{artifact_id}"
+
+        if isinstance(artifact, dict):
+            artifact_payload = _extract_artifact_payload(artifact)
+            artifact_modality = str(artifact.get("modality", "auto") or "auto").strip().lower()
+            source_type_value = artifact.get("source_type")
+            if isinstance(source_type_value, SourceType):
+                artifact_source_type = source_type_value
+            elif isinstance(source_type_value, str):
+                try:
+                    artifact_source_type = SourceType(source_type_value.strip().lower())
+                except ValueError:
+                    artifact_source_type = record.source_type
+            artifact_id = _normalize_artifact_id(
+                artifact.get("artifact_id") or artifact.get("id") or artifact.get("name") or artifact_idx
+            )
+            explicit_source_id = artifact.get("source_id")
+            if isinstance(explicit_source_id, str) and explicit_source_id.strip():
+                child_source_id = explicit_source_id.strip()
+            else:
+                child_source_id = f"{parent_source_id}::artifact:{artifact_id}"
+
+        artifact_metadata = dict(parent_metadata)
+        artifact_metadata.update(
+            {
+                "parent_source_id": parent_source_id,
+                "artifact_index": artifact_idx,
+                "artifact_id": artifact_id,
+            }
+        )
+
+        if isinstance(artifact, dict) and isinstance(artifact.get("metadata"), dict):
+            artifact_metadata.update(artifact["metadata"])
+
+        normalized = _normalize_ingestion_record(
+            IngestionRecord(
+                source_id=child_source_id,
+                source_type=artifact_source_type,
+                payload=artifact_payload,
+                modality=artifact_modality,
+                metadata=artifact_metadata,
+            )
+        )
+        prior_route = str(normalized.metadata.get("ingestion_route", "")).strip()
+        if prior_route:
+            normalized.metadata["artifact_ingestion_route"] = prior_route
+        normalized.metadata["ingestion_route"] = "record_bundle"
+        docs.append(normalized)
+
+    return docs
+
+
+def _extract_artifact_payload(artifact: Dict[str, Any]) -> Any:
+    for key in ("content", "payload", "data", "value", "body"):
+        if key in artifact:
+            return artifact[key]
+    return artifact
+
+
+def _normalize_artifact_id(raw_value: Any) -> str:
+    value = str(raw_value or "").strip().lower()
+    if not value:
+        return "0"
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", value)
+    cleaned = cleaned.strip("-")
+    return cleaned or "0"
 
 
 def _infer_record_modality_and_payload(payload: Any) -> Tuple[str, Any]:
