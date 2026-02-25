@@ -244,6 +244,9 @@ class RetrievalEngine:
                     )
                 )
 
+        _apply_corroboration_bonus(scored)
+        _apply_corroboration_bonus(fallback)
+
         scored.sort(
             key=lambda item: (
                 -item.score,
@@ -1696,6 +1699,44 @@ def _fuse_ranked_chunks(primary: Sequence[RankedChunk], supplemental: Sequence[R
     return fused
 
 
+def _apply_corroboration_bonus(candidates: Sequence[RankedChunk], max_bonus: float = 0.10) -> None:
+    if not candidates:
+        return
+
+    term_sources: Dict[str, set] = {}
+    term_source_types: Dict[str, set] = {}
+    term_modalities: Dict[str, set] = {}
+
+    for item in candidates:
+        for term in set(item.matched_terms):
+            term_sources.setdefault(term, set()).add(item.chunk.source_id)
+            term_source_types.setdefault(term, set()).add(item.chunk.source_type)
+            term_modalities.setdefault(term, set()).add(item.chunk.modality)
+
+    for item in candidates:
+        if not item.matched_terms:
+            item.score_breakdown["corroboration"] = 0.0
+            continue
+
+        term_scores: List[float] = []
+        for term in set(item.matched_terms):
+            support_sources = max(0, len(term_sources.get(term, set())) - 1)
+            support_types = max(0, len(term_source_types.get(term, set())) - 1)
+            support_modalities = max(0, len(term_modalities.get(term, set())) - 1)
+            corroboration = min(
+                1.0,
+                (support_sources * 0.22) + (support_types * 0.40) + (support_modalities * 0.20),
+            )
+            term_scores.append(corroboration)
+
+        aggregate = sum(term_scores) / max(len(term_scores), 1)
+        breadth = min(1.0, len(set(item.matched_terms)) / 3.0)
+        aggregate *= breadth
+        bonus = min(max_bonus, aggregate * max_bonus)
+        item.score += bonus
+        item.score_breakdown["corroboration"] = round(aggregate, 4)
+
+
 def _select_coverage_aware_top(
     candidates: Sequence[RankedChunk],
     plan: QueryPlan,
@@ -2088,6 +2129,9 @@ class HybridRetrievalEngine(RetrievalEngine):
                         score_breakdown=breakdown,
                     )
                 )
+
+        _apply_corroboration_bonus(scored)
+        _apply_corroboration_bonus(fallback)
 
         # Sort and select results
         scored.sort(

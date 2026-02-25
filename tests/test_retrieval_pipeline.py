@@ -167,6 +167,64 @@ class TestRetrievalPipeline(unittest.TestCase):
             self.assertEqual(evidence.retrieval_strategy, "adaptive_recovery")
             self.assertGreaterEqual(len(evidence.recovery_queries), 1)
 
+    def test_query_exposes_corroboration_score_component(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication token refresh failure requires mitigation plan.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Incident diagnostics confirm token refresh failure in production.",
+            ),
+            IngestDocument(
+                source_id="kb-isolated",
+                source_type=SourceType.KNOWLEDGE,
+                content="Playbook for release governance and compliance review.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query("token refresh failure mitigation", top_k=3, diversify=False)
+
+        self.assertGreaterEqual(len(ranked), 2)
+        for item in ranked:
+            self.assertIn("corroboration", item.score_breakdown)
+
+    def test_query_assigns_higher_corroboration_to_multisource_supported_chunk(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Token refresh failure needs auth mitigation and test coverage updates.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Auth incident review confirms token refresh failure and mitigation workstream.",
+            ),
+            IngestDocument(
+                source_id="kb-noise",
+                source_type=SourceType.KNOWLEDGE,
+                content="Mitigation playbook for governance reporting and audit readiness.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query("token refresh failure mitigation", top_k=3, diversify=False)
+        by_source = {item.chunk.source_id: item for item in ranked}
+
+        self.assertIn("req-auth", by_source)
+        self.assertIn("kb-noise", by_source)
+        self.assertGreater(
+            by_source["req-auth"].score_breakdown.get("corroboration", 0.0),
+            by_source["kb-noise"].score_breakdown.get("corroboration", 0.0),
+        )
+
     def test_multisource_ingestor_reads_repository_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
