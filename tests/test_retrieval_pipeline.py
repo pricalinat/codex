@@ -1390,6 +1390,77 @@ Missing negative authorization tests are release blocking.
             any(chunk.source_id == "record:bundle-auth::artifact:summary" for chunk in chunks)
         )
 
+    def test_ingest_records_extracts_reference_metadata_from_structured_payload(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:incident-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "text": "Authentication retries increased after release candidate deployment.",
+                        "references": {
+                            "source_ids": ["req-auth", "repo:src/auth/token.py"],
+                            "paths": ["src/auth/token.py", "docs/requirements/auth.md"],
+                        },
+                        "linked_source_id": "req-auth",
+                    },
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(len(chunks), 1)
+        primary = next(chunk for chunk in chunks if chunk.source_id == "record:incident-auth")
+        self.assertEqual(primary.metadata.get("linked_source_id"), "req-auth")
+        self.assertIn("req-auth", primary.metadata.get("referenced_source_ids", []))
+        self.assertIn("repo:src/auth/token.py", primary.metadata.get("referenced_source_ids", []))
+        self.assertIn("src/auth/token.py", primary.metadata.get("referenced_paths", []))
+        self.assertIn("docs/requirements/auth.md", primary.metadata.get("referenced_paths", []))
+
+    def test_artifact_bundle_item_references_flow_into_graph_scoring(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="req-auth",
+                    source_type=SourceType.REQUIREMENTS,
+                    payload="Auth requirements mandate negative credential tests before release.",
+                ),
+                IngestionRecord(
+                    source_id="record:bundle-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "artifacts": [
+                            {
+                                "artifact_id": "summary",
+                                "content": "Retry storms in auth service increased incident risk.",
+                                "references": {
+                                    "source_ids": ["req-auth"],
+                                    "paths": ["docs/requirements/auth.md"],
+                                },
+                            }
+                        ]
+                    },
+                ),
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry storm release requirements evidence",
+            top_k=3,
+            diversify=False,
+        )
+
+        by_source = {item.chunk.source_id: item for item in ranked}
+        self.assertIn("record:bundle-auth::artifact:summary", by_source)
+        artifact = by_source["record:bundle-auth::artifact:summary"]
+        self.assertIn("req-auth", artifact.chunk.metadata.get("referenced_source_ids", []))
+        self.assertGreater(artifact.score_breakdown.get("citation_graph", 0.0), 0.0)
+
     def test_artifact_bundle_parent_links_enable_graph_bonus_and_confidence_support(self):
         engine = RetrievalEngine()
         ingestor = MultiSourceIngestor(engine)

@@ -1542,6 +1542,13 @@ def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:
         else:
             metadata.setdefault("ingestion_route", "pipeline_ocr_stub")
 
+    metadata.update(
+        _extract_record_reference_metadata(
+            payload=normalized_payload,
+            metadata=metadata,
+        )
+    )
+
     return IngestDocument(
         source_id=record.source_id,
         source_type=record.source_type,
@@ -1608,6 +1615,8 @@ def _expand_record_artifacts(record: IngestionRecord) -> List[IngestDocument]:
 
         if isinstance(artifact, dict) and isinstance(artifact.get("metadata"), dict):
             artifact_metadata.update(artifact["metadata"])
+        if isinstance(artifact, dict):
+            artifact_metadata.update(_lift_artifact_reference_fields(artifact))
 
         normalized = _normalize_ingestion_record(
             IngestionRecord(
@@ -1632,6 +1641,125 @@ def _extract_artifact_payload(artifact: Dict[str, Any]) -> Any:
         if key in artifact:
             return artifact[key]
     return artifact
+
+
+def _lift_artifact_reference_fields(artifact: Dict[str, Any]) -> Dict[str, Any]:
+    lifted: Dict[str, Any] = {}
+    for key in (
+        "references",
+        "referenced_source_ids",
+        "referenced_paths",
+        "linked_source_id",
+        "source_ids",
+        "paths",
+        "related_sources",
+        "related_paths",
+        "depends_on",
+        "citations",
+    ):
+        if key in artifact:
+            lifted[key] = artifact[key]
+    return lifted
+
+
+def _extract_record_reference_metadata(
+    payload: Any,
+    metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    source_ids: List[str] = []
+    paths: List[str] = []
+    linked_source_id = ""
+
+    def add_source_id(raw: Any) -> None:
+        token = _normalize_reference_token(str(raw or ""))
+        if token:
+            source_ids.append(token)
+
+    def add_path(raw: Any) -> None:
+        normalized = _normalize_reference_path(str(raw or ""))
+        if normalized:
+            paths.append(normalized)
+
+    def consume_source_value(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            add_source_id(value)
+            return
+        if isinstance(value, dict):
+            for key in ("source_id", "id", "source"):
+                if key in value:
+                    consume_source_value(value.get(key))
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                consume_source_value(item)
+
+    def consume_path_value(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            add_path(value)
+            return
+        if isinstance(value, dict):
+            for key in ("path", "file_path", "origin_path"):
+                if key in value:
+                    consume_path_value(value.get(key))
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                consume_path_value(item)
+
+    def harvest(container: Any) -> None:
+        nonlocal linked_source_id
+        if not isinstance(container, dict):
+            return
+
+        linked = str(container.get("linked_source_id", "")).strip()
+        if linked and not linked_source_id:
+            linked_source_id = _normalize_reference_token(linked)
+
+        for key in ("referenced_source_ids", "source_ids", "related_sources", "depends_on"):
+            if key in container:
+                consume_source_value(container.get(key))
+        for key in ("referenced_paths", "paths", "related_paths", "file_paths", "evidence_paths"):
+            if key in container:
+                consume_path_value(container.get(key))
+
+        refs = container.get("references")
+        if isinstance(refs, dict):
+            harvest(refs)
+        elif isinstance(refs, (list, tuple, set)):
+            for item in refs:
+                if isinstance(item, dict):
+                    harvest(item)
+
+        citations = container.get("citations")
+        if isinstance(citations, dict):
+            harvest(citations)
+        elif isinstance(citations, (list, tuple, set)):
+            for item in citations:
+                if isinstance(item, dict):
+                    harvest(item)
+
+    harvest(metadata or {})
+    harvest(payload)
+
+    # Keep explicit metadata relationships, then merge harvested references.
+    source_ids = _dedupe(_coerce_str_list((metadata or {}).get("referenced_source_ids")) + source_ids)
+    paths = _dedupe(
+        [p for p in (_normalize_reference_path(raw) for raw in _coerce_str_list((metadata or {}).get("referenced_paths"))) if p]
+        + paths
+    )
+
+    result: Dict[str, Any] = {}
+    if linked_source_id:
+        result["linked_source_id"] = linked_source_id
+    if source_ids:
+        result["referenced_source_ids"] = source_ids
+    if paths:
+        result["referenced_paths"] = paths
+    return result
 
 
 def _normalize_artifact_id(raw_value: Any) -> str:
