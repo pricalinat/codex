@@ -3664,6 +3664,10 @@ def _calibrate_retrieval_confidence(
             max(0.0, min(1.0, float(item.score_breakdown.get("citation_graph", 0.0))))
             for item in ranked
         ) / len(ranked)
+        provenance_chain_support = sum(
+            max(0.0, min(1.0, float(item.score_breakdown.get("provenance_chain", 0.0))))
+            for item in ranked
+        ) / len(ranked)
         repository_map_support = sum(
             max(0.0, min(1.0, float(item.score_breakdown.get("repo_map", 0.0))))
             for item in ranked
@@ -3682,6 +3686,7 @@ def _calibrate_retrieval_confidence(
         artifact_graph_support = 0.0
         artifact_parent_support = 0.0
         citation_graph_support = 0.0
+        provenance_chain_support = 0.0
         repository_map_support = 0.0
 
     unavailable_pressure = 0.0
@@ -3704,6 +3709,7 @@ def _calibrate_retrieval_confidence(
         + (0.008 * artifact_graph_support)
         + (0.012 * artifact_parent_support)
         + (0.012 * citation_graph_support)
+        + (0.014 * provenance_chain_support)
         + (0.010 * repository_map_support)
     )
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio) + (0.16 * cross_source_conflict)
@@ -3743,6 +3749,7 @@ def _calibrate_retrieval_confidence(
         "artifact_graph_support": round(max(0.0, min(1.0, artifact_graph_support)), 4),
         "artifact_parent_support": round(max(0.0, min(1.0, artifact_parent_support)), 4),
         "citation_graph_support": round(max(0.0, min(1.0, citation_graph_support)), 4),
+        "provenance_chain_support": round(max(0.0, min(1.0, provenance_chain_support)), 4),
         "repository_map_support": round(max(0.0, min(1.0, repository_map_support)), 4),
     }
     return round(calibrated, 4), factors
@@ -4093,6 +4100,7 @@ def _apply_artifact_graph_bonus(
             item.score_breakdown["artifact_graph"] = 0.0
             item.score_breakdown["artifact_parent"] = 0.0
             item.score_breakdown["citation_graph"] = 0.0
+            item.score_breakdown["provenance_chain"] = 0.0
             continue
 
         related_chunks = list(related.values())
@@ -4100,6 +4108,7 @@ def _apply_artifact_graph_bonus(
         related_sources = {chunk.source_type for chunk in related_chunks}
         lexical_hits = sum(1 for chunk in related_chunks if query_terms.intersection(set(_tokenize(chunk.text))))
         citation_support = _citation_graph_support(item.chunk, related_chunks)
+        provenance_support = _provenance_chain_support(item.chunk, related_chunks)
 
         modality_support = (
             len(related_modalities.intersection(set(modality_targets))) / len(modality_targets)
@@ -4115,17 +4124,19 @@ def _apply_artifact_graph_bonus(
 
         aggregate = min(
             1.0,
-            (modality_support * 0.34)
-            + (source_support * 0.13)
-            + (lexical_bridge * 0.20)
-            + (citation_support * 0.18)
-            + (parent_support * 0.15),
+            (modality_support * 0.29)
+            + (source_support * 0.12)
+            + (lexical_bridge * 0.18)
+            + (citation_support * 0.14)
+            + (parent_support * 0.12)
+            + (provenance_support * 0.15),
         )
         bonus = min(max_bonus, aggregate * max_bonus)
         item.score += bonus
         item.score_breakdown["artifact_graph"] = round(aggregate, 4)
         item.score_breakdown["artifact_parent"] = round(parent_support, 4)
         item.score_breakdown["citation_graph"] = round(citation_support, 4)
+        item.score_breakdown["provenance_chain"] = round(provenance_support, 4)
 
 
 def _citation_graph_support(chunk: Chunk, related_chunks: Sequence[Chunk]) -> float:
@@ -4154,6 +4165,54 @@ def _citation_graph_support(chunk: Chunk, related_chunks: Sequence[Chunk]) -> fl
     source_support = source_hits / max(1, len(referenced_sources)) if referenced_sources else 0.0
     path_support = path_hits / max(1, len(referenced_paths)) if referenced_paths else 0.0
     return min(1.0, (source_support * 0.8) + (path_support * 0.2))
+
+
+def _provenance_chain_support(chunk: Chunk, related_chunks: Sequence[Chunk]) -> float:
+    referenced_sources = set(_chunk_referenced_sources(chunk))
+    referenced_paths: set = set()
+    for raw in _coerce_str_list(chunk.metadata.get("referenced_paths")):
+        normalized = _normalize_reference_path(raw)
+        if normalized:
+            referenced_paths.add(normalized)
+    if not referenced_sources and not referenced_paths:
+        return 0.0
+
+    chunk_source_id = _normalize_reference_token(str(chunk.source_id).strip())
+    source_hits = 0
+    source_quality_total = 0.0
+    source_reciprocal_hits = 0
+    resolved_paths: set = set()
+
+    for related in related_chunks:
+        related_source_id = _normalize_reference_token(str(related.source_id).strip())
+        related_paths: set = set()
+        for raw in (related.metadata.get("path"), related.metadata.get("origin_path")):
+            normalized = _normalize_reference_path(str(raw or ""))
+            if normalized:
+                related_paths.add(normalized)
+
+        if related_source_id and related_source_id in referenced_sources:
+            source_hits += 1
+            source_quality_total += (_source_reliability(related) * 0.70) + (_ingestion_route_quality(related) * 0.30)
+            if chunk_source_id and chunk_source_id in set(_chunk_referenced_sources(related)):
+                source_reciprocal_hits += 1
+
+        if referenced_paths and related_paths:
+            overlap = referenced_paths.intersection(related_paths)
+            if overlap:
+                resolved_paths.update(overlap)
+
+    source_coverage = (source_hits / len(referenced_sources)) if referenced_sources else 0.0
+    path_coverage = (len(resolved_paths) / len(referenced_paths)) if referenced_paths else 0.0
+    if referenced_sources and referenced_paths:
+        coverage = (source_coverage * 0.8) + (path_coverage * 0.2)
+    else:
+        coverage = source_coverage if referenced_sources else path_coverage
+
+    avg_quality = (source_quality_total / source_hits) if source_hits else 0.0
+    reciprocity = (source_reciprocal_hits / source_hits) if source_hits else 0.0
+    chain = (coverage * 0.58) + (avg_quality * 0.30) + (reciprocity * 0.12)
+    return max(0.0, min(1.0, chain))
 
 
 def _chunk_link_keys(chunk: Chunk) -> List[str]:

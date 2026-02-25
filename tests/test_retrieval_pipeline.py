@@ -925,6 +925,96 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("citation_graph_support", evidence.confidence_factors)
         self.assertGreater(evidence.confidence_factors["citation_graph_support"], 0.0)
 
+    def test_query_prefers_bidirectional_provenance_chain_over_weak_citations(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication retry mitigation requires negative tests and release gating.",
+                metadata={"ingestion_route": "pipeline_verified"},
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "Incident analysis cites [source:req-auth] and confirms retry storms in auth gateway."
+                ),
+                metadata={"ingestion_route": "pipeline_verified"},
+            ),
+            IngestDocument(
+                source_id="repo-strong-chain",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Patch notes cite [source:req-auth] and [source:sys-auth] "
+                    "for authentication retry mitigation and release gating."
+                ),
+                metadata={"ingestion_route": "pipeline_verified"},
+            ),
+            IngestDocument(
+                source_id="repo-weak-chain",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Patch notes mention [source:req-missing] for authentication retry mitigation "
+                    "and release gating."
+                ),
+                metadata={"ingestion_route": "pipeline_detected"},
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        ranked = engine.query("authentication retry mitigation release gating", top_k=4, diversify=False)
+        by_source = {item.chunk.source_id: item for item in ranked}
+
+        self.assertIn("repo-strong-chain", by_source)
+        self.assertIn("repo-weak-chain", by_source)
+        self.assertGreater(
+            by_source["repo-strong-chain"].score_breakdown.get("provenance_chain", 0.0),
+            by_source["repo-weak-chain"].score_breakdown.get("provenance_chain", 0.0),
+        )
+        self.assertGreater(
+            by_source["repo-strong-chain"].score,
+            by_source["repo-weak-chain"].score,
+        )
+
+    def test_retrieve_evidence_reports_provenance_chain_support_factor(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication retry mitigation requires negative tests and release gating.",
+                metadata={"ingestion_route": "pipeline_verified"},
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Incident report references [source:req-auth] for retry failure context.",
+                metadata={"ingestion_route": "pipeline_verified"},
+            ),
+            IngestDocument(
+                source_id="repo-auth",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Code fix references [source:req-auth] and [source:sys-auth] "
+                    "for authentication retry mitigation."
+                ),
+                metadata={"ingestion_route": "pipeline_verified"},
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        evidence = engine.retrieve_evidence(
+            "authentication retry mitigation release gating",
+            top_k=4,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("provenance_chain_support", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["provenance_chain_support"], 0.0)
+
     def test_retrieve_evidence_reports_lineage_coherence_factor(self):
         docs = [
             IngestDocument(
