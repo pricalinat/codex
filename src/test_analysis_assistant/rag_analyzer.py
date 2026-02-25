@@ -323,6 +323,7 @@ class RAGAnalyzer:
         missing_artifacts = {"source_types": set(), "modalities": set()}
         unavailable_artifacts = {"source_types": set(), "modalities": set()}
         retrieval_confidences: List[float] = []
+        retrieval_confidences_raw: List[float] = []
 
         for query in queries:
             evidence = self._engine.retrieve_evidence(query, top_k=5, diversify=True)
@@ -330,7 +331,8 @@ class RAGAnalyzer:
             if not ranked:
                 continue
 
-            retrieval_confidences.append(evidence.aggregate_confidence)
+            retrieval_confidences.append(evidence.calibrated_confidence)
+            retrieval_confidences_raw.append(evidence.aggregate_confidence)
             for missing_source in evidence.missing_source_types:
                 missing_artifacts["source_types"].add(missing_source.value)
             for missing_modality in evidence.missing_modalities:
@@ -375,6 +377,11 @@ class RAGAnalyzer:
         if retrieval_confidences:
             risk_factors["retrieval_confidence"] = round(
                 sum(retrieval_confidences) / len(retrieval_confidences),
+                4,
+            )
+        if retrieval_confidences_raw:
+            risk_factors["retrieval_confidence_raw"] = round(
+                sum(retrieval_confidences_raw) / len(retrieval_confidences_raw),
                 4,
             )
         if missing_artifacts["source_types"] or missing_artifacts["modalities"]:

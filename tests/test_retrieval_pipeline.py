@@ -125,6 +125,61 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertLessEqual(evidence.aggregate_confidence, 1.0)
         self.assertIn(evidence.confidence_band, {"low", "medium", "high"})
 
+    def test_retrieve_evidence_calibrates_confidence_for_missing_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication risk requires release prioritization and mitigation plan.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table risk matrix for authentication gaps",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("source_coverage", evidence.confidence_factors)
+        self.assertIn("modality_coverage", evidence.confidence_factors)
+        self.assertIn("ocr_stub_ratio", evidence.confidence_factors)
+        self.assertLess(evidence.calibrated_confidence, evidence.aggregate_confidence)
+        self.assertLess(evidence.confidence_factors["modality_coverage"], 1.0)
+
+    def test_retrieve_evidence_calibration_stays_close_with_rich_multimodal_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="compound-rich",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Auth release risk matrix identifies retry storms and priority mitigations.",
+                    "tables": [{"rows": [{"component": "auth", "risk": "high", "priority": "p0"}]}],
+                    "images": [{"ocr_text": "auth retry heatmap with risk clusters"}],
+                },
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table risk matrix for auth retry storms",
+            top_k=5,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertGreaterEqual(evidence.confidence_factors["modality_coverage"], 0.75)
+        self.assertGreaterEqual(
+            evidence.calibrated_confidence,
+            evidence.aggregate_confidence * 0.7,
+        )
+
     def test_retrieve_evidence_adaptive_recovery_adds_missing_modalities(self):
         docs = [
             IngestDocument(

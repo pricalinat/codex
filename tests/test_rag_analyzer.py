@@ -133,6 +133,11 @@ class TestRAGAnalyzer(unittest.TestCase):
         self.assertIn("retrieval_confidence", result.risk_assessment)
         self.assertGreaterEqual(result.risk_assessment["retrieval_confidence"], 0.0)
         self.assertLessEqual(result.risk_assessment["retrieval_confidence"], 1.0)
+        self.assertIn("retrieval_confidence_raw", result.risk_assessment)
+        self.assertGreaterEqual(
+            result.risk_assessment["retrieval_confidence_raw"],
+            result.risk_assessment["retrieval_confidence"],
+        )
 
     def test_analyze_prompt_includes_source_bundle_summary(self):
         test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">

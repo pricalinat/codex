@@ -75,7 +75,9 @@ class RetrievalEvidence:
     unavailable_preferred_source_types: List[SourceType] = field(default_factory=list)
     unavailable_preferred_modalities: List[str] = field(default_factory=list)
     aggregate_confidence: float = 0.0
+    calibrated_confidence: float = 0.0
     confidence_band: str = "low"
+    confidence_factors: Dict[str, float] = field(default_factory=dict)
     retrieval_strategy: str = "baseline"
     recovery_applied: bool = False
     recovery_queries: List[str] = field(default_factory=list)
@@ -405,6 +407,15 @@ class RetrievalEngine:
             modality for modality in plan.preferred_modalities if modality not in corpus_available_modalities
         ]
         aggregate_confidence = _aggregate_confidence(ranked)
+        calibrated_confidence, confidence_factors = _calibrate_retrieval_confidence(
+            ranked=ranked,
+            plan=plan,
+            aggregate_confidence=aggregate_confidence,
+            missing_sources=missing_sources,
+            missing_modalities=missing_modalities,
+            unavailable_sources=unavailable_sources,
+            unavailable_modalities=unavailable_modalities,
+        )
         recovery_applied = False
         recovery_queries: List[str] = []
         retrieval_strategy = "baseline"
@@ -450,11 +461,20 @@ class RetrievalEngine:
                     missing_modalities = [
                         modality for modality in plan.preferred_modalities if modality not in covered_modalities
                     ]
+                    calibrated_confidence, confidence_factors = _calibrate_retrieval_confidence(
+                        ranked=ranked,
+                        plan=plan,
+                        aggregate_confidence=aggregate_confidence,
+                        missing_sources=missing_sources,
+                        missing_modalities=missing_modalities,
+                        unavailable_sources=unavailable_sources,
+                        unavailable_modalities=unavailable_modalities,
+                    )
 
         source_bundles = _build_source_bundles(ranked, plan)
-        if aggregate_confidence >= 0.72:
+        if calibrated_confidence >= 0.72:
             band = "high"
-        elif aggregate_confidence >= 0.45:
+        elif calibrated_confidence >= 0.45:
             band = "medium"
         else:
             band = "low"
@@ -473,7 +493,9 @@ class RetrievalEngine:
             unavailable_preferred_source_types=unavailable_sources,
             unavailable_preferred_modalities=unavailable_modalities,
             aggregate_confidence=aggregate_confidence,
+            calibrated_confidence=calibrated_confidence,
             confidence_band=band,
+            confidence_factors=confidence_factors,
             retrieval_strategy=retrieval_strategy,
             recovery_applied=recovery_applied,
             recovery_queries=recovery_queries,
@@ -1538,6 +1560,54 @@ def _aggregate_confidence(ranked: Sequence[RankedChunk]) -> float:
     if weight_sum == 0:
         return 0.0
     return round(max(0.0, min(1.0, weighted_total / weight_sum)), 4)
+
+
+def _calibrate_retrieval_confidence(
+    ranked: Sequence[RankedChunk],
+    plan: QueryPlan,
+    aggregate_confidence: float,
+    missing_sources: Sequence[SourceType],
+    missing_modalities: Sequence[str],
+    unavailable_sources: Sequence[SourceType],
+    unavailable_modalities: Sequence[str],
+) -> Tuple[float, Dict[str, float]]:
+    preferred_sources = len(plan.preferred_source_types)
+    preferred_modalities = len(plan.preferred_modalities)
+    source_coverage = 1.0 - (len(missing_sources) / preferred_sources) if preferred_sources else 1.0
+    modality_coverage = 1.0 - (len(missing_modalities) / preferred_modalities) if preferred_modalities else 1.0
+
+    if ranked:
+        ocr_stub_count = sum(1 for item in ranked if item.chunk.modality == "image_ocr_stub")
+        low_conf_count = sum(1 for item in ranked if item.confidence < 0.35)
+        ocr_stub_ratio = ocr_stub_count / len(ranked)
+        low_signal_ratio = low_conf_count / len(ranked)
+    else:
+        ocr_stub_ratio = 0.0
+        low_signal_ratio = 1.0
+
+    unavailable_pressure = 0.0
+    if preferred_sources:
+        unavailable_pressure += (len(unavailable_sources) / preferred_sources) * 0.6
+    if preferred_modalities:
+        unavailable_pressure += (len(unavailable_modalities) / preferred_modalities) * 0.4
+    unavailable_pressure = max(0.0, min(1.0, unavailable_pressure))
+
+    coverage_multiplier = (0.56 + (0.24 * source_coverage) + (0.20 * modality_coverage))
+    quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio)
+    availability_penalty = 0.08 * unavailable_pressure
+
+    calibrated = aggregate_confidence * coverage_multiplier
+    calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty)
+    calibrated = max(0.0, min(1.0, calibrated))
+
+    factors = {
+        "source_coverage": round(max(0.0, min(1.0, source_coverage)), 4),
+        "modality_coverage": round(max(0.0, min(1.0, modality_coverage)), 4),
+        "ocr_stub_ratio": round(max(0.0, min(1.0, ocr_stub_ratio)), 4),
+        "low_signal_ratio": round(max(0.0, min(1.0, low_signal_ratio)), 4),
+        "unavailable_pressure": round(unavailable_pressure, 4),
+    }
+    return round(calibrated, 4), factors
 
 
 def _build_source_bundles(
