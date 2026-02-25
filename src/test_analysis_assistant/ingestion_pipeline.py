@@ -222,9 +222,18 @@ class UnifiedIngestionPipeline:
 
         try:
             # Detect content type
-            content_result = detect_content_type(str(document.content))
+            detection_text = self._build_detection_text(document.content)
+            source_hint = str(
+                document.metadata.get("file_path")
+                or document.metadata.get("path")
+                or document.source_id
+            )
+            content_result = detect_content_type(detection_text, source_hint=source_hint)
             content_category = content_result.category
-            ingestion_strategy = suggest_ingestion_strategy(content_category)
+            recommended_chunker, recommended_source_type = suggest_ingestion_strategy(
+                detection_text,
+                source_hint=source_hint,
+            )
 
             # Get source config
             source_config = self._config.sources.get(
@@ -234,14 +243,43 @@ class UnifiedIngestionPipeline:
 
             # Route to appropriate handler
             # Route based on modality in document metadata
+            route_name = "text"
             if document.modality == "table" or content_category == ContentCategory.STRUCTURED_DATA:
+                route_name = "table"
                 chunks = self._process_table_content(document, source_config)
+                if not chunks:
+                    route_name = "table_fallback_text"
+                    chunks = self._process_text_content(document, source_config)
             elif document.modality == "image":
+                route_name = "image"
                 chunks = self._process_image_content(document, source_config)
-            elif document.source_type == SourceType.CODE_SNIPPET:
+            elif (
+                document.source_type == SourceType.CODE_SNIPPET
+                or recommended_chunker == "code_aware"
+            ):
+                route_name = "code"
                 chunks = self._process_code_content(document, source_config)
             else:
                 chunks = self._process_text_content(document, source_config)
+            self._attach_detection_metadata(
+                chunks=chunks,
+                document=document,
+                route_name=route_name,
+                detection_category=content_result.category.value,
+                detection_confidence=content_result.confidence,
+                recommended_chunker=recommended_chunker,
+                recommended_source_type=recommended_source_type,
+                detected_language=(
+                    content_result.detected_language.value
+                    if content_result.detected_language
+                    else ""
+                ),
+                detected_doc_type=(
+                    content_result.detected_doc_type.value
+                    if content_result.detected_doc_type
+                    else ""
+                ),
+            )
 
             result.chunks = chunks
             result.source_stats[document.source_type] = len(chunks)
@@ -260,6 +298,51 @@ class UnifiedIngestionPipeline:
             logger.error(f"Error processing document {document.source_id}: {e}")
 
         return result
+
+    def _build_detection_text(self, content: Any) -> str:
+        """Build normalized text used for content-type detection."""
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, dict):
+            text_parts: List[str] = []
+            text_value = content.get("text")
+            if isinstance(text_value, str):
+                text_parts.append(text_value)
+            for key in ("tables", "images"):
+                value = content.get(key)
+                if value:
+                    text_parts.append(str(value))
+            if text_parts:
+                return "\n".join(text_parts)
+        return str(content)
+
+    def _attach_detection_metadata(
+        self,
+        chunks: Sequence[Chunk],
+        document: IngestDocument,
+        route_name: str,
+        detection_category: str,
+        detection_confidence: float,
+        recommended_chunker: str,
+        recommended_source_type: str,
+        detected_language: str,
+        detected_doc_type: str,
+    ) -> None:
+        """Attach detection and routing metadata used by downstream retrieval scoring."""
+        for chunk in chunks:
+            chunk.metadata.setdefault("ingestion_route", "pipeline_detected")
+            chunk.metadata.setdefault("source_id", document.source_id)
+            chunk.metadata["processing_handler"] = route_name
+            chunk.metadata["detection_category"] = detection_category
+            chunk.metadata["detection_confidence"] = round(float(detection_confidence), 4)
+            chunk.metadata["recommended_chunker"] = recommended_chunker
+            chunk.metadata["recommended_source_type"] = recommended_source_type
+            if detected_language:
+                chunk.metadata["detected_language"] = detected_language
+            if detected_doc_type:
+                chunk.metadata["detected_doc_type"] = detected_doc_type
 
     def process_batch(
         self, documents: Sequence[IngestDocument]
@@ -450,6 +533,7 @@ class UnifiedIngestionPipeline:
                     text=chunk_text,
                     token_count=self._estimate_tokens(chunk_text),
                     metadata={
+                        **document.metadata,
                         "language": language.value if language else "unknown",
                         "unit_type": unit.unit_type,
                         "unit_name": unit.name,
@@ -458,7 +542,21 @@ class UnifiedIngestionPipeline:
                     },
                 ))
 
-        # If no units extracted or content too large, fall back to text processing
+        # If no units extracted, degrade gracefully with code-labeled chunks.
+        if not chunks and content.strip():
+            text_chunks = self._split_large_text(content, document, config)
+            for chunk in text_chunks:
+                chunk.modality = "code"
+                chunk.metadata.update(
+                    {
+                        **document.metadata,
+                        "language": language.value if language else "unknown",
+                        "unit_type": "snippet_fallback",
+                    }
+                )
+            return text_chunks
+
+        # If content is empty, fall back to text processing
         if not chunks:
             return self._process_text_content(document, config)
 

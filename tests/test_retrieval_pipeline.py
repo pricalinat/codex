@@ -5,6 +5,7 @@ from pathlib import Path
 from src.test_analysis_assistant.retrieval import (
     AnalysisEvidencePack,
     ArtifactBundle,
+    Chunk,
     DummyEmbeddingProvider,
     FocusedEvidence,
     HybridRetrievalEngine,
@@ -15,6 +16,7 @@ from src.test_analysis_assistant.retrieval import (
     RetrievalEngine,
     SourceType,
     TFIDFEmbeddingProvider,
+    _extraction_quality,
     build_analysis_prompt,
     build_analysis_prompt_from_evidence,
     build_analysis_prompt_from_pack,
@@ -2332,6 +2334,28 @@ class TestHybridRetrievalEngine(unittest.TestCase):
         self.assertIn("source_reliability", evidence.confidence_factors)
         self.assertGreaterEqual(evidence.confidence_factors["source_reliability"], 0.0)
         self.assertLessEqual(evidence.confidence_factors["source_reliability"], 1.0)
+
+    def test_detection_confidence_improves_extraction_quality(self):
+        low = Chunk(
+            chunk_id="low",
+            source_id="src-low",
+            source_type=SourceType.KNOWLEDGE,
+            modality="text",
+            text="authentication failure analysis",
+            token_count=4,
+            metadata={"extraction_confidence": 0.6, "detection_confidence": 0.2},
+        )
+        high = Chunk(
+            chunk_id="high",
+            source_id="src-high",
+            source_type=SourceType.KNOWLEDGE,
+            modality="text",
+            text="authentication failure analysis",
+            token_count=4,
+            metadata={"extraction_confidence": 0.6, "detection_confidence": 0.95},
+        )
+
+        self.assertGreater(_extraction_quality(high), _extraction_quality(low))
 
     def test_prompt_source_bundle_summary_includes_reliability(self):
         docs = [

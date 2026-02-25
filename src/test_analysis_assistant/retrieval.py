@@ -2723,6 +2723,25 @@ def _extraction_quality(chunk: Chunk) -> float:
     if chunk.modality == "image_ocr_stub":
         quality -= 0.10
 
+    detection_value = chunk.metadata.get("detection_confidence")
+    if detection_value is not None:
+        try:
+            detection_conf = max(0.0, min(1.0, float(detection_value)))
+            quality += (detection_conf - 0.5) * 0.12
+        except (TypeError, ValueError):
+            pass
+
+    detected_category = str(chunk.metadata.get("detection_category", "")).strip().lower()
+    if detected_category:
+        if detected_category == "code" and chunk.modality == "code":
+            quality += 0.03
+        elif detected_category in {"markdown", "documentation", "plain_text"} and chunk.modality == "text":
+            quality += 0.02
+        elif detected_category == "structured_data" and chunk.modality in {"table", "text"}:
+            quality += 0.02
+        else:
+            quality -= 0.02
+
     return max(0.0, min(1.0, quality))
 
 
@@ -2815,6 +2834,7 @@ def _ingestion_route_quality(chunk: Chunk) -> float:
     route_scores = {
         "pipeline_verified": 0.98,
         "pipeline_verified_sidecar": 0.93,
+        "pipeline_detected": 0.9,
         "repository_scan": 0.94,
         "artifact_bundle": 0.90,
         "normalized_record": 0.84,

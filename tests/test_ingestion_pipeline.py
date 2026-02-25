@@ -153,6 +153,65 @@ def test_logout():
         assert result.success is True
         assert len(result.chunks) > 0
 
+    def test_process_text_document_uses_detected_code_strategy(self):
+        """Code-like content should route to code processing even from non-code source."""
+        pipeline = UnifiedIngestionPipeline()
+        content = """
+def login(user, password):
+    if not user:
+        raise ValueError("missing user")
+    return True
+"""
+        doc = IngestDocument(
+            source_id="doc-code-like",
+            source_type=SourceType.KNOWLEDGE,
+            content=content,
+            modality="text",
+            metadata={"file_path": "auth.py"},
+        )
+
+        result = pipeline.process_document(doc)
+
+        assert result.success is True
+        assert len(result.chunks) > 0
+        assert any(chunk.modality == "code" for chunk in result.chunks)
+
+    def test_table_processing_falls_back_to_text_when_no_tables_extracted(self):
+        """Table modality should degrade to text chunks if table extraction returns nothing."""
+        pipeline = UnifiedIngestionPipeline()
+        doc = IngestDocument(
+            source_id="table-missing",
+            source_type=SourceType.SYSTEM_ANALYSIS,
+            content="No parsable markdown table content is present.",
+            modality="table",
+        )
+
+        result = pipeline.process_document(doc)
+
+        assert result.success is True
+        assert len(result.chunks) > 0
+        assert any(chunk.modality == "table" or chunk.modality == "text" for chunk in result.chunks)
+
+    def test_chunk_metadata_includes_detection_signals(self):
+        """Detection signals should be propagated to chunk metadata for retrieval quality."""
+        pipeline = UnifiedIngestionPipeline()
+        doc = IngestDocument(
+            source_id="req-detect",
+            source_type=SourceType.REQUIREMENTS,
+            content="# Requirements\n\nThe system shall validate authentication failures.",
+            modality="text",
+        )
+
+        result = pipeline.process_document(doc)
+
+        assert result.success is True
+        assert len(result.chunks) > 0
+        chunk = result.chunks[0]
+        assert "detection_category" in chunk.metadata
+        assert "detection_confidence" in chunk.metadata
+        assert "recommended_chunker" in chunk.metadata
+        assert "recommended_source_type" in chunk.metadata
+
     def test_process_batch(self):
         """Test processing multiple documents."""
         pipeline = UnifiedIngestionPipeline()
