@@ -1,9 +1,10 @@
 import hashlib
 import json
+from pathlib import Path
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
@@ -145,7 +146,7 @@ class RetrievalEngine:
             preferred_modalities=_dedupe(preferred_modalities),
         )
 
-    def query(self, query_text: str, top_k: int = 5) -> List[RankedChunk]:
+    def query(self, query_text: str, top_k: int = 5, diversify: bool = True) -> List[RankedChunk]:
         plan = self.build_query_plan(query_text)
         query_tokens = set(plan.tokens)
         if not self._chunks or not plan.tokens:
@@ -216,21 +217,114 @@ class RetrievalEngine:
             )
             scored.extend(fallback)
 
-        top = scored[: max(1, top_k)]
+        limit = max(1, top_k)
+        top = _select_diverse_top(scored, limit) if diversify else scored[:limit]
 
         if not top:
             return []
 
         max_score = top[0].score
+        source_span = len({item.chunk.source_id for item in top})
+        modality_span = len({item.chunk.modality for item in top})
+        diversity_bonus = ((source_span / len(top)) * 0.6) + ((modality_span / len(top)) * 0.4)
         for rank, item in enumerate(top):
             normalized = item.score / max(max_score, 1e-9)
             coverage = len(item.matched_terms) / max(len(plan.tokens), 1)
             extraction = item.score_breakdown.get("extraction", 1.0)
             decay = 1.0 - (rank * 0.12)
-            confidence = (normalized * 0.55) + (coverage * 0.25) + (extraction * 0.20)
+            confidence = (
+                (normalized * 0.50)
+                + (coverage * 0.22)
+                + (extraction * 0.18)
+                + (diversity_bonus * 0.10)
+            )
             item.confidence = round(max(0.0, min(1.0, confidence * decay)), 4)
 
         return top
+
+
+class MultiSourceIngestor:
+    def __init__(self, engine: RetrievalEngine) -> None:
+        self._engine = engine
+
+    def ingest_raw(
+        self,
+        source_id: str,
+        source_type: SourceType,
+        content: Any,
+        modality: str = "text",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        doc = IngestDocument(
+            source_id=source_id,
+            source_type=source_type,
+            content=content,
+            modality=modality,
+            metadata=metadata or {},
+        )
+        return self._engine.ingest_documents([doc])
+
+    def ingest_repository(
+        self,
+        repo_root: str,
+        max_files: int = 200,
+        include_extensions: Optional[Sequence[str]] = None,
+    ) -> List[Chunk]:
+        root = Path(repo_root)
+        if not root.exists() or not root.is_dir():
+            raise ValueError(f"Repository path does not exist or is not a directory: {repo_root}")
+
+        default_extensions = {
+            ".py",
+            ".md",
+            ".rst",
+            ".txt",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".ini",
+            ".cfg",
+        }
+        allow = set(ext.lower() for ext in (include_extensions or list(default_extensions)))
+
+        docs: List[IngestDocument] = []
+        for path in sorted(root.rglob("*")):
+            if len(docs) >= max_files:
+                break
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in allow:
+                continue
+            rel_path = path.relative_to(root).as_posix()
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if not text.strip():
+                continue
+            docs.append(
+                IngestDocument(
+                    source_id=f"repo:{rel_path}",
+                    source_type=SourceType.REPOSITORY,
+                    content=text,
+                    modality="text",
+                    metadata={"path": rel_path, "extension": path.suffix.lower()},
+                )
+            )
+
+        if not docs:
+            return []
+        return self._engine.ingest_documents(docs)
+
+    def ingest_requirements_markdown(self, source_id: str, markdown: str) -> List[Chunk]:
+        return self.ingest_raw(
+            source_id=source_id,
+            source_type=SourceType.REQUIREMENTS,
+            content=markdown,
+            modality="markdown_mixed",
+            metadata={"format": "markdown"},
+        )
 
 
 def build_analysis_prompt(question: str, ranked_context: Sequence[RankedChunk]) -> str:
@@ -272,6 +366,8 @@ def build_analysis_prompt(question: str, ranked_context: Sequence[RankedChunk]) 
 
 
 def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
+    if doc.modality == "markdown_mixed" and isinstance(doc.content, str):
+        return _extract_markdown_mixed_units(doc.content)
     if doc.modality == "table":
         return [
             ExtractedUnit(
@@ -356,6 +452,87 @@ def _chunk_text(text: str, size: int, overlap: int) -> Iterable[str]:
     return chunks
 
 
+def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
+    lines = markdown.splitlines()
+    units: List[ExtractedUnit] = []
+
+    # Preserve plain-text context while pulling table and image artifacts into
+    # dedicated units for modality-aware retrieval.
+    plain_lines: List[str] = []
+    in_table = False
+    table_lines: List[str] = []
+    table_index = 0
+    image_index = 0
+
+    image_pattern = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+    for line in lines:
+        image_matches = image_pattern.findall(line)
+        if image_matches:
+            for image_path in image_matches:
+                image_text = _image_to_ocr_stub({"image_path": image_path})
+                extraction_confidence = 0.25 if image_text.startswith("[OCR_STUB]") else 0.65
+                units.append(
+                    ExtractedUnit(
+                        text=image_text,
+                        modality="image",
+                        extraction_confidence=extraction_confidence,
+                        metadata={"image_index": image_index, "image_path": image_path},
+                    )
+                )
+                image_index += 1
+            continue
+
+        looks_like_table = "|" in line and line.strip().startswith("|")
+        if looks_like_table:
+            in_table = True
+            table_lines.append(line)
+            continue
+
+        if in_table:
+            table_text = "\n".join(table_lines).strip()
+            if table_text:
+                units.append(
+                    ExtractedUnit(
+                        text=table_text,
+                        modality="table",
+                        extraction_confidence=0.82,
+                        metadata={"table_index": table_index},
+                    )
+                )
+                table_index += 1
+            table_lines = []
+            in_table = False
+
+        plain_lines.append(line)
+
+    if table_lines:
+        table_text = "\n".join(table_lines).strip()
+        if table_text:
+            units.append(
+                ExtractedUnit(
+                    text=table_text,
+                    modality="table",
+                    extraction_confidence=0.82,
+                    metadata={"table_index": table_index},
+                )
+            )
+
+    plain_text = "\n".join(line for line in plain_lines if line.strip()).strip()
+    if plain_text:
+        units.append(
+            ExtractedUnit(
+                text=plain_text,
+                modality="text",
+                extraction_confidence=0.95,
+                metadata={"extracted_from": "markdown_mixed"},
+            )
+        )
+
+    if units:
+        return units
+    return [ExtractedUnit(text=markdown, modality="text", extraction_confidence=0.9)]
+
+
 def _tokenize(text: str) -> List[str]:
     return [_normalize_token(token.lower()) for token in _WORD_RE.findall(text)]
 
@@ -421,6 +598,41 @@ def _dedupe(items: Sequence[Any]) -> List[Any]:
         seen.add(item)
         ordered.append(item)
     return ordered
+
+
+def _select_diverse_top(candidates: Sequence[RankedChunk], top_k: int) -> List[RankedChunk]:
+    if top_k <= 0 or not candidates:
+        return []
+    if len(candidates) <= top_k:
+        return list(candidates)
+
+    selected: List[RankedChunk] = [candidates[0]]
+    remaining = list(candidates[1:])
+    lambda_score = 0.82
+    novelty_penalty = 0.18
+
+    while remaining and len(selected) < top_k:
+        best_idx = 0
+        best_value = float("-inf")
+        for idx, candidate in enumerate(remaining):
+            max_similarity = max(_chunk_similarity(candidate.chunk, item.chunk) for item in selected)
+            mmr_value = (lambda_score * candidate.score) - (novelty_penalty * max_similarity)
+            if mmr_value > best_value:
+                best_value = mmr_value
+                best_idx = idx
+        selected.append(remaining.pop(best_idx))
+
+    return selected
+
+
+def _chunk_similarity(left: Chunk, right: Chunk) -> float:
+    left_tokens = set(_tokenize(left.text))
+    right_tokens = set(_tokenize(right.text))
+    union = left_tokens.union(right_tokens)
+    lexical = (len(left_tokens.intersection(right_tokens)) / len(union)) if union else 0.0
+    source_penalty = 0.25 if left.source_id == right.source_id else 0.0
+    modality_penalty = 0.10 if left.modality == right.modality else 0.0
+    return min(1.0, lexical + source_penalty + modality_penalty)
 
 
 def _hash_id(source_id: str, unit_idx: int, chunk_idx: int, text: str) -> str:

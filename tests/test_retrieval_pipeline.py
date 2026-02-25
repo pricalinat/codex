@@ -1,7 +1,10 @@
 import unittest
+import tempfile
+from pathlib import Path
 
 from src.test_analysis_assistant.retrieval import (
     IngestDocument,
+    MultiSourceIngestor,
     QueryPlan,
     RetrievalEngine,
     SourceType,
@@ -10,6 +13,50 @@ from src.test_analysis_assistant.retrieval import (
 
 
 class TestRetrievalPipeline(unittest.TestCase):
+    def test_multisource_ingestor_reads_repository_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "src").mkdir()
+            (root / "src" / "service.py").write_text(
+                "def deploy_guard(failures):\n    return failures == 0\n",
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text(
+                "Release is blocked when smoke tests fail.",
+                encoding="utf-8",
+            )
+            (root / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            self.assertGreaterEqual(len(chunks), 2)
+            source_ids = {chunk.source_id for chunk in chunks}
+            self.assertIn("repo:README.md", source_ids)
+            self.assertIn("repo:src/service.py", source_ids)
+
+    def test_markdown_requirements_extracts_table_and_image_units(self):
+        markdown = """
+# Auth Requirements
+Missing negative authorization tests are release blocking.
+
+| risk | severity |
+| ---- | -------- |
+| auth | high     |
+
+![failure matrix](artifacts/failure-matrix.png)
+""".strip()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        chunks = ingestor.ingest_requirements_markdown("req-md-1", markdown)
+
+        modalities = {chunk.modality for chunk in chunks}
+        self.assertIn("text", modalities)
+        self.assertIn("table", modalities)
+        self.assertIn("image_ocr_stub", modalities)
+
     def test_ingest_multisource_with_table_and_image_stub(self):
         docs = [
             IngestDocument(
@@ -139,6 +186,41 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("intent", ranked[0].score_breakdown)
         self.assertIn("extraction", ranked[0].score_breakdown)
         self.assertGreater(ranked[0].score_breakdown["extraction"], ranked[1].score_breakdown["extraction"])
+
+    def test_diversify_prefers_cross_source_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-a",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "authentication failure test gap release risk blocking "
+                    "authorization negative path triage"
+                ),
+            ),
+            IngestDocument(
+                source_id="repo-a",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "authentication failure test gap release risk blocking "
+                    "authorization token expiry scenario"
+                ),
+            ),
+            IngestDocument(
+                source_id="req-b",
+                source_type=SourceType.REQUIREMENTS,
+                content="release risk requires P0 triage for auth test gap",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        diverse = engine.query("auth test gap release risk triage", top_k=2, diversify=True)
+        plain = engine.query("auth test gap release risk triage", top_k=2, diversify=False)
+
+        diverse_sources = {item.chunk.source_id for item in diverse}
+        plain_sources = {item.chunk.source_id for item in plain}
+        self.assertGreaterEqual(len(diverse_sources), 2)
+        self.assertLessEqual(len(plain_sources), 2)
 
 
 if __name__ == "__main__":
