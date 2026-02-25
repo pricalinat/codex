@@ -147,6 +147,8 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("source_coverage", evidence.confidence_factors)
         self.assertIn("modality_coverage", evidence.confidence_factors)
         self.assertIn("ocr_stub_ratio", evidence.confidence_factors)
+        self.assertIn("cross_source_consensus", evidence.confidence_factors)
+        self.assertIn("source_concentration", evidence.confidence_factors)
         self.assertLess(evidence.calibrated_confidence, evidence.aggregate_confidence)
         self.assertLess(evidence.confidence_factors["modality_coverage"], 1.0)
 
@@ -179,6 +181,70 @@ class TestRetrievalPipeline(unittest.TestCase):
             evidence.calibrated_confidence,
             evidence.aggregate_confidence * 0.7,
         )
+
+    def test_retrieve_evidence_reports_cross_source_consensus_signal(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth token refresh failure is release blocking and requires mitigation.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Incident diagnostics confirm auth token refresh failure and mitigation urgency.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth token refresh failure mitigation",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("cross_source_consensus", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["cross_source_consensus"], 0.0)
+
+    def test_retrieve_evidence_reports_source_concentration_signal(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-auth",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Auth token refresh failure mitigation with traceback and root cause hypothesis "
+                    "for retry storm under load."
+                ),
+            ),
+            IngestDocument(
+                source_id="repo-auth",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Additional auth token refresh failure mitigation notes and retry storm analysis."
+                ),
+            ),
+            IngestDocument(
+                source_id="kb-noise",
+                source_type=SourceType.KNOWLEDGE,
+                content="Governance updates and release policy communication templates.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth token refresh failure mitigation",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("source_concentration", evidence.confidence_factors)
+        self.assertGreaterEqual(evidence.confidence_factors["source_concentration"], 0.6)
 
     def test_retrieve_evidence_adaptive_recovery_adds_missing_modalities(self):
         docs = [
@@ -307,6 +373,43 @@ class TestRetrievalPipeline(unittest.TestCase):
             by_source["req-auth"].score_breakdown.get("corroboration", 0.0),
             by_source["kb-noise"].score_breakdown.get("corroboration", 0.0),
         )
+
+    def test_query_diversify_prefers_intent_source_type_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-auth-parser",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Root cause traceback shows auth parser failure and hypothesis for token decode path."
+                ),
+            ),
+            IngestDocument(
+                source_id="repo-auth-handler",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Root cause traceback indicates handler failure, hypothesis around request normalization."
+                ),
+            ),
+            IngestDocument(
+                source_id="sys-incident-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "Incident diagnostics provide root cause hypothesis and traceback chain for auth failures."
+                ),
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "root cause traceback hypothesis why auth failures",
+            top_k=2,
+            diversify=True,
+        )
+
+        self.assertEqual(len(ranked), 2)
+        source_types = {item.chunk.source_type for item in ranked}
+        self.assertIn(SourceType.SYSTEM_ANALYSIS, source_types)
 
     def test_multisource_ingestor_reads_repository_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -904,6 +1007,44 @@ class TestHybridRetrievalEngine(unittest.TestCase):
         self.assertEqual(len(vectors), 3)
         # Dummy provider uses 64 dimensions
         self.assertEqual(len(vectors[0]), 64)
+
+    def test_hybrid_query_diversify_prefers_intent_source_type_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-auth-a",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Root cause traceback hypothesis shows auth parser failure in token refresh flow."
+                ),
+            ),
+            IngestDocument(
+                source_id="repo-auth-b",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Root cause traceback hypothesis indicates auth handler failure in refresh flow."
+                ),
+            ),
+            IngestDocument(
+                source_id="sys-incident-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "System diagnostics report root cause hypothesis with traceback evidence for auth failures."
+                ),
+            ),
+        ]
+        engine = create_hybrid_engine(embedding_provider=TFIDFEmbeddingProvider(), lexical_weight=0.9)
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "root cause traceback hypothesis why auth failures",
+            top_k=2,
+            diversify=True,
+            use_hybrid=True,
+        )
+
+        self.assertEqual(len(ranked), 2)
+        source_types = {item.chunk.source_type for item in ranked}
+        self.assertIn(SourceType.SYSTEM_ANALYSIS, source_types)
 
 
 if __name__ == "__main__":

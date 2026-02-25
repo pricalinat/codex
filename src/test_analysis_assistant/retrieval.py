@@ -1562,6 +1562,34 @@ def _aggregate_confidence(ranked: Sequence[RankedChunk]) -> float:
     return round(max(0.0, min(1.0, weighted_total / weight_sum)), 4)
 
 
+def _cross_source_consensus(ranked: Sequence[RankedChunk]) -> float:
+    if not ranked:
+        return 0.0
+
+    term_support: Dict[str, set] = {}
+    for item in ranked:
+        for term in set(item.matched_terms):
+            term_support.setdefault(term, set()).add(item.chunk.source_id)
+
+    if not term_support:
+        return 0.0
+
+    corroborated = sum(1 for sources in term_support.values() if len(sources) >= 2)
+    return max(0.0, min(1.0, corroborated / len(term_support)))
+
+
+def _source_concentration(ranked: Sequence[RankedChunk]) -> float:
+    if not ranked:
+        return 0.0
+
+    by_source: Dict[str, int] = {}
+    for item in ranked:
+        by_source[item.chunk.source_id] = by_source.get(item.chunk.source_id, 0) + 1
+
+    max_share = max(by_source.values()) / len(ranked)
+    return max(0.0, min(1.0, max_share))
+
+
 def _calibrate_retrieval_confidence(
     ranked: Sequence[RankedChunk],
     plan: QueryPlan,
@@ -1581,9 +1609,13 @@ def _calibrate_retrieval_confidence(
         low_conf_count = sum(1 for item in ranked if item.confidence < 0.35)
         ocr_stub_ratio = ocr_stub_count / len(ranked)
         low_signal_ratio = low_conf_count / len(ranked)
+        cross_source_consensus = _cross_source_consensus(ranked)
+        source_concentration = _source_concentration(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
+        cross_source_consensus = 0.0
+        source_concentration = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -1593,11 +1625,13 @@ def _calibrate_retrieval_confidence(
     unavailable_pressure = max(0.0, min(1.0, unavailable_pressure))
 
     coverage_multiplier = (0.56 + (0.24 * source_coverage) + (0.20 * modality_coverage))
+    consensus_multiplier = 0.96 + (0.04 * cross_source_consensus)
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio)
     availability_penalty = 0.08 * unavailable_pressure
+    concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
 
-    calibrated = aggregate_confidence * coverage_multiplier
-    calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty)
+    calibrated = aggregate_confidence * coverage_multiplier * consensus_multiplier
+    calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty - concentration_penalty)
     calibrated = max(0.0, min(1.0, calibrated))
 
     factors = {
@@ -1606,6 +1640,8 @@ def _calibrate_retrieval_confidence(
         "ocr_stub_ratio": round(max(0.0, min(1.0, ocr_stub_ratio)), 4),
         "low_signal_ratio": round(max(0.0, min(1.0, low_signal_ratio)), 4),
         "unavailable_pressure": round(unavailable_pressure, 4),
+        "cross_source_consensus": round(max(0.0, min(1.0, cross_source_consensus)), 4),
+        "source_concentration": round(max(0.0, min(1.0, source_concentration)), 4),
     }
     return round(calibrated, 4), factors
 
