@@ -3042,6 +3042,45 @@ def _cross_source_conflict(ranked: Sequence[RankedChunk]) -> float:
     return max(0.0, min(1.0, conflicting_pairs / comparable_pairs))
 
 
+def _lineage_coherence(ranked: Sequence[RankedChunk]) -> float:
+    if len(ranked) < 2:
+        return 0.0
+
+    comparable_pairs = 0
+    linked_pairs = 0
+    connected_chunks: set = set()
+
+    link_keys_by_chunk: Dict[str, set] = {
+        item.chunk.chunk_id: set(_chunk_link_keys(item.chunk))
+        for item in ranked
+    }
+
+    for idx, left in enumerate(ranked):
+        left_id = left.chunk.chunk_id
+        left_keys = link_keys_by_chunk.get(left_id, set())
+        if not left_keys:
+            continue
+        for right in ranked[idx + 1:]:
+            if left.chunk.source_id == right.chunk.source_id:
+                continue
+            right_id = right.chunk.chunk_id
+            right_keys = link_keys_by_chunk.get(right_id, set())
+            if not right_keys:
+                continue
+            comparable_pairs += 1
+            if left_keys.intersection(right_keys):
+                linked_pairs += 1
+                connected_chunks.add(left_id)
+                connected_chunks.add(right_id)
+
+    if comparable_pairs == 0:
+        return 0.0
+
+    pair_ratio = linked_pairs / comparable_pairs
+    chunk_ratio = len(connected_chunks) / max(1, len(ranked))
+    return max(0.0, min(1.0, (pair_ratio * 0.65) + (chunk_ratio * 0.35)))
+
+
 def _calibrate_retrieval_confidence(
     ranked: Sequence[RankedChunk],
     plan: QueryPlan,
@@ -3064,6 +3103,7 @@ def _calibrate_retrieval_confidence(
         low_signal_ratio = low_conf_count / len(ranked)
         cross_source_consensus = _cross_source_consensus(ranked)
         cross_source_conflict = _cross_source_conflict(ranked)
+        lineage_coherence = _lineage_coherence(ranked)
         source_concentration = _source_concentration(ranked)
         extraction_reliability = sum(_extraction_quality(item.chunk) for item in ranked) / len(ranked)
         source_reliability = sum(_source_reliability(item.chunk) for item in ranked) / len(ranked)
@@ -3085,6 +3125,7 @@ def _calibrate_retrieval_confidence(
         low_signal_ratio = 1.0
         cross_source_consensus = 0.0
         cross_source_conflict = 0.0
+        lineage_coherence = 0.0
         source_concentration = 0.0
         extraction_reliability = 0.0
         source_reliability = 0.0
@@ -3103,6 +3144,7 @@ def _calibrate_retrieval_confidence(
     coverage_multiplier = (0.56 + (0.24 * source_coverage) + (0.20 * modality_coverage))
     structural_multiplier = 0.90 + (0.10 * structural_coverage)
     consensus_multiplier = 0.96 + (0.04 * cross_source_consensus)
+    lineage_multiplier = 1.0 + (0.02 * lineage_coherence)
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
     route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
@@ -3121,6 +3163,7 @@ def _calibrate_retrieval_confidence(
         * coverage_multiplier
         * structural_multiplier
         * consensus_multiplier
+        * lineage_multiplier
         * extraction_multiplier
         * reliability_multiplier
         * route_multiplier
@@ -3138,6 +3181,7 @@ def _calibrate_retrieval_confidence(
         "unavailable_pressure": round(unavailable_pressure, 4),
         "cross_source_consensus": round(max(0.0, min(1.0, cross_source_consensus)), 4),
         "cross_source_conflict": round(max(0.0, min(1.0, cross_source_conflict)), 4),
+        "lineage_coherence": round(max(0.0, min(1.0, lineage_coherence)), 4),
         "source_concentration": round(max(0.0, min(1.0, source_concentration)), 4),
         "extraction_reliability": round(max(0.0, min(1.0, extraction_reliability)), 4),
         "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),

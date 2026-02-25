@@ -732,6 +732,106 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("citation_graph_support", evidence.confidence_factors)
         self.assertGreater(evidence.confidence_factors["citation_graph_support"], 0.0)
 
+    def test_retrieve_evidence_reports_lineage_coherence_factor(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth retry failures require mitigation and release risk prioritization.",
+            ),
+            IngestDocument(
+                source_id="record:bundle-auth::artifact:summary",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Auth retry failures affect release stability and mitigation planning.",
+                metadata={
+                    "parent_source_id": "record:bundle-auth",
+                    "referenced_source_ids": ["req-auth"],
+                    "ingestion_route": "record_bundle",
+                },
+            ),
+            IngestDocument(
+                source_id="record:bundle-auth::artifact:risk-table",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="table",
+                content={"rows": [{"area": "auth", "risk": "high", "priority": "p0"}]},
+                metadata={
+                    "parent_source_id": "record:bundle-auth",
+                    "ingestion_route": "record_bundle",
+                },
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        evidence = engine.retrieve_evidence(
+            "auth retry failure mitigation and risk prioritization",
+            top_k=4,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("lineage_coherence", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["lineage_coherence"], 0.0)
+
+    def test_lineage_coherence_higher_for_connected_multisource_evidence(self):
+        connected_docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth retry failures require mitigation and release risk prioritization.",
+            ),
+            IngestDocument(
+                source_id="record:bundle-auth::artifact:summary",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "Auth retry failure mitigation references [source:req-auth] and aligns with "
+                    "release risk prioritization."
+                ),
+                metadata={
+                    "parent_source_id": "record:bundle-auth",
+                    "ingestion_route": "record_bundle",
+                },
+            ),
+        ]
+        disconnected_docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth retry failures require mitigation and release risk prioritization.",
+            ),
+            IngestDocument(
+                source_id="kb-ops",
+                source_type=SourceType.KNOWLEDGE,
+                content="General governance updates for quarterly planning and staffing.",
+            ),
+        ]
+
+        connected_engine = RetrievalEngine()
+        connected_engine.ingest_documents(connected_docs)
+        connected = connected_engine.retrieve_evidence(
+            "auth retry failure mitigation and release risk prioritization",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        disconnected_engine = RetrievalEngine()
+        disconnected_engine.ingest_documents(disconnected_docs)
+        disconnected = disconnected_engine.retrieve_evidence(
+            "auth retry failure mitigation and release risk prioritization",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertGreater(
+            connected.confidence_factors.get("lineage_coherence", 0.0),
+            disconnected.confidence_factors.get("lineage_coherence", 0.0),
+        )
+
     def test_query_diversify_prefers_intent_source_type_coverage(self):
         docs = [
             IngestDocument(
