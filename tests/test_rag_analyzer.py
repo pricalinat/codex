@@ -10,6 +10,7 @@ from src.test_analysis_assistant.rag_analyzer import (
 from src.test_analysis_assistant.retrieval import (
     ArtifactBundle,
     Chunk,
+    IngestionRecord,
     SourceType,
     compute_enhanced_confidence,
 )
@@ -232,6 +233,76 @@ Missing negative authorization tests are release blocking.
         self.assertIn("root_cause", result.risk_assessment["focus_confidence"])
         self.assertIn("test_gap", result.risk_assessment["focus_confidence"])
         self.assertIn("Analysis focus coverage", result.augmented_prompt)
+
+    def test_initialize_corpus_accepts_ingestion_records(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_refresh">
+                <failure type="RuntimeError">token refresh failure</failure>
+            </testcase>
+        </testsuite>"""
+        analyzer = RAGAnalyzer()
+        indexed = analyzer.initialize_corpus(
+            ingestion_records=[
+                IngestionRecord(
+                    source_id="record:auth-compound",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "text": "Auth retry storms are release blocking.",
+                        "tables": [{"rows": [{"component": "auth", "risk": "high"}]}],
+                        "images": [{"ocr_text": "auth retry heatmap risk matrix"}],
+                    },
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(indexed, 3)
+        result = analyzer.analyze(test_report, query_for_context="auth retry heatmap risk matrix")
+        self.assertTrue(any(source.startswith("record:auth-compound") for source in result.evidence_sources))
+
+    def test_initialize_corpus_routes_code_snippet_records_to_code_aware_chunking(self):
+        analyzer = RAGAnalyzer(chunker_type=ChunkerType.CODE_AWARE)
+        indexed = analyzer.initialize_corpus(
+            ingestion_records=[
+                IngestionRecord(
+                    source_id="snippet:auth.py",
+                    source_type=SourceType.CODE_SNIPPET,
+                    payload="""
+def refresh_token(token: str) -> str:
+    if not token:
+        raise ValueError("token missing")
+    return token.strip()
+""".strip(),
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(indexed, 1)
+        code_chunks = [chunk for chunk in analyzer._engine._chunks if chunk.source_id == "snippet:auth.py"]
+        self.assertGreaterEqual(len(code_chunks), 1)
+        self.assertTrue(all(chunk.modality == "code" for chunk in code_chunks))
+        self.assertTrue(any("chunk_type" in chunk.metadata for chunk in code_chunks))
+
+    def test_rag_analyze_accepts_ingestion_records(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_login">
+                <failure type="AssertionError">Expected True, got False</failure>
+            </testcase>
+        </testsuite>"""
+
+        result = rag_analyze(
+            test_report_content=test_report,
+            ingestion_records=[
+                IngestionRecord(
+                    source_id="record:req-auth",
+                    source_type=SourceType.REQUIREMENTS,
+                    payload="Authentication release risk requires stricter negative tests.",
+                )
+            ],
+            query="authentication release risk",
+        )
+
+        self.assertEqual(result.base_result.total_failures, 1)
+        self.assertIn("retrieval_confidence", result.risk_assessment)
 
 
 class TestRAGSeverityAssessment(unittest.TestCase):

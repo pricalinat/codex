@@ -1,5 +1,6 @@
 """RAG-augmented test analysis with retrieval-enhanced insights."""
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -13,6 +14,7 @@ from .retrieval import (
     CodeAwareIngestor,
     DummyEmbeddingProvider,
     HybridRetrievalEngine,
+    IngestionRecord,
     IngestDocument,
     MultiSourceIngestor,
     RankedChunk,
@@ -211,6 +213,8 @@ class RAGAnalyzer:
         system_analysis_docs: Optional[Sequence[tuple]] = None,
         knowledge_docs: Optional[Sequence[tuple]] = None,
         artifact_bundles: Optional[Sequence[ArtifactBundle]] = None,
+        ingestion_records: Optional[Sequence[IngestionRecord]] = None,
+        generate_source_summaries: bool = False,
     ) -> int:
         """Initialize the retrieval corpus with various document sources.
 
@@ -220,6 +224,8 @@ class RAGAnalyzer:
             system_analysis_docs: List of (source_id, content) tuples
             knowledge_docs: List of (source_id, content) tuples
             artifact_bundles: Mixed-modality extraction/OCR payloads
+            ingestion_records: Unified mixed-source records (multimodal/code/docs)
+            generate_source_summaries: Whether to synthesize per-source summary chunks
 
         Returns:
             Total number of chunks indexed
@@ -227,32 +233,45 @@ class RAGAnalyzer:
         total_chunks = 0
 
         if repo_path:
-            chunks = self._ingestor.ingest_repository(repo_path)
+            chunks = self._call_ingestion_method(
+                self._ingestor.ingest_repository,
+                repo_path,
+                generate_source_summaries=generate_source_summaries,
+            )
             total_chunks += len(chunks)
 
         if requirements_docs:
             for source_id, content in requirements_docs:
                 ingestor = self._select_ingestor(SourceType.REQUIREMENTS, source_id)
-                chunks = ingestor.ingest_requirements_markdown(source_id, content)
+                chunks = self._call_ingestion_method(
+                    ingestor.ingest_requirements_markdown,
+                    source_id,
+                    content,
+                    generate_source_summaries=generate_source_summaries,
+                )
                 total_chunks += len(chunks)
 
         if system_analysis_docs:
             for source_id, content in system_analysis_docs:
                 ingestor = self._select_ingestor(SourceType.SYSTEM_ANALYSIS, source_id)
-                chunks = ingestor.ingest_raw(
+                chunks = self._call_ingestion_method(
+                    ingestor.ingest_raw,
                     source_id=source_id,
                     source_type=SourceType.SYSTEM_ANALYSIS,
                     content=content,
+                    generate_source_summaries=generate_source_summaries,
                 )
                 total_chunks += len(chunks)
 
         if knowledge_docs:
             for source_id, content in knowledge_docs:
                 ingestor = self._select_ingestor(SourceType.KNOWLEDGE, source_id)
-                chunks = ingestor.ingest_raw(
+                chunks = self._call_ingestion_method(
+                    ingestor.ingest_raw,
                     source_id=source_id,
                     source_type=SourceType.KNOWLEDGE,
                     content=content,
+                    generate_source_summaries=generate_source_summaries,
                 )
                 total_chunks += len(chunks)
 
@@ -260,9 +279,14 @@ class RAGAnalyzer:
             for bundle in artifact_bundles:
                 ingestor = self._select_ingestor(bundle.source_type, bundle.source_id)
                 if hasattr(ingestor, "ingest_artifact_bundle"):
-                    chunks = ingestor.ingest_artifact_bundle(bundle)
+                    chunks = self._call_ingestion_method(
+                        ingestor.ingest_artifact_bundle,
+                        bundle,
+                        generate_source_summaries=generate_source_summaries,
+                    )
                 else:
-                    chunks = ingestor.ingest_raw(
+                    chunks = self._call_ingestion_method(
+                        ingestor.ingest_raw,
                         source_id=bundle.source_id,
                         source_type=bundle.source_type,
                         content={
@@ -272,11 +296,75 @@ class RAGAnalyzer:
                         },
                         modality="compound",
                         metadata=bundle.metadata,
+                        generate_source_summaries=generate_source_summaries,
                     )
                 total_chunks += len(chunks)
 
+        if ingestion_records:
+            for record in ingestion_records:
+                total_chunks += self._ingest_record(
+                    record,
+                    generate_source_summaries=generate_source_summaries,
+                )
+
         self._initialized = total_chunks > 0
         return total_chunks
+
+    def _ingest_record(
+        self,
+        record: IngestionRecord,
+        generate_source_summaries: bool = False,
+    ) -> int:
+        if (
+            record.source_type == SourceType.CODE_SNIPPET
+            and self._code_ingestor is not None
+        ):
+            code_payload = self._extract_code_payload(record.payload)
+            if code_payload:
+                chunks = self._code_ingestor.ingest_code_snippet(
+                    source_id=record.source_id,
+                    code_content=code_payload,
+                    metadata=dict(record.metadata),
+                )
+                return len(chunks)
+
+        ingestor = self._select_ingestor(record.source_type, record.source_id)
+        if hasattr(ingestor, "ingest_records"):
+            chunks = self._call_ingestion_method(
+                ingestor.ingest_records,
+                [record],
+                generate_source_summaries=generate_source_summaries,
+            )
+            return len(chunks)
+
+        fallback_ingestor = self._basic_ingestor or MultiSourceIngestor(self._engine)
+        chunks = self._call_ingestion_method(
+            fallback_ingestor.ingest_records,
+            [record],
+            generate_source_summaries=generate_source_summaries,
+        )
+        return len(chunks)
+
+    def _extract_code_payload(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("code", "content", "text", "snippet"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+        return ""
+
+    def _call_ingestion_method(
+        self,
+        method: Any,
+        *args: Any,
+        generate_source_summaries: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        if generate_source_summaries and _method_supports_keyword(method, "generate_source_summaries"):
+            kwargs["generate_source_summaries"] = True
+        return method(*args, **kwargs)
 
     def add_knowledge(self, source_id: str, content: str) -> int:
         """Add a knowledge document to the corpus."""
@@ -672,10 +760,15 @@ def rag_analyze(
     test_report_content: str,
     repo_path: Optional[str] = None,
     requirements_docs: Optional[Sequence[tuple]] = None,
+    system_analysis_docs: Optional[Sequence[tuple]] = None,
+    knowledge_docs: Optional[Sequence[tuple]] = None,
+    artifact_bundles: Optional[Sequence[ArtifactBundle]] = None,
+    ingestion_records: Optional[Sequence[IngestionRecord]] = None,
     query: Optional[str] = None,
     use_hybrid: bool = True,
     lexical_weight: float = 0.5,
     chunker_type: ChunkerType = ChunkerType.AUTO,
+    generate_source_summaries: bool = False,
 ) -> RAGAnalysisResult:
     """Convenience function for RAG-augmented analysis.
 
@@ -683,10 +776,15 @@ def rag_analyze(
         test_report_content: Raw test report (JUnit XML or pytest text)
         repo_path: Optional path to repository
         requirements_docs: Optional list of (source_id, markdown) tuples
+        system_analysis_docs: Optional list of (source_id, content) tuples
+        knowledge_docs: Optional list of (source_id, content) tuples
+        artifact_bundles: Optional mixed-modality extraction payloads
+        ingestion_records: Optional normalized ingestion records
         query: Optional additional query
         use_hybrid: Whether to use hybrid (lexical + semantic) retrieval
         lexical_weight: Weight for lexical search when using hybrid mode (0-1)
         chunker_type: Chunker strategy (basic, code_aware, auto)
+        generate_source_summaries: Whether to synthesize per-source summary chunks
 
     Returns:
         RAGAnalysisResult with augmented insights
@@ -698,10 +796,30 @@ def rag_analyze(
     )
 
     # Initialize corpus
-    if repo_path or requirements_docs:
+    if (
+        repo_path
+        or requirements_docs
+        or system_analysis_docs
+        or knowledge_docs
+        or artifact_bundles
+        or ingestion_records
+    ):
         analyzer.initialize_corpus(
             repo_path=repo_path,
             requirements_docs=requirements_docs,
+            system_analysis_docs=system_analysis_docs,
+            knowledge_docs=knowledge_docs,
+            artifact_bundles=artifact_bundles,
+            ingestion_records=ingestion_records,
+            generate_source_summaries=generate_source_summaries,
         )
 
     return analyzer.analyze(test_report_content, query_for_context=query)
+
+
+def _method_supports_keyword(method: Any, keyword: str) -> bool:
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return keyword in params
