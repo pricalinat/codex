@@ -53,7 +53,9 @@ Core module lives in `src/test_analysis_assistant/` and supports two input forma
 It now also includes a retrieval foundation for AI-native analysis:
 - multi-source ingestion (`code`, `repository`, `requirements`, `system analysis`, `knowledge`)
 - mixed-modality normalization (`text`, `table`, `image` with OCR stub fallback)
-- deterministic chunking, ranking, and confidence scoring
+- intent-aware query planning for test-gap/risk/root-cause workflows
+- explainable ranking with score breakdown (`lexical`, `source`, `intent`, `modality`, `extraction`)
+- deterministic chunking, ranking, and confidence scoring with extraction-quality weighting
 - prompt builder that emits citation-ready context blocks
 
 ### Quick Start

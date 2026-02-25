@@ -43,6 +43,24 @@ class RankedChunk:
     score: float
     confidence: float
     matched_terms: List[str] = field(default_factory=list)
+    score_breakdown: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class QueryPlan:
+    query_text: str
+    tokens: List[str]
+    intent_labels: List[str] = field(default_factory=list)
+    preferred_source_types: List[SourceType] = field(default_factory=list)
+    preferred_modalities: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ExtractedUnit:
+    text: str
+    modality: str
+    extraction_confidence: float
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class RetrievalEngine:
@@ -55,27 +73,82 @@ class RetrievalEngine:
         chunked: List[Chunk] = []
         for doc in docs:
             text_units = _extract_text_units(doc)
-            for unit_idx, text in enumerate(text_units):
-                for chunk_idx, piece in enumerate(_chunk_text(text, self._chunk_size, self._chunk_overlap)):
+            for unit_idx, unit in enumerate(text_units):
+                for chunk_idx, piece in enumerate(_chunk_text(unit.text, self._chunk_size, self._chunk_overlap)):
                     if not piece.strip():
                         continue
+                    chunk_metadata = dict(doc.metadata)
+                    chunk_metadata.update(
+                        {
+                            "unit_index": unit_idx,
+                            "extraction_confidence": round(unit.extraction_confidence, 4),
+                            **unit.metadata,
+                        }
+                    )
                     chunk = Chunk(
                         chunk_id=_hash_id(doc.source_id, unit_idx, chunk_idx, piece),
                         source_id=doc.source_id,
                         source_type=doc.source_type,
-                        modality=_effective_modality(doc.modality, text),
+                        modality=_effective_modality(unit.modality, unit.text),
                         text=piece,
                         token_count=len(_tokenize(piece)),
-                        metadata=dict(doc.metadata),
+                        metadata=chunk_metadata,
                     )
                     chunked.append(chunk)
 
         self._chunks.extend(chunked)
         return chunked
 
+    def build_query_plan(self, query_text: str) -> QueryPlan:
+        tokens = sorted(set(_tokenize(query_text)))
+        token_set = set(tokens)
+        intent_rules = {
+            "failure_clustering": {"cluster", "group", "pattern", "recurring", "flaky", "flake"},
+            "root_cause": {"root", "cause", "traceback", "hypothesis", "why"},
+            "test_gap": {"gap", "missing", "coverage", "untested", "negative"},
+            "risk_prioritization": {"risk", "prioritize", "priority", "blocking", "release", "p0"},
+            "actionable_plan": {"plan", "mitigation", "next", "actions", "roadmap"},
+        }
+        intent_labels = [name for name, words in intent_rules.items() if token_set.intersection(words)]
+
+        source_preferences_by_intent = {
+            "failure_clustering": [SourceType.REPOSITORY, SourceType.CODE_SNIPPET, SourceType.SYSTEM_ANALYSIS],
+            "root_cause": [SourceType.CODE_SNIPPET, SourceType.SYSTEM_ANALYSIS, SourceType.REPOSITORY],
+            "test_gap": [SourceType.REQUIREMENTS, SourceType.SYSTEM_ANALYSIS, SourceType.REPOSITORY],
+            "risk_prioritization": [SourceType.REQUIREMENTS, SourceType.SYSTEM_ANALYSIS, SourceType.KNOWLEDGE],
+            "actionable_plan": [SourceType.REQUIREMENTS, SourceType.SYSTEM_ANALYSIS, SourceType.CODE_SNIPPET],
+        }
+        preferred_source_types: List[SourceType] = []
+        for intent in intent_labels:
+            preferred_source_types.extend(source_preferences_by_intent.get(intent, []))
+        if not preferred_source_types:
+            preferred_source_types = [
+                SourceType.REQUIREMENTS,
+                SourceType.SYSTEM_ANALYSIS,
+                SourceType.CODE_SNIPPET,
+                SourceType.REPOSITORY,
+                SourceType.KNOWLEDGE,
+            ]
+
+        preferred_modalities = ["text"]
+        if token_set.intersection({"table", "matrix", "spreadsheet"}):
+            preferred_modalities.append("table")
+        if token_set.intersection({"image", "diagram", "screenshot", "ocr"}):
+            preferred_modalities.append("image")
+            preferred_modalities.append("image_ocr_stub")
+
+        return QueryPlan(
+            query_text=query_text,
+            tokens=tokens,
+            intent_labels=intent_labels,
+            preferred_source_types=_dedupe(preferred_source_types),
+            preferred_modalities=_dedupe(preferred_modalities),
+        )
+
     def query(self, query_text: str, top_k: int = 5) -> List[RankedChunk]:
-        query_tokens = set(_tokenize(query_text))
-        if not self._chunks or not query_tokens:
+        plan = self.build_query_plan(query_text)
+        query_tokens = set(plan.tokens)
+        if not self._chunks or not plan.tokens:
             return []
 
         scored: List[RankedChunk] = []
@@ -83,9 +156,25 @@ class RetrievalEngine:
         for chunk in self._chunks:
             chunk_tokens = set(_tokenize(chunk.text))
             overlap = sorted(query_tokens.intersection(chunk_tokens))
-            lexical_score = len(overlap) / max(len(query_tokens), 1)
+            lexical_score = len(overlap) / max(len(plan.tokens), 1)
             source_boost = _source_weight(chunk.source_type)
-            score = lexical_score * 0.85 + source_boost * 0.15
+            intent_boost = _intent_alignment(plan, chunk)
+            modality_boost = _modality_alignment(plan, chunk.modality)
+            extraction_quality = _extraction_quality(chunk)
+            score = (
+                lexical_score * 0.55
+                + source_boost * 0.15
+                + intent_boost * 0.15
+                + modality_boost * 0.05
+                + extraction_quality * 0.10
+            )
+            breakdown = {
+                "lexical": round(lexical_score, 4),
+                "source": round(source_boost, 4),
+                "intent": round(intent_boost, 4),
+                "modality": round(modality_boost, 4),
+                "extraction": round(extraction_quality, 4),
+            }
             if overlap:
                 scored.append(
                     RankedChunk(
@@ -93,6 +182,7 @@ class RetrievalEngine:
                         score=score,
                         confidence=0.0,
                         matched_terms=overlap,
+                        score_breakdown=breakdown,
                     )
                 )
             else:
@@ -101,9 +191,10 @@ class RetrievalEngine:
                 fallback.append(
                     RankedChunk(
                         chunk=chunk,
-                        score=source_boost * 0.05,
+                        score=score * 0.15,
                         confidence=0.0,
                         matched_terms=[],
+                        score_breakdown=breakdown,
                     )
                 )
 
@@ -133,8 +224,11 @@ class RetrievalEngine:
         max_score = top[0].score
         for rank, item in enumerate(top):
             normalized = item.score / max(max_score, 1e-9)
+            coverage = len(item.matched_terms) / max(len(plan.tokens), 1)
+            extraction = item.score_breakdown.get("extraction", 1.0)
             decay = 1.0 - (rank * 0.12)
-            item.confidence = round(max(0.0, min(1.0, normalized * decay)), 4)
+            confidence = (normalized * 0.55) + (coverage * 0.25) + (extraction * 0.20)
+            item.confidence = round(max(0.0, min(1.0, confidence * decay)), 4)
 
         return top
 
@@ -157,6 +251,12 @@ def build_analysis_prompt(question: str, ranked_context: Sequence[RankedChunk]) 
             lines.append(
                 f"[{idx}] source={item.chunk.source_id} type={item.chunk.source_type.value} modality={item.chunk.modality} confidence={item.confidence:.2f} terms={','.join(item.matched_terms)}"
             )
+            lines.append(
+                "    score_parts="
+                + ",".join(
+                    f"{name}:{value:.2f}" for name, value in sorted(item.score_breakdown.items())
+                )
+            )
             lines.append(f"    {snippet}")
 
     lines.extend(
@@ -171,18 +271,44 @@ def build_analysis_prompt(question: str, ranked_context: Sequence[RankedChunk]) 
     return "\n".join(lines)
 
 
-def _extract_text_units(doc: IngestDocument) -> List[str]:
+def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
     if doc.modality == "table":
-        return [_table_to_text(doc.content)]
+        return [
+            ExtractedUnit(
+                text=_table_to_text(doc.content),
+                modality="table",
+                extraction_confidence=0.85,
+            )
+        ]
     if doc.modality == "image":
-        return [_image_to_ocr_stub(doc.content)]
+        image_text = _image_to_ocr_stub(doc.content)
+        extraction_confidence = 0.25 if image_text.startswith("[OCR_STUB]") else 0.65
+        return [
+            ExtractedUnit(
+                text=image_text,
+                modality="image",
+                extraction_confidence=extraction_confidence,
+            )
+        ]
     if isinstance(doc.content, str):
-        return [doc.content]
+        return [ExtractedUnit(text=doc.content, modality="text", extraction_confidence=1.0)]
     if isinstance(doc.content, dict):
-        return [json.dumps(doc.content, sort_keys=True)]
+        return [
+            ExtractedUnit(
+                text=json.dumps(doc.content, sort_keys=True),
+                modality=doc.modality or "text",
+                extraction_confidence=0.9,
+            )
+        ]
     if isinstance(doc.content, list):
-        return ["\n".join(str(item) for item in doc.content)]
-    return [str(doc.content)]
+        return [
+            ExtractedUnit(
+                text="\n".join(str(item) for item in doc.content),
+                modality=doc.modality or "text",
+                extraction_confidence=0.9,
+            )
+        ]
+    return [ExtractedUnit(text=str(doc.content), modality=doc.modality or "text", extraction_confidence=0.8)]
 
 
 def _table_to_text(content: Any) -> str:
@@ -231,7 +357,17 @@ def _chunk_text(text: str, size: int, overlap: int) -> Iterable[str]:
 
 
 def _tokenize(text: str) -> List[str]:
-    return [token.lower() for token in _WORD_RE.findall(text)]
+    return [_normalize_token(token.lower()) for token in _WORD_RE.findall(text)]
+
+
+def _normalize_token(token: str) -> str:
+    if token.endswith("ies") and len(token) > 4:
+        return token[:-3] + "y"
+    if token.endswith("es") and len(token) > 4:
+        return token[:-2]
+    if token.endswith("s") and len(token) > 3:
+        return token[:-1]
+    return token
 
 
 def _source_weight(source_type: SourceType) -> float:
@@ -249,6 +385,42 @@ def _effective_modality(modality: str, text: str) -> str:
     if modality == "image" and text.startswith("[OCR_STUB]"):
         return "image_ocr_stub"
     return modality
+
+
+def _intent_alignment(plan: QueryPlan, chunk: Chunk) -> float:
+    if chunk.source_type in plan.preferred_source_types:
+        position = plan.preferred_source_types.index(chunk.source_type)
+        return max(0.4, 1.0 - (position * 0.12))
+    return 0.35
+
+
+def _modality_alignment(plan: QueryPlan, chunk_modality: str) -> float:
+    if chunk_modality in plan.preferred_modalities:
+        position = plan.preferred_modalities.index(chunk_modality)
+        return max(0.4, 1.0 - (position * 0.15))
+    if chunk_modality == "image_ocr_stub":
+        return 0.2
+    return 0.5
+
+
+def _extraction_quality(chunk: Chunk) -> float:
+    value = chunk.metadata.get("extraction_confidence", 0.7)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.7
+    return max(0.0, min(1.0, numeric))
+
+
+def _dedupe(items: Sequence[Any]) -> List[Any]:
+    seen = set()
+    ordered: List[Any] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
 
 
 def _hash_id(source_id: str, unit_idx: int, chunk_idx: int, text: str) -> str:

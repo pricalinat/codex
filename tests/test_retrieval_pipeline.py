@@ -2,6 +2,7 @@ import unittest
 
 from src.test_analysis_assistant.retrieval import (
     IngestDocument,
+    QueryPlan,
     RetrievalEngine,
     SourceType,
     build_analysis_prompt,
@@ -103,6 +104,41 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("What are highest-risk gaps?", prompt)
         self.assertIn("confidence=", prompt)
         self.assertIn("req-1", prompt)
+
+    def test_build_query_plan_detects_risk_gap_intent(self):
+        engine = RetrievalEngine()
+        plan = engine.build_query_plan("Identify test gaps and prioritize release risks.")
+
+        self.assertIsInstance(plan, QueryPlan)
+        self.assertIn("test_gap", plan.intent_labels)
+        self.assertIn("risk_prioritization", plan.intent_labels)
+        self.assertIn(SourceType.REQUIREMENTS, plan.preferred_source_types)
+
+    def test_query_exposes_score_breakdown(self):
+        docs = [
+            IngestDocument(
+                source_id="req-1",
+                source_type=SourceType.REQUIREMENTS,
+                content="Missing negative authorization tests create release risk.",
+            ),
+            IngestDocument(
+                source_id="img-1",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content={"image_path": "risk.png"},
+                modality="image",
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        ranked = engine.query("negative authorization test gap risk", top_k=2)
+
+        self.assertEqual(ranked[0].chunk.source_id, "req-1")
+        self.assertIn("lexical", ranked[0].score_breakdown)
+        self.assertIn("source", ranked[0].score_breakdown)
+        self.assertIn("intent", ranked[0].score_breakdown)
+        self.assertIn("extraction", ranked[0].score_breakdown)
+        self.assertGreater(ranked[0].score_breakdown["extraction"], ranked[1].score_breakdown["extraction"])
 
 
 if __name__ == "__main__":
