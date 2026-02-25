@@ -29,6 +29,13 @@ from .retrieval import (
     create_code_aware_engine,
     create_hybrid_engine,
 )
+from .store import (
+    AdaptiveConfidenceCalibrator,
+    CorpusStats,
+    PersistentVectorStore,
+    StoredChunk,
+    create_persistent_engine,
+)
 
 __all__ = [
     "analyze_report_text",
@@ -59,4 +66,10 @@ __all__ = [
     "detect_language",
     "CodeAwareIngestor",
     "create_code_aware_engine",
+    # New store exports
+    "PersistentVectorStore",
+    "AdaptiveConfidenceCalibrator",
+    "CorpusStats",
+    "StoredChunk",
+    "create_persistent_engine",
 ]
