@@ -94,6 +94,8 @@ class QueryPlan:
     intent_labels: List[str] = field(default_factory=list)
     preferred_source_types: List[SourceType] = field(default_factory=list)
     preferred_modalities: List[str] = field(default_factory=list)
+    required_source_types: List[SourceType] = field(default_factory=list)
+    required_modalities: List[str] = field(default_factory=list)
     target_paths: List[str] = field(default_factory=list)
     target_symbols: List[str] = field(default_factory=list)
 
@@ -275,6 +277,7 @@ class RetrievalEngine:
         tokens = sorted(set(_tokenize(query_text)))
         token_set = set(tokens)
         target_paths, target_symbols = _extract_structural_targets(query_text)
+        required_source_types, required_modalities = _extract_query_constraints(query_text)
         intent_rules = {
             "failure_clustering": {"cluster", "group", "pattern", "recurring", "flaky", "flake"},
             "root_cause": {"root", "cause", "traceback", "hypothesis", "why"},
@@ -302,6 +305,8 @@ class RetrievalEngine:
                 SourceType.REPOSITORY,
                 SourceType.KNOWLEDGE,
             ]
+        if required_source_types:
+            preferred_source_types = _dedupe(required_source_types + preferred_source_types)
 
         preferred_modalities = ["text"]
         if token_set.intersection({"table", "matrix", "spreadsheet"}):
@@ -309,6 +314,8 @@ class RetrievalEngine:
         if token_set.intersection({"image", "diagram", "screenshot", "ocr"}):
             preferred_modalities.append("image")
             preferred_modalities.append("image_ocr_stub")
+        if required_modalities:
+            preferred_modalities = _dedupe(required_modalities + preferred_modalities)
 
         return QueryPlan(
             query_text=query_text,
@@ -316,6 +323,8 @@ class RetrievalEngine:
             intent_labels=intent_labels,
             preferred_source_types=_dedupe(preferred_source_types),
             preferred_modalities=_dedupe(preferred_modalities),
+            required_source_types=required_source_types,
+            required_modalities=required_modalities,
             target_paths=target_paths,
             target_symbols=target_symbols,
         )
@@ -329,6 +338,8 @@ class RetrievalEngine:
         scored: List[RankedChunk] = []
         fallback: List[RankedChunk] = []
         for chunk in self._chunks:
+            if not _chunk_satisfies_constraints(plan, chunk):
+                continue
             chunk_tokens = set(_tokenize(chunk.text))
             overlap = sorted(query_tokens.intersection(chunk_tokens))
             lexical_score = len(overlap) / max(len(plan.tokens), 1)
@@ -1360,6 +1371,12 @@ def build_analysis_prompt_from_evidence(question: str, evidence: RetrievalEviden
             "Structural query targets: "
             f"paths={evidence.query_plan.target_paths} "
             f"symbols={evidence.query_plan.target_symbols}"
+        )
+    if evidence.query_plan.required_source_types or evidence.query_plan.required_modalities:
+        lines.append(
+            "Explicit query constraints: "
+            f"source_types={[item.value for item in evidence.query_plan.required_source_types]} "
+            f"modalities={evidence.query_plan.required_modalities}"
         )
 
     if evidence.missing_source_types or evidence.missing_modalities:
@@ -2505,6 +2522,51 @@ def _extract_structural_targets(query_text: str) -> Tuple[List[str], List[str]]:
                 target_symbols.append(symbol.lower())
 
     return _dedupe(target_paths), _dedupe(target_symbols)
+
+
+def _extract_query_constraints(query_text: str) -> Tuple[List[SourceType], List[str]]:
+    required_sources: List[SourceType] = []
+    required_modalities: List[str] = []
+
+    source_matches = re.findall(r"(?:source|source_type|type)\s*[:=]\s*([A-Za-z0-9_,|/-]+)", query_text, flags=re.IGNORECASE)
+    for raw_value in source_matches:
+        for token in re.split(r"[,|]", raw_value):
+            normalized = str(token).strip().lower().replace("-", "_")
+            if not normalized:
+                continue
+            try:
+                required_sources.append(SourceType(normalized))
+            except ValueError:
+                continue
+
+    modality_matches = re.findall(
+        r"(?:modality|modalities)\s*[:=]\s*([A-Za-z0-9_,|/-]+)",
+        query_text,
+        flags=re.IGNORECASE,
+    )
+    for raw_value in modality_matches:
+        for token in re.split(r"[,|]", raw_value):
+            normalized = str(token).strip().lower().replace("-", "_")
+            if not normalized:
+                continue
+            if normalized in {"image_stub", "ocr_stub"}:
+                normalized = "image_ocr_stub"
+            if normalized in {"text", "code", "table", "image", "image_ocr_stub", "markdown_mixed"}:
+                required_modalities.append(normalized)
+
+    return _dedupe(required_sources), _dedupe(required_modalities)
+
+
+def _chunk_satisfies_constraints(plan: QueryPlan, chunk: Chunk) -> bool:
+    if plan.required_source_types and chunk.source_type not in plan.required_source_types:
+        return False
+    if not plan.required_modalities:
+        return True
+    if chunk.modality in plan.required_modalities:
+        return True
+    if "image" in plan.required_modalities and chunk.modality == "image_ocr_stub":
+        return True
+    return False
 
 
 def _extract_reference_signals(text: str) -> Dict[str, List[str]]:

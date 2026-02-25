@@ -36,6 +36,73 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("src/auth/token.py", plan.target_paths)
         self.assertIn("refresh_token", plan.target_symbols)
 
+    def test_build_query_plan_extracts_source_and_modality_directives(self):
+        engine = RetrievalEngine()
+
+        plan = engine.build_query_plan(
+            "root cause source:requirements source:system_analysis modality:image modality:table"
+        )
+
+        self.assertEqual(
+            plan.required_source_types,
+            [SourceType.REQUIREMENTS, SourceType.SYSTEM_ANALYSIS],
+        )
+        self.assertEqual(plan.required_modalities, ["image", "table"])
+
+    def test_query_respects_source_directive_filter(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication risk mitigation requirement and coverage gaps.",
+            ),
+            IngestDocument(
+                source_id="repo-auth",
+                source_type=SourceType.REPOSITORY,
+                content="Auth module implementation details and retry logic.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "auth mitigation source:requirements",
+            top_k=5,
+            diversify=False,
+        )
+
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertTrue(all(item.chunk.source_type == SourceType.REQUIREMENTS for item in ranked))
+
+    def test_query_respects_modality_directive_filter(self):
+        docs = [
+            IngestDocument(
+                source_id="compound-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Auth incidents show retry storms and release risk.",
+                    "images": [{"ocr_text": "auth retry heatmap image evidence"}],
+                },
+            ),
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth release checklist and risk notes.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "auth risk modality:image",
+            top_k=5,
+            diversify=False,
+        )
+
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertTrue(all(item.chunk.modality in {"image", "image_ocr_stub"} for item in ranked))
+
     def test_retrieve_evidence_prioritizes_structural_targets(self):
         docs = [
             IngestDocument(
