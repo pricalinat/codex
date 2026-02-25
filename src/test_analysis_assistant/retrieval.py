@@ -226,6 +226,9 @@ class RetrievalEngine:
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
                 "extraction": round(extraction_quality, 4),
+                "position": round(_position_score(chunk), 4),
+                "authority": round(_source_authority(chunk), 4),
+                "completeness": round(_chunk_completeness(chunk, avg_chunk_size=self._chunk_size), 4),
             }
             if overlap:
                 scored.append(
@@ -282,17 +285,26 @@ class RetrievalEngine:
         modality_span = len({item.chunk.modality for item in top})
         diversity_bonus = ((source_span / len(top)) * 0.6) + ((modality_span / len(top)) * 0.4)
         for rank, item in enumerate(top):
+            enhanced_confidence = compute_enhanced_confidence(
+                chunk=item.chunk,
+                query_tokens=plan.tokens,
+                matched_terms=item.matched_terms,
+                score_breakdown=item.score_breakdown,
+                rank=rank,
+                total_results=len(top),
+            )
             normalized = item.score / max(max_score, 1e-9)
             coverage = len(item.matched_terms) / max(len(plan.tokens), 1)
             extraction = item.score_breakdown.get("extraction", 1.0)
             decay = 1.0 - (rank * 0.12)
-            confidence = (
+            legacy_confidence = (
                 (normalized * 0.50)
                 + (coverage * 0.22)
                 + (extraction * 0.18)
                 + (diversity_bonus * 0.10)
             )
-            item.confidence = round(max(0.0, min(1.0, confidence * decay)), 4)
+            blended = (enhanced_confidence * 0.72) + (legacy_confidence * decay * 0.28)
+            item.confidence = round(max(0.0, min(1.0, blended)), 4)
 
         return top
 
@@ -2227,6 +2239,9 @@ class HybridRetrievalEngine(RetrievalEngine):
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
                 "extraction": round(extraction_quality, 4),
+                "position": round(_position_score(chunk), 4),
+                "authority": round(_source_authority(chunk), 4),
+                "completeness": round(_chunk_completeness(chunk, avg_chunk_size=self._chunk_size), 4),
             }
 
             overlap = sorted(set(plan.tokens).intersection(set(_tokenize(chunk.text))))
@@ -2281,17 +2296,26 @@ class HybridRetrievalEngine(RetrievalEngine):
         diversity_bonus = ((source_span / len(top)) * 0.6) + ((modality_span / len(top)) * 0.4)
 
         for rank, item in enumerate(top):
+            enhanced_confidence = compute_enhanced_confidence(
+                chunk=item.chunk,
+                query_tokens=plan.tokens,
+                matched_terms=item.matched_terms,
+                score_breakdown=item.score_breakdown,
+                rank=rank,
+                total_results=len(top),
+            )
             normalized = item.score / max(max_score, 1e-9)
             coverage = len(item.matched_terms) / max(len(plan.tokens), 1)
             extraction = item.score_breakdown.get("extraction", 1.0)
             decay = 1.0 - (rank * 0.12)
-            confidence = (
+            legacy_confidence = (
                 (normalized * 0.50)
                 + (coverage * 0.22)
                 + (extraction * 0.18)
                 + (diversity_bonus * 0.10)
             )
-            item.confidence = round(max(0.0, min(1.0, confidence * decay)), 4)
+            blended = (enhanced_confidence * 0.72) + (legacy_confidence * decay * 0.28)
+            item.confidence = round(max(0.0, min(1.0, blended)), 4)
 
         return top
 

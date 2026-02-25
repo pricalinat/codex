@@ -826,6 +826,54 @@ Missing negative authorization tests increase release risk.
         self.assertIn("extraction", ranked[0].score_breakdown)
         self.assertGreater(ranked[0].score_breakdown["extraction"], ranked[1].score_breakdown["extraction"])
 
+    def test_query_exposes_enhanced_confidence_components(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication failure mitigation and release risk triage.",
+            ),
+            IngestDocument(
+                source_id="kb-auth",
+                source_type=SourceType.KNOWLEDGE,
+                content="Authentication failure mitigation and release risk triage.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query("authentication failure mitigation release risk", top_k=2, diversify=False)
+
+        self.assertEqual(2, len(ranked))
+        for item in ranked:
+            self.assertIn("authority", item.score_breakdown)
+            self.assertIn("position", item.score_breakdown)
+            self.assertIn("completeness", item.score_breakdown)
+
+    def test_query_confidence_prefers_authoritative_source_on_tie(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth-tie",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication failure mitigation release risk triage",
+            ),
+            IngestDocument(
+                source_id="kb-auth-tie",
+                source_type=SourceType.KNOWLEDGE,
+                content="Authentication failure mitigation release risk triage",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query("authentication failure mitigation release risk triage", top_k=2, diversify=False)
+        by_source = {item.chunk.source_id: item for item in ranked}
+
+        self.assertGreater(
+            by_source["req-auth-tie"].confidence,
+            by_source["kb-auth-tie"].confidence,
+        )
+
     def test_diversify_prefers_cross_source_coverage(self):
         docs = [
             IngestDocument(
