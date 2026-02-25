@@ -2070,6 +2070,66 @@ Missing negative authorization tests increase release risk.
         self.assertIn("coverage=", prompt)
         self.assertIn("req-md-prompt", prompt)
 
+    def test_retrieve_evidence_reports_traceability_coverage_factor(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication requirements require retry-safe refresh flow validation.",
+            ),
+            IngestDocument(
+                source_id="sys-incident-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "Incident report references source:req-auth for expected behavior and "
+                    "documents retry refresh failures."
+                ),
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "root cause retry refresh requirement reference",
+            top_k=4,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("traceability_coverage", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["traceability_coverage"], 0.0)
+
+    def test_source_bundle_summary_includes_linked_sources_and_traceability(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth requirement: retry refresh must handle stale token rotation.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Root-cause note references source:req-auth and retry refresh backoff policy.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth retry refresh root cause requirement",
+            top_k=4,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        bundle_by_source = {bundle.source_id: bundle for bundle in evidence.source_bundles}
+        self.assertIn("sys-auth", bundle_by_source)
+        sys_bundle = bundle_by_source["sys-auth"]
+        self.assertIn("req-auth", sys_bundle.linked_sources)
+        self.assertGreater(sys_bundle.traceability_score, 0.0)
+
     def test_retrieve_evidence_prefers_intent_source_coverage_from_candidate_pool(self):
         docs = [
             IngestDocument(

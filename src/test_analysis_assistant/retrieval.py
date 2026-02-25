@@ -158,10 +158,12 @@ class SourceEvidenceBundle:
     modalities: List[str] = field(default_factory=list)
     chunk_ids: List[str] = field(default_factory=list)
     matched_terms: List[str] = field(default_factory=list)
+    linked_sources: List[str] = field(default_factory=list)
     aggregate_score: float = 0.0
     aggregate_confidence: float = 0.0
     coverage_ratio: float = 0.0
     reliability_score: float = 0.0
+    traceability_score: float = 0.0
 
 
 @dataclass
@@ -1391,6 +1393,8 @@ def build_analysis_prompt(
                 f"confidence={bundle.aggregate_confidence:.2f} "
                 f"coverage={bundle.coverage_ratio:.2f} "
                 f"reliability={bundle.reliability_score:.2f} "
+                f"traceability={bundle.traceability_score:.2f} "
+                f"links={','.join(bundle.linked_sources)} "
                 f"terms={','.join(bundle.matched_terms)}"
             )
 
@@ -3388,6 +3392,59 @@ def _lineage_coherence(ranked: Sequence[RankedChunk]) -> float:
     return max(0.0, min(1.0, (pair_ratio * 0.65) + (chunk_ratio * 0.35)))
 
 
+def _chunk_referenced_sources(chunk: Chunk) -> List[str]:
+    refs: List[str] = []
+    linked_source = _normalize_reference_token(str(chunk.metadata.get("linked_source_id", "")).strip())
+    if linked_source:
+        refs.append(linked_source)
+    parent_source = _normalize_reference_token(str(chunk.metadata.get("parent_source_id", "")).strip())
+    if parent_source:
+        refs.append(parent_source)
+    for raw in _coerce_str_list(chunk.metadata.get("referenced_source_ids")):
+        normalized = _normalize_reference_token(raw)
+        if normalized:
+            refs.append(normalized)
+    return _dedupe(refs)
+
+
+def _traceability_coverage(ranked: Sequence[RankedChunk]) -> float:
+    if not ranked:
+        return 0.0
+
+    known_sources: set = set()
+    for item in ranked:
+        source_id = _normalize_reference_token(str(item.chunk.source_id).strip())
+        if source_id:
+            known_sources.add(source_id)
+        parent_source = _extract_bundle_parent_source(str(item.chunk.source_id).strip())
+        if parent_source:
+            known_sources.add(_normalize_reference_token(parent_source))
+
+    total_refs = 0
+    resolved_refs = 0
+    chunks_with_resolved_refs = 0
+
+    for item in ranked:
+        refs = [ref for ref in _chunk_referenced_sources(item.chunk) if ref]
+        if not refs:
+            continue
+        total_refs += len(refs)
+        chunk_resolved = 0
+        for ref in refs:
+            if ref in known_sources:
+                resolved_refs += 1
+                chunk_resolved += 1
+        if chunk_resolved > 0:
+            chunks_with_resolved_refs += 1
+
+    if total_refs == 0:
+        return 0.0
+
+    ref_resolution = resolved_refs / total_refs
+    chunk_resolution = chunks_with_resolved_refs / len(ranked)
+    return max(0.0, min(1.0, (ref_resolution * 0.75) + (chunk_resolution * 0.25)))
+
+
 def _calibrate_retrieval_confidence(
     ranked: Sequence[RankedChunk],
     plan: QueryPlan,
@@ -3411,6 +3468,7 @@ def _calibrate_retrieval_confidence(
         cross_source_consensus = _cross_source_consensus(ranked)
         cross_source_conflict = _cross_source_conflict(ranked)
         lineage_coherence = _lineage_coherence(ranked)
+        traceability_coverage = _traceability_coverage(ranked)
         source_concentration = _source_concentration(ranked)
         extraction_reliability = sum(_extraction_quality(item.chunk) for item in ranked) / len(ranked)
         source_reliability = sum(_source_reliability(item.chunk) for item in ranked) / len(ranked)
@@ -3437,6 +3495,7 @@ def _calibrate_retrieval_confidence(
         cross_source_consensus = 0.0
         cross_source_conflict = 0.0
         lineage_coherence = 0.0
+        traceability_coverage = 0.0
         source_concentration = 0.0
         extraction_reliability = 0.0
         source_reliability = 0.0
@@ -3457,6 +3516,7 @@ def _calibrate_retrieval_confidence(
     structural_multiplier = 0.90 + (0.10 * structural_coverage)
     consensus_multiplier = 0.96 + (0.04 * cross_source_consensus)
     lineage_multiplier = 1.0 + (0.02 * lineage_coherence)
+    traceability_multiplier = 1.0 + (0.03 * traceability_coverage)
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
     route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
@@ -3477,6 +3537,7 @@ def _calibrate_retrieval_confidence(
         * structural_multiplier
         * consensus_multiplier
         * lineage_multiplier
+        * traceability_multiplier
         * extraction_multiplier
         * reliability_multiplier
         * route_multiplier
@@ -3495,6 +3556,7 @@ def _calibrate_retrieval_confidence(
         "cross_source_consensus": round(max(0.0, min(1.0, cross_source_consensus)), 4),
         "cross_source_conflict": round(max(0.0, min(1.0, cross_source_conflict)), 4),
         "lineage_coherence": round(max(0.0, min(1.0, lineage_coherence)), 4),
+        "traceability_coverage": round(max(0.0, min(1.0, traceability_coverage)), 4),
         "source_concentration": round(max(0.0, min(1.0, source_concentration)), 4),
         "extraction_reliability": round(max(0.0, min(1.0, extraction_reliability)), 4),
         "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),
@@ -3526,6 +3588,7 @@ def _build_source_bundles(
                 "modalities": set(),
                 "chunk_ids": [],
                 "matched_terms": set(),
+                "linked_sources": set(),
                 "score_weighted": 0.0,
                 "confidence_weighted": 0.0,
                 "reliability_weighted": 0.0,
@@ -3535,6 +3598,7 @@ def _build_source_bundles(
         entry["modalities"].add(item.chunk.modality)
         entry["matched_terms"].update(item.matched_terms)
         entry["chunk_ids"].append(item.chunk.chunk_id)
+        entry["linked_sources"].update(_chunk_referenced_sources(item.chunk))
 
         # Earlier ranked chunks contribute more strongly to source confidence.
         weight = 1.0 / (1.0 + len(entry["chunk_ids"]) * 0.6)
@@ -3548,6 +3612,12 @@ def _build_source_bundles(
         weight_sum = entry["weight_sum"] if entry["weight_sum"] > 0 else 1.0
         matched_terms = sorted(entry["matched_terms"])
         coverage_ratio = len(set(matched_terms).intersection(query_tokens)) / max(len(query_tokens), 1)
+        linked_sources = sorted(
+            source for source in entry["linked_sources"] if source and source != source_id
+        )
+        traceability_score = 0.0
+        if linked_sources:
+            traceability_score = len([source for source in linked_sources if source in grouped]) / len(linked_sources)
         bundles.append(
             SourceEvidenceBundle(
                 source_id=source_id,
@@ -3555,10 +3625,12 @@ def _build_source_bundles(
                 modalities=sorted(entry["modalities"]),
                 chunk_ids=entry["chunk_ids"][:4],
                 matched_terms=matched_terms,
+                linked_sources=linked_sources[:6],
                 aggregate_score=round(entry["score_weighted"] / weight_sum, 4),
                 aggregate_confidence=round(entry["confidence_weighted"] / weight_sum, 4),
                 coverage_ratio=round(coverage_ratio, 4),
                 reliability_score=round(entry["reliability_weighted"] / weight_sum, 4),
+                traceability_score=round(traceability_score, 4),
             )
         )
 
