@@ -359,7 +359,7 @@ def build_adaptive_prompt(
         Optimized prompt string
     """
     if config is None:
-        config = AnalysisPromptStrategy()
+        config = AnalysisPromptConfig()
 
     strategy = config.strategy
 

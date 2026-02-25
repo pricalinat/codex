@@ -160,6 +160,98 @@ class TableExtractor:
 
         return tables
 
+    def extract_from_json(self, content: str) -> List[ExtractedTable]:
+        """Extract tables from JSON content (array of objects or nested).
+
+        Args:
+            content: JSON text potentially containing tabular data
+
+        Returns:
+            List of extracted tables
+        """
+        import json
+
+        tables = []
+        try:
+            data = json.loads(content)
+
+            # Handle array of objects (common API response format)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                if data:  # Non-empty array
+                    # Extract headers from all objects
+                    headers = list(data[0].keys()) if data else []
+                    rows = []
+                    for item in data:
+                        row = [str(item.get(h, "")) for h in headers]
+                        rows.append(row)
+
+                    if headers and rows:
+                        tables.append(ExtractedTable(
+                            table_id="json_table_0",
+                            headers=headers,
+                            rows=rows,
+                            extraction_confidence=0.9,
+                            metadata={"format": "array_of_objects"},
+                        ))
+
+            # Handle object with array property (common API response)
+            elif isinstance(data, dict):
+                for key, value in data.items():
+                    if isinstance(value, list) and value and isinstance(value[0], dict):
+                        headers = list(value[0].keys()) if value else []
+                        rows = []
+                        for item in value:
+                            row = [str(item.get(h, "")) for h in headers]
+                            rows.append(row)
+
+                        if headers and rows:
+                            tables.append(ExtractedTable(
+                                table_id=f"json_{key}_0",
+                                headers=headers,
+                                rows=rows,
+                                extraction_confidence=0.85,
+                                metadata={"format": "nested_array", "source_key": key},
+                            ))
+
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        return tables
+
+    def extract_from_delimited(self, content: str, delimiter: str = ",") -> List[ExtractedTable]:
+        """Extract tables from delimited text (CSV, TSV, semicolon-separated).
+
+        Args:
+            content: Delimited text content
+            delimiter: Field delimiter (default: comma)
+
+        Returns:
+            List of extracted tables
+        """
+        import io
+        import csv
+
+        tables = []
+        try:
+            reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+            rows = list(reader)
+            if rows:
+                # Filter out empty rows
+                rows = [r for r in rows if any(cell.strip() for cell in r)]
+                if rows:
+                    # First row as headers, rest as data
+                    tables.append(ExtractedTable(
+                        table_id=f"delimited_table_0",
+                        headers=rows[0],
+                        rows=rows[1:] if len(rows) > 1 else [],
+                        extraction_confidence=0.95,
+                        metadata={"format": f"delimited_{repr(delimiter)}"},
+                    ))
+        except Exception:
+            pass
+
+        return tables
+
     def extract_from_html(self, content: str) -> List[ExtractedTable]:
         """Extract tables from HTML content.
 
@@ -212,18 +304,26 @@ class TableExtractor:
 
         Args:
             content: Content containing tables
-            format_hint: Format hint (markdown, csv, html, auto)
+            format_hint: Format hint (markdown, csv, html, json, tsv, auto)
 
         Returns:
             List of extracted tables
         """
         if format_hint == "auto":
             # Auto-detect format
-            if content.strip().startswith("|"):
+            content_stripped = content.strip()
+            if content_stripped.startswith("|"):
                 format_hint = "markdown"
-            elif content.strip().startswith("<"):
+            elif content_stripped.startswith("<"):
                 format_hint = "html"
-            elif "," in content.split("\n")[0] if "\n" in content else "":
+            elif content_stripped.startswith(("{" , "[")):
+                format_hint = "json"
+            elif "\t" in content:
+                format_hint = "tsv"
+            elif ";" in content and "," not in content:
+                # Semicolon-separated (European CSV)
+                format_hint = "semicolon"
+            elif "," in content:
                 format_hint = "csv"
 
         if format_hint == "markdown":
@@ -232,6 +332,12 @@ class TableExtractor:
             return self.extract_from_csv(content)
         elif format_hint == "html":
             return self.extract_from_html(content)
+        elif format_hint == "json":
+            return self.extract_from_json(content)
+        elif format_hint == "tsv":
+            return self.extract_from_delimited(content, delimiter="\t")
+        elif format_hint == "semicolon":
+            return self.extract_from_delimited(content, delimiter=";")
 
         return []
 
@@ -309,6 +415,102 @@ class ImageOCRProcessor:
             ocr_confidence=0.0,
             metadata={"stub": True, "url": image_url},
         )
+
+
+class PDFProcessor:
+    """Processes PDF documents for text extraction.
+
+    This is a stub implementation with fallback for PDF text extraction.
+    In production, this would integrate with:
+    - pdfminer.six (pure Python, recommended)
+    - PyMuPDF (fitz) - fast C++ binding
+    - pdfplumber - table extraction focus
+
+    The stub provides helpful guidance when PDF processing is needed.
+    """
+
+    def __init__(self) -> None:
+        """Initialize PDF processor."""
+        self._pdfminer_available = self._check_pdfminer()
+
+    def _check_pdfminer(self) -> bool:
+        """Check if pdfminer.six is available."""
+        try:
+            import pdfminer.high_level
+            return True
+        except ImportError:
+            return False
+
+    def extract_text_from_bytes(self, pdf_data: bytes) -> str:
+        """Extract text from PDF bytes.
+
+        Args:
+            pdf_data: PDF file content as bytes
+
+        Returns:
+            Extracted text content
+        """
+        if self._pdfminer_available:
+            import io
+            from pdfminer.high_level import extract_text
+            return extract_text(io.BytesIO(pdf_data))
+        else:
+            return self._stub_response("bytes")
+
+    def extract_text_from_path(self, pdf_path: str) -> str:
+        """Extract text from PDF file path.
+
+        Args:
+            pdf_path: Path to PDF file
+
+        Returns:
+            Extracted text content
+        """
+        if self._pdfminer_available:
+            from pdfminer.high_level import extract_text
+            return extract_text(pdf_path)
+        else:
+            return self._stub_response("path")
+
+    def extract_text_from_url(self, pdf_url: str) -> str:
+        """Extract text from PDF URL.
+
+        Args:
+            pdf_url: URL to PDF file
+
+        Returns:
+            Extracted text content
+        """
+        # For URL extraction, we'd need to fetch the PDF first
+        if self._pdfminer_available:
+            try:
+                import urllib.request
+                import io
+                from pdfminer.high_level import extract_text
+                with urllib.request.urlopen(pdf_url) as response:
+                    pdf_data = response.read()
+                    return extract_text(io.BytesIO(pdf_data))
+            except Exception:
+                pass
+        return self._stub_response("url")
+
+    def _stub_response(self, source_type: str) -> str:
+        """Return a stub response with helpful guidance."""
+        return (
+            f"[PDF extraction not available: pdfminer.six not installed]\n"
+            f"To enable PDF text extraction, install pdfminer.six:\n"
+            f"    pip install pdfminer.six\n"
+            f"\n"
+            f"Source type: {source_type}\n"
+            f"\n"
+            f"For production use with tables, consider:\n"
+            f"    pip install pdfplumber  # Best for table extraction\n"
+        )
+
+    @property
+    def is_available(self) -> bool:
+        """Check if PDF processing is available."""
+        return self._pdfminer_available
 
 
 class MultimodalIngestor:

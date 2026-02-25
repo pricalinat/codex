@@ -8,6 +8,7 @@ from src.test_analysis_assistant.multimodal import (
     ModalityType,
     MultimodalIngestor,
     OCRResult,
+    PDFProcessor,
     ProcessedArtifact,
     TableExtractor,
 )
@@ -286,6 +287,119 @@ class TestModalityType(unittest.TestCase):
         self.assertEqual(ModalityType.TABLE.value, "table")
         self.assertEqual(ModalityType.IMAGE.value, "image")
         self.assertEqual(ModalityType.COMPOUND.value, "compound")
+
+
+class TestTableExtractorJSON(unittest.TestCase):
+    """Tests for JSON table extraction."""
+
+    def test_extract_from_json_array_of_objects(self):
+        """Test extraction of JSON array of objects."""
+        extractor = TableExtractor()
+        content = """[
+            {"name": "Alice", "age": 30, "city": "NYC"},
+            {"name": "Bob", "age": 25, "city": "LA"}
+        ]"""
+        tables = extractor.extract_from_json(content)
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0].headers, ["name", "age", "city"])
+        self.assertEqual(len(tables[0].rows), 2)
+        self.assertEqual(tables[0].rows[0], ["Alice", "30", "NYC"])
+
+    def test_extract_from_json_nested(self):
+        """Test extraction of JSON with nested array property."""
+        extractor = TableExtractor()
+        content = """{
+            "users": [
+                {"id": 1, "name": "Alice"},
+                {"id": 2, "name": "Bob"}
+            ]
+        }"""
+        tables = extractor.extract_from_json(content)
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0].headers, ["id", "name"])
+
+    def test_extract_from_json_invalid(self):
+        """Test extraction with invalid JSON returns empty list."""
+        extractor = TableExtractor()
+        tables = extractor.extract_from_json("not valid json")
+        self.assertEqual(len(tables), 0)
+
+    def test_extract_auto_detect_json(self):
+        """Test auto-detection of JSON format."""
+        extractor = TableExtractor()
+        content = '[{"a": 1}, {"a": 2}]'
+        tables = extractor.extract(content, format_hint="auto")
+        self.assertEqual(len(tables), 1)
+
+
+class TestTableExtractorDelimited(unittest.TestCase):
+    """Tests for delimited text (TSV, semicolon CSV) extraction."""
+
+    def test_extract_from_tsv(self):
+        """Test extraction of TSV content."""
+        extractor = TableExtractor()
+        content = "Name\tAge\tCity\nAlice\t30\tNYC\nBob\t25\tLA"
+        tables = extractor.extract_from_delimited(content, delimiter="\t")
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0].headers, ["Name", "Age", "City"])
+        self.assertEqual(len(tables[0].rows), 2)
+
+    def test_extract_from_semicolon_csv(self):
+        """Test extraction of semicolon-separated content."""
+        extractor = TableExtractor()
+        content = "Name;Age;City\nAlice;30;NYC\nBob;25;LA"
+        tables = extractor.extract_from_delimited(content, delimiter=";")
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0].headers, ["Name", "Age", "City"])
+
+    def test_extract_auto_detect_tsv(self):
+        """Test auto-detection of TSV format."""
+        extractor = TableExtractor()
+        content = "A\tB\n1\t2"
+        tables = extractor.extract(content, format_hint="auto")
+        self.assertEqual(len(tables), 1)
+
+    def test_extract_auto_detect_semicolon(self):
+        """Test auto-detection of semicolon format."""
+        extractor = TableExtractor()
+        content = "A;B\n1;2"
+        tables = extractor.extract(content, format_hint="auto")
+        self.assertEqual(len(tables), 1)
+
+
+class TestPDFProcessor(unittest.TestCase):
+    """Tests for PDF processing."""
+
+    def test_pdf_processor_init(self):
+        """Test PDF processor initialization."""
+        processor = PDFProcessor()
+        # Should initialize (pdfminer may or may not be available)
+        self.assertIsNotNone(processor)
+
+    def test_pdf_processor_stub_response(self):
+        """Test that PDF processor returns helpful stub when pdfminer not available."""
+        processor = PDFProcessor()
+        result = processor.extract_text_from_path("/path/to/file.pdf")
+        # Should contain helpful message about pdfminer
+        self.assertIn("pdfminer.six", result)
+
+    def test_pdf_processor_bytes_stub(self):
+        """Test PDF bytes extraction returns stub."""
+        processor = PDFProcessor()
+        result = processor.extract_text_from_bytes(b"%PDF-1.4 fake pdf content")
+        self.assertIn("pdfminer.six", result)
+
+    def test_pdf_processor_url_stub(self):
+        """Test PDF URL extraction returns stub."""
+        processor = PDFProcessor()
+        result = processor.extract_text_from_url("https://example.com/doc.pdf")
+        self.assertIn("pdfminer.six", result)
+
+    def test_pdf_is_available_property(self):
+        """Test is_available property reflects pdfminer availability."""
+        processor = PDFProcessor()
+        # Property should exist and be a boolean
+        self.assertIsInstance(processor.is_available, bool)
 
 
 if __name__ == "__main__":
