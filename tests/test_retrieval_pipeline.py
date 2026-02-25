@@ -253,6 +253,42 @@ Missing negative authorization tests are release blocking.
         self.assertIn("table", modalities)
         self.assertIn("image_ocr_stub", modalities)
 
+    def test_markdown_table_units_are_normalized_into_key_value_rows(self):
+        markdown = """
+# Coverage Matrix
+| component | severity | owner |
+| --------- | -------- | ----- |
+| auth      | high     | qa    |
+| billing   | medium   | sdet  |
+""".strip()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        chunks = ingestor.ingest_requirements_markdown("req-md-table-normalized", markdown)
+
+        table_text = "\n".join(chunk.text for chunk in chunks if chunk.modality == "table")
+        self.assertIn("component=auth", table_text)
+        self.assertIn("severity=high", table_text)
+        self.assertIn("owner=qa", table_text)
+
+    def test_markdown_image_alt_text_is_searchable_with_ocr_stub(self):
+        markdown = """
+# Auth Diagnostics
+![auth retry storm heatmap](artifacts/auth-heatmap.png)
+""".strip()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        ingestor.ingest_requirements_markdown("req-md-image-alt", markdown)
+
+        ranked = engine.query("auth retry storm heatmap", top_k=1, diversify=False)
+
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].chunk.source_id, "req-md-image-alt")
+        self.assertEqual(ranked[0].chunk.modality, "image_ocr_stub")
+        self.assertIn("auth", ranked[0].matched_terms)
+        self.assertIn("heatmap", ranked[0].chunk.text)
+
     def test_ingest_multisource_with_table_and_image_stub(self):
         docs = [
             IngestDocument(

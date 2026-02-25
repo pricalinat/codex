@@ -1012,6 +1012,9 @@ def _image_to_ocr_stub(content: Any) -> str:
         if isinstance(content.get("ocr_text"), str) and content["ocr_text"].strip():
             return content["ocr_text"]
         image_path = str(content.get("image_path", "unknown_image"))
+        alt_text = str(content.get("alt_text", "")).strip()
+        if alt_text:
+            return f"[OCR_STUB] no OCR pipeline connected for {image_path}. alt_text: {alt_text}"
         return f"[OCR_STUB] no OCR pipeline connected for {image_path}."
     return "[OCR_STUB] image payload provided without OCR text."
 
@@ -1051,19 +1054,26 @@ def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
     table_index = 0
     image_index = 0
 
-    image_pattern = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+    image_pattern = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
     for line in lines:
         image_matches = image_pattern.findall(line)
         if image_matches:
-            for image_path in image_matches:
-                image_text = _image_to_ocr_stub({"image_path": image_path})
+            for alt_text, image_path in image_matches:
+                payload = {"image_path": image_path}
+                if alt_text.strip():
+                    payload["alt_text"] = alt_text.strip()
+                image_text = _image_to_ocr_stub(payload)
                 extraction_confidence = 0.25 if image_text.startswith("[OCR_STUB]") else 0.65
                 units.append(
                     ExtractedUnit(
                         text=image_text,
                         modality="image",
                         extraction_confidence=extraction_confidence,
-                        metadata={"image_index": image_index, "image_path": image_path},
+                        metadata={
+                            "image_index": image_index,
+                            "image_path": image_path,
+                            "alt_text": alt_text.strip(),
+                        },
                     )
                 )
                 image_index += 1
@@ -1076,7 +1086,7 @@ def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
             continue
 
         if in_table:
-            table_text = "\n".join(table_lines).strip()
+            table_text = _markdown_table_to_text(table_lines)
             if table_text:
                 units.append(
                     ExtractedUnit(
@@ -1093,7 +1103,7 @@ def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
         plain_lines.append(line)
 
     if table_lines:
-        table_text = "\n".join(table_lines).strip()
+        table_text = _markdown_table_to_text(table_lines)
         if table_text:
             units.append(
                 ExtractedUnit(
@@ -1118,6 +1128,72 @@ def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
     if units:
         return units
     return [ExtractedUnit(text=markdown, modality="text", extraction_confidence=0.9)]
+
+
+def _markdown_table_to_text(lines: Sequence[str]) -> str:
+    parsed = _parse_markdown_table(lines)
+    if parsed is None:
+        return "\n".join(lines).strip()
+    return _table_to_text(parsed)
+
+
+def _parse_markdown_table(lines: Sequence[str]) -> Optional[Dict[str, Any]]:
+    if len(lines) < 2:
+        return None
+
+    rows: List[List[str]] = []
+    for line in lines:
+        cells = _split_markdown_table_row(line)
+        if cells:
+            rows.append(cells)
+
+    if len(rows) < 2:
+        return None
+
+    header = rows[0]
+    separator = rows[1]
+    if len(separator) != len(header):
+        return None
+    if not all(_is_markdown_separator_cell(cell) for cell in separator):
+        return None
+
+    if not header or len(set(header)) != len(header) or not all(header):
+        return None
+
+    structured_rows: List[Dict[str, str]] = []
+    width = len(header)
+    for values in rows[2:]:
+        padded = values[:width] + ([""] * max(0, width - len(values)))
+        structured_rows.append({header[idx]: padded[idx] for idx in range(width)})
+    return {"rows": structured_rows}
+
+
+def _split_markdown_table_row(line: str) -> List[str]:
+    stripped = line.strip()
+    if not stripped.startswith("|") or "|" not in stripped:
+        return []
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _is_markdown_separator_cell(cell: str) -> bool:
+    if not cell:
+        return False
+    reduced = cell.replace(" ", "")
+    if len(reduced) < 3:
+        return False
+    if set(reduced) <= {"-"}:
+        return True
+    if reduced.startswith(":") and reduced.endswith(":"):
+        return set(reduced[1:-1]) <= {"-"}
+    if reduced.startswith(":"):
+        return set(reduced[1:]) <= {"-"}
+    if reduced.endswith(":"):
+        return set(reduced[:-1]) <= {"-"}
+    return False
 
 
 def _infer_repository_modality(extension: str) -> str:
