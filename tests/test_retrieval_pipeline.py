@@ -515,6 +515,71 @@ class TestRetrievalPipeline(unittest.TestCase):
             by_source["kb-noise"].score_breakdown.get("corroboration", 0.0),
         )
 
+    def test_query_assigns_artifact_graph_bonus_for_multimodal_linked_source(self):
+        docs = [
+            IngestDocument(
+                source_id="req-single",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication risk matrix requires mitigation planning for release.",
+            ),
+            IngestDocument(
+                source_id="incident-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Authentication risk matrix requires mitigation planning for release.",
+                    "tables": [{"rows": [{"component": "auth", "risk": "high", "view": "matrix"}]}],
+                    "images": [{"ocr_text": "authentication risk heatmap screenshot"}],
+                },
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "authentication risk matrix image evidence",
+            top_k=4,
+            diversify=False,
+        )
+
+        self.assertGreaterEqual(len(ranked), 2)
+        by_source = {item.chunk.source_id: item for item in ranked}
+        self.assertIn("req-single", by_source)
+        self.assertIn("incident-auth", by_source)
+        self.assertGreater(by_source["incident-auth"].score_breakdown.get("artifact_graph", 0.0), 0.0)
+        self.assertGreater(
+            by_source["incident-auth"].score_breakdown.get("artifact_graph", 0.0),
+            by_source["req-single"].score_breakdown.get("artifact_graph", 0.0),
+        )
+
+    def test_retrieve_evidence_reports_artifact_graph_support_factor(self):
+        docs = [
+            IngestDocument(
+                source_id="incident-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Authentication risk mitigation plan for release readiness.",
+                    "tables": [{"rows": [{"component": "auth", "risk": "high", "priority": "p0"}]}],
+                    "images": [{"ocr_text": "authentication risk heatmap for retry storm"}],
+                },
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        evidence = engine.retrieve_evidence(
+            "auth risk matrix and image evidence",
+            top_k=4,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("artifact_graph_support", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["artifact_graph_support"], 0.0)
+
     def test_query_diversify_prefers_intent_source_type_coverage(self):
         docs = [
             IngestDocument(

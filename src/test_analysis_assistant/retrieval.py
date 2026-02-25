@@ -368,6 +368,8 @@ class RetrievalEngine:
 
         _apply_corroboration_bonus(scored)
         _apply_corroboration_bonus(fallback)
+        _apply_artifact_graph_bonus(scored, corpus_chunks=self._chunks, plan=plan)
+        _apply_artifact_graph_bonus(fallback, corpus_chunks=self._chunks, plan=plan)
 
         scored.sort(
             key=lambda item: (
@@ -2515,6 +2517,10 @@ def _calibrate_retrieval_confidence(
         extraction_reliability = sum(_extraction_quality(item.chunk) for item in ranked) / len(ranked)
         source_reliability = sum(_source_reliability(item.chunk) for item in ranked) / len(ranked)
         ingestion_route_quality = sum(_ingestion_route_quality(item.chunk) for item in ranked) / len(ranked)
+        artifact_graph_support = sum(
+            max(0.0, min(1.0, float(item.score_breakdown.get("artifact_graph", 0.0))))
+            for item in ranked
+        ) / len(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
@@ -2524,6 +2530,7 @@ def _calibrate_retrieval_confidence(
         extraction_reliability = 0.0
         source_reliability = 0.0
         ingestion_route_quality = 0.0
+        artifact_graph_support = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -2537,6 +2544,7 @@ def _calibrate_retrieval_confidence(
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
     route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
+    graph_multiplier = 1.0 + (0.01 * artifact_graph_support)
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio) + (0.16 * cross_source_conflict)
     availability_penalty = 0.08 * unavailable_pressure
     concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
@@ -2548,6 +2556,7 @@ def _calibrate_retrieval_confidence(
         * extraction_multiplier
         * reliability_multiplier
         * route_multiplier
+        * graph_multiplier
     )
     calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty - concentration_penalty)
     calibrated = max(0.0, min(1.0, calibrated))
@@ -2564,6 +2573,7 @@ def _calibrate_retrieval_confidence(
         "extraction_reliability": round(max(0.0, min(1.0, extraction_reliability)), 4),
         "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),
         "ingestion_route_quality": round(max(0.0, min(1.0, ingestion_route_quality)), 4),
+        "artifact_graph_support": round(max(0.0, min(1.0, artifact_graph_support)), 4),
     }
     return round(calibrated, 4), factors
 
@@ -2861,6 +2871,89 @@ def _apply_corroboration_bonus(candidates: Sequence[RankedChunk], max_bonus: flo
         bonus = min(max_bonus, aggregate * max_bonus)
         item.score += bonus
         item.score_breakdown["corroboration"] = round(aggregate, 4)
+
+
+def _apply_artifact_graph_bonus(
+    candidates: Sequence[RankedChunk],
+    corpus_chunks: Sequence[Chunk],
+    plan: QueryPlan,
+    max_bonus: float = 0.12,
+) -> None:
+    if not candidates or not corpus_chunks:
+        return
+
+    index: Dict[str, List[Chunk]] = {}
+    for chunk in corpus_chunks:
+        for key in _chunk_link_keys(chunk):
+            index.setdefault(key, []).append(chunk)
+
+    modality_targets = [modality for modality in plan.preferred_modalities if modality != "text"]
+    source_targets = set(plan.preferred_source_types)
+    query_terms = set(plan.tokens)
+
+    for item in candidates:
+        related: Dict[str, Chunk] = {}
+        for key in _chunk_link_keys(item.chunk):
+            for neighbor in index.get(key, []):
+                if neighbor.chunk_id == item.chunk.chunk_id:
+                    continue
+                related[neighbor.chunk_id] = neighbor
+
+        if not related:
+            item.score_breakdown["artifact_graph"] = 0.0
+            continue
+
+        related_chunks = list(related.values())
+        related_modalities = {chunk.modality for chunk in related_chunks}
+        related_sources = {chunk.source_type for chunk in related_chunks}
+        lexical_hits = sum(1 for chunk in related_chunks if query_terms.intersection(set(_tokenize(chunk.text))))
+
+        modality_support = (
+            len(related_modalities.intersection(set(modality_targets))) / len(modality_targets)
+            if modality_targets
+            else 0.0
+        )
+        source_support = (
+            len(related_sources.intersection(source_targets)) / len(source_targets)
+            if source_targets
+            else 0.0
+        )
+        lexical_bridge = lexical_hits / max(1, len(related_chunks))
+
+        aggregate = min(
+            1.0,
+            (modality_support * 0.50) + (source_support * 0.20) + (lexical_bridge * 0.30),
+        )
+        bonus = min(max_bonus, aggregate * max_bonus)
+        item.score += bonus
+        item.score_breakdown["artifact_graph"] = round(aggregate, 4)
+
+
+def _chunk_link_keys(chunk: Chunk) -> List[str]:
+    keys: List[str] = []
+
+    source_id = str(chunk.source_id).strip()
+    if source_id:
+        keys.append(f"source:{source_id}")
+        if source_id.endswith("::__summary__"):
+            keys.append(f"source:{source_id[:-12]}")
+
+    linked_source = str(chunk.metadata.get("linked_source_id", "")).strip()
+    if linked_source:
+        keys.append(f"source:{linked_source}")
+
+    path_value = str(chunk.metadata.get("path", "")).strip()
+    origin_path = str(chunk.metadata.get("origin_path", "")).strip()
+    for raw in (path_value, origin_path):
+        if not raw:
+            continue
+        normalized = Path(raw).as_posix()
+        keys.append(f"path:{normalized}")
+        parent = Path(normalized).parent.as_posix()
+        if parent and parent != ".":
+            keys.append(f"dir:{parent}")
+
+    return _dedupe(keys)
 
 
 def _select_coverage_aware_top(
@@ -3311,6 +3404,8 @@ class HybridRetrievalEngine(RetrievalEngine):
 
         _apply_corroboration_bonus(scored)
         _apply_corroboration_bonus(fallback)
+        _apply_artifact_graph_bonus(scored, corpus_chunks=self._chunks, plan=plan)
+        _apply_artifact_graph_bonus(fallback, corpus_chunks=self._chunks, plan=plan)
 
         # Sort and select results
         scored.sort(
