@@ -86,6 +86,14 @@ from .query_reformulator import (
     ReformulatedQueries,
     reformulate_queries,
 )
+from .query_understanding import (
+    QueryIntent,
+    IntentClassification,
+    QueryUnderstanding,
+    ContextualVariant,
+    QueryUnderstandingEngine,
+    understand_query,
+)
 from .root_cause import (
     RootCauseAnalysis,
     RootCauseAnalyzer,
@@ -168,6 +176,13 @@ __all__ = [
     "QueryVariant",
     "ReformulatedQueries",
     "reformulate_queries",
+    # Query understanding exports
+    "QueryIntent",
+    "IntentClassification",
+    "QueryUnderstanding",
+    "ContextualVariant",
+    "QueryUnderstandingEngine",
+    "understand_query",
     # Content detection exports
     "ContentCategory",
     "ContentDetectionResult",
