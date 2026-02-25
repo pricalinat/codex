@@ -14,6 +14,15 @@ from .code_chunker import (
     CodeUnit,
     detect_language,
 )
+from .content_detector import (
+    CodeLanguage as DetectedCodeLanguage,
+    ContentCategory,
+    ContentDetectionResult,
+    DocumentType,
+    detect_code_language,
+    detect_content_type,
+    suggest_ingestion_strategy,
+)
 from .models import AnalysisResult, FailureRecord, FixSuggestion
 from .rag_analyzer import (
     ChunkerType,
@@ -113,4 +122,12 @@ __all__ = [
     "QueryVariant",
     "ReformulatedQueries",
     "reformulate_queries",
+    # Content detection exports
+    "ContentCategory",
+    "ContentDetectionResult",
+    "DocumentType",
+    "DetectedCodeLanguage",
+    "detect_code_language",
+    "detect_content_type",
+    "suggest_ingestion_strategy",
 ]

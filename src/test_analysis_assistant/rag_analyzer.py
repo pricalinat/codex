@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
 
 from .analyzer import analyze_report_text
+from .content_detector import detect_content_type, suggest_ingestion_strategy
 from .models import AnalysisResult, FailureCluster, FixSuggestion
 from .query_reformulator import QueryReformulator, ReformulatedQueries
 from .retrieval import (
@@ -177,12 +178,18 @@ class RAGAnalyzer:
         self._reformulator = QueryReformulator(max_variants_per_failure=3)
         self._reformulated_queries: Optional[ReformulatedQueries] = None
 
-    def _select_ingestor(self, source_type: SourceType, source_id: str) -> Any:
+    def _select_ingestor(
+        self,
+        source_type: SourceType,
+        source_id: str,
+        content: Optional[str] = None,
+    ) -> Any:
         """Select appropriate ingestor based on source type and content.
 
         Args:
             source_type: The type of source being ingested
             source_id: The source identifier (file path)
+            content: Optional content for smart detection
 
         Returns:
             The appropriate ingestor instance
@@ -190,7 +197,13 @@ class RAGAnalyzer:
         if self._chunker_type == ChunkerType.CODE_AWARE:
             return self._ingestor
         if self._chunker_type == ChunkerType.AUTO:
-            # Auto-select based on source type and file extension
+            # Use content-aware detection if content is available
+            if content and self._code_ingestor is not None:
+                chunker, _ = suggest_ingestion_strategy(content, source_id)
+                if chunker == "code_aware":
+                    return self._code_ingestor
+
+            # Fallback to extension-based detection
             if source_type in (SourceType.REPOSITORY, SourceType.CODE_SNIPPET):
                 # Check if it's a code file
                 if self._is_code_file(source_id):
