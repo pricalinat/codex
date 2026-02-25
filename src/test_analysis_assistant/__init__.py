@@ -24,6 +24,23 @@ from .content_detector import (
     suggest_ingestion_strategy,
 )
 from .models import AnalysisResult, FailureRecord, FixSuggestion
+from .prompt_strategy import (
+    AnalysisPromptConfig,
+    AnalysisPromptStrategy,
+    FewShotExample,
+    PromptStrategy,
+    PromptSection,
+    TEST_GAP_EXAMPLES,
+    ROOT_CAUSE_EXAMPLES,
+    build_adaptive_prompt,
+    build_cot_prompt,
+    build_fewshot_prompt,
+    build_hierarchical_prompt,
+    extract_structured_response,
+    estimate_token_count,
+    truncate_for_context,
+    default_strategy,
+)
 from .rag_analyzer import (
     ChunkerType,
     RAGAnalyzer,
@@ -130,4 +147,20 @@ __all__ = [
     "detect_code_language",
     "detect_content_type",
     "suggest_ingestion_strategy",
+    # Prompt strategy exports
+    "PromptStrategy",
+    "AnalysisPromptConfig",
+    "AnalysisPromptStrategy",
+    "FewShotExample",
+    "PromptSection",
+    "TEST_GAP_EXAMPLES",
+    "ROOT_CAUSE_EXAMPLES",
+    "build_adaptive_prompt",
+    "build_cot_prompt",
+    "build_fewshot_prompt",
+    "build_hierarchical_prompt",
+    "extract_structured_response",
+    "estimate_token_count",
+    "truncate_for_context",
+    "default_strategy",
 ]
