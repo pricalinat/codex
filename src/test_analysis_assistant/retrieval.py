@@ -217,6 +217,13 @@ class RetrievalEngine:
                             **unit.metadata,
                         }
                     )
+                    reference_signals = _extract_reference_signals(piece)
+                    if reference_signals["source_ids"]:
+                        prior_refs = _coerce_str_list(chunk_metadata.get("referenced_source_ids"))
+                        chunk_metadata["referenced_source_ids"] = _dedupe(prior_refs + reference_signals["source_ids"])
+                    if reference_signals["paths"]:
+                        prior_paths = _coerce_str_list(chunk_metadata.get("referenced_paths"))
+                        chunk_metadata["referenced_paths"] = _dedupe(prior_paths + reference_signals["paths"])
                     chunk = Chunk(
                         chunk_id=_hash_id(doc.source_id, unit_idx, chunk_idx, piece),
                         source_id=doc.source_id,
@@ -2236,6 +2243,68 @@ def _tokenize(text: str) -> List[str]:
     return [_normalize_token(token.lower()) for token in _WORD_RE.findall(text)]
 
 
+def _extract_reference_signals(text: str) -> Dict[str, List[str]]:
+    source_ids: List[str] = []
+    referenced_paths: List[str] = []
+
+    for match in re.finditer(r"(?:\[\s*)?source:([A-Za-z0-9_./:-]+)", text, flags=re.IGNORECASE):
+        token = _normalize_reference_token(match.group(1))
+        if token:
+            source_ids.append(token)
+    for match in re.finditer(r"source_id\s*[:=]\s*([A-Za-z0-9_./:-]+)", text, flags=re.IGNORECASE):
+        token = _normalize_reference_token(match.group(1))
+        if token:
+            source_ids.append(token)
+
+    for match in re.finditer(r"\]\(([^)]+)\)", text):
+        path_candidate = _normalize_reference_path(match.group(1))
+        if path_candidate:
+            referenced_paths.append(path_candidate)
+    for match in re.finditer(r"(?:^|[\s(])path:([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+)", text):
+        path_candidate = _normalize_reference_path(match.group(1))
+        if path_candidate:
+            referenced_paths.append(path_candidate)
+
+    return {"source_ids": _dedupe(source_ids), "paths": _dedupe(referenced_paths)}
+
+
+def _normalize_reference_token(raw: str) -> str:
+    token = str(raw or "").strip()
+    if not token:
+        return ""
+    return re.sub(r"[\],.;:)\s]+$", "", token)
+
+
+def _normalize_reference_path(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    value = value.split("?", 1)[0].split("#", 1)[0].strip()
+    if "://" in value:
+        return ""
+    value = re.sub(r"[\],.;:)\s]+$", "", value)
+    if "/" not in value and "." not in value:
+        return ""
+    return Path(value).as_posix()
+
+
+def _coerce_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return [cleaned] if cleaned else []
+    if isinstance(value, (list, tuple, set)):
+        items: List[str] = []
+        for item in value:
+            cleaned = str(item).strip()
+            if cleaned:
+                items.append(cleaned)
+        return items
+    cleaned = str(value).strip()
+    return [cleaned] if cleaned else []
+
+
 def _normalize_token(token: str) -> str:
     if token.endswith("ies") and len(token) > 4:
         return token[:-3] + "y"
@@ -2615,6 +2684,10 @@ def _calibrate_retrieval_confidence(
             max(0.0, min(1.0, float(item.score_breakdown.get("artifact_graph", 0.0))))
             for item in ranked
         ) / len(ranked)
+        citation_graph_support = sum(
+            max(0.0, min(1.0, float(item.score_breakdown.get("citation_graph", 0.0))))
+            for item in ranked
+        ) / len(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
@@ -2625,6 +2698,7 @@ def _calibrate_retrieval_confidence(
         source_reliability = 0.0
         ingestion_route_quality = 0.0
         artifact_graph_support = 0.0
+        citation_graph_support = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -2638,7 +2712,7 @@ def _calibrate_retrieval_confidence(
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
     route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
-    graph_multiplier = 1.0 + (0.01 * artifact_graph_support)
+    graph_multiplier = 1.0 + (0.008 * artifact_graph_support) + (0.012 * citation_graph_support)
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio) + (0.16 * cross_source_conflict)
     availability_penalty = 0.08 * unavailable_pressure
     concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
@@ -2668,6 +2742,7 @@ def _calibrate_retrieval_confidence(
         "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),
         "ingestion_route_quality": round(max(0.0, min(1.0, ingestion_route_quality)), 4),
         "artifact_graph_support": round(max(0.0, min(1.0, artifact_graph_support)), 4),
+        "citation_graph_support": round(max(0.0, min(1.0, citation_graph_support)), 4),
     }
     return round(calibrated, 4), factors
 
@@ -2995,12 +3070,14 @@ def _apply_artifact_graph_bonus(
 
         if not related:
             item.score_breakdown["artifact_graph"] = 0.0
+            item.score_breakdown["citation_graph"] = 0.0
             continue
 
         related_chunks = list(related.values())
         related_modalities = {chunk.modality for chunk in related_chunks}
         related_sources = {chunk.source_type for chunk in related_chunks}
         lexical_hits = sum(1 for chunk in related_chunks if query_terms.intersection(set(_tokenize(chunk.text))))
+        citation_support = _citation_graph_support(item.chunk, related_chunks)
 
         modality_support = (
             len(related_modalities.intersection(set(modality_targets))) / len(modality_targets)
@@ -3016,11 +3093,40 @@ def _apply_artifact_graph_bonus(
 
         aggregate = min(
             1.0,
-            (modality_support * 0.50) + (source_support * 0.20) + (lexical_bridge * 0.30),
+            (modality_support * 0.40) + (source_support * 0.15) + (lexical_bridge * 0.25) + (citation_support * 0.20),
         )
         bonus = min(max_bonus, aggregate * max_bonus)
         item.score += bonus
         item.score_breakdown["artifact_graph"] = round(aggregate, 4)
+        item.score_breakdown["citation_graph"] = round(citation_support, 4)
+
+
+def _citation_graph_support(chunk: Chunk, related_chunks: Sequence[Chunk]) -> float:
+    referenced_sources = set(_coerce_str_list(chunk.metadata.get("referenced_source_ids")))
+    referenced_paths = set(_coerce_str_list(chunk.metadata.get("referenced_paths")))
+    if not referenced_sources and not referenced_paths:
+        return 0.0
+
+    source_hits = 0
+    path_hits = 0
+
+    for related in related_chunks:
+        source_id = str(related.source_id).strip()
+        if source_id and source_id in referenced_sources:
+            source_hits += 1
+            continue
+
+        related_paths = set()
+        for raw_path in (related.metadata.get("path"), related.metadata.get("origin_path")):
+            if not raw_path:
+                continue
+            related_paths.add(Path(str(raw_path)).as_posix())
+        if referenced_paths and referenced_paths.intersection(related_paths):
+            path_hits += 1
+
+    source_support = source_hits / max(1, len(referenced_sources)) if referenced_sources else 0.0
+    path_support = path_hits / max(1, len(referenced_paths)) if referenced_paths else 0.0
+    return min(1.0, (source_support * 0.8) + (path_support * 0.2))
 
 
 def _chunk_link_keys(chunk: Chunk) -> List[str]:
@@ -3041,6 +3147,8 @@ def _chunk_link_keys(chunk: Chunk) -> List[str]:
     parent_source = str(chunk.metadata.get("parent_source_id", "")).strip()
     if parent_source:
         keys.append(f"source:{parent_source}")
+    for referenced_source in _coerce_str_list(chunk.metadata.get("referenced_source_ids")):
+        keys.append(f"source:{referenced_source}")
 
     path_value = str(chunk.metadata.get("path", "")).strip()
     origin_path = str(chunk.metadata.get("origin_path", "")).strip()
@@ -3050,6 +3158,12 @@ def _chunk_link_keys(chunk: Chunk) -> List[str]:
         normalized = Path(raw).as_posix()
         keys.append(f"path:{normalized}")
         parent = Path(normalized).parent.as_posix()
+        if parent and parent != ".":
+            keys.append(f"dir:{parent}")
+    for referenced_path in _coerce_str_list(chunk.metadata.get("referenced_paths")):
+        normalized_path = Path(referenced_path).as_posix()
+        keys.append(f"path:{normalized_path}")
+        parent = Path(normalized_path).parent.as_posix()
         if parent and parent != ".":
             keys.append(f"dir:{parent}")
 

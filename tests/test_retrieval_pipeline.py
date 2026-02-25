@@ -580,6 +580,81 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("artifact_graph_support", evidence.confidence_factors)
         self.assertGreater(evidence.confidence_factors["artifact_graph_support"], 0.0)
 
+    def test_query_assigns_citation_graph_bonus_for_cross_source_references(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Token refresh failure requires mitigation and negative auth tests.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Incident report confirms token refresh failure under retry load.",
+            ),
+            IngestDocument(
+                source_id="repo-citing",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Auth fix references [source:req-auth] and [source:sys-auth] while addressing "
+                    "token refresh failure mitigation."
+                ),
+            ),
+            IngestDocument(
+                source_id="repo-uncited",
+                source_type=SourceType.REPOSITORY,
+                content="Token refresh failure mitigation patch notes for auth module.",
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        ranked = engine.query("token refresh failure mitigation", top_k=4, diversify=False)
+        by_source = {item.chunk.source_id: item for item in ranked}
+
+        self.assertIn("repo-citing", by_source)
+        self.assertIn("repo-uncited", by_source)
+        self.assertGreater(by_source["repo-citing"].score_breakdown.get("citation_graph", 0.0), 0.0)
+        self.assertGreater(
+            by_source["repo-citing"].score_breakdown.get("citation_graph", 0.0),
+            by_source["repo-uncited"].score_breakdown.get("citation_graph", 0.0),
+        )
+
+    def test_retrieve_evidence_reports_citation_graph_support_factor(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Token refresh failure requires mitigation and negative auth tests.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Incident report confirms token refresh failure under retry load.",
+            ),
+            IngestDocument(
+                source_id="repo-citing",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Auth fix references [source:req-auth] and [source:sys-auth] while addressing "
+                    "token refresh failure mitigation."
+                ),
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        evidence = engine.retrieve_evidence(
+            "token refresh failure mitigation",
+            top_k=4,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("citation_graph_support", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["citation_graph_support"], 0.0)
+
     def test_query_diversify_prefers_intent_source_type_coverage(self):
         docs = [
             IngestDocument(
