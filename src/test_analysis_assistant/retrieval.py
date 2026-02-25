@@ -144,6 +144,17 @@ class ArtifactBundle:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class IngestionRecord:
+    """Normalized ingestion contract for multi-source pipeline adapters."""
+
+    source_id: str
+    source_type: SourceType
+    payload: Any
+    modality: str = "auto"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class RetrievalEngine:
     def __init__(self, chunk_size: int = 360, chunk_overlap: int = 40) -> None:
         self._chunk_size = max(80, chunk_size)
@@ -784,6 +795,19 @@ class MultiSourceIngestor:
             generate_source_summaries=generate_source_summaries,
         )
 
+    def ingest_records(
+        self,
+        records: Sequence[IngestionRecord],
+        generate_source_summaries: bool = False,
+    ) -> List[Chunk]:
+        docs = [_normalize_ingestion_record(record) for record in records]
+        if not docs:
+            return []
+        return self._engine.ingest_documents(
+            docs,
+            generate_source_summaries=generate_source_summaries,
+        )
+
     def ingest_repository(
         self,
         repo_root: str,
@@ -1336,6 +1360,71 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
             )
         ]
     return [ExtractedUnit(text=str(doc.content), modality=doc.modality or "text", extraction_confidence=0.8)]
+
+
+def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:
+    normalized_modality = (record.modality or "auto").strip().lower()
+    normalized_payload = record.payload
+    metadata = dict(record.metadata)
+
+    if normalized_modality == "auto":
+        normalized_modality, normalized_payload = _infer_record_modality_and_payload(record.payload)
+        metadata.setdefault("ingestion_route", "normalized_record")
+    else:
+        metadata.setdefault("ingestion_route", "explicit_record")
+
+    if normalized_modality == "compound":
+        metadata.setdefault("format", "artifact_bundle")
+    if normalized_modality in {"image", "image_ocr_stub"}:
+        if isinstance(normalized_payload, dict) and str(normalized_payload.get("ocr_text", "")).strip():
+            metadata.setdefault("ingestion_route", "pipeline_verified")
+        else:
+            metadata.setdefault("ingestion_route", "pipeline_ocr_stub")
+
+    return IngestDocument(
+        source_id=record.source_id,
+        source_type=record.source_type,
+        content=normalized_payload,
+        modality=normalized_modality,
+        metadata=metadata,
+    )
+
+
+def _infer_record_modality_and_payload(payload: Any) -> Tuple[str, Any]:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("markdown"), str) and payload["markdown"].strip():
+            return "markdown_mixed", payload["markdown"]
+        if any(key in payload for key in ("text", "summary", "body", "tables", "images", "table", "image")):
+            return "compound", payload
+        if "rows" in payload:
+            return "table", payload
+        if any(key in payload for key in ("ocr_text", "image_path", "alt_text", "image_bytes")):
+            return "image", payload
+        return "text", json.dumps(payload, sort_keys=True)
+
+    if isinstance(payload, list):
+        if payload and all(isinstance(item, dict) and "rows" in item for item in payload):
+            return "compound", {"tables": payload}
+        if payload and all(isinstance(item, dict) for item in payload):
+            return "table", {"rows": payload}
+        return "text", "\n".join(str(item) for item in payload)
+
+    if isinstance(payload, str):
+        if _looks_like_markdown(payload):
+            return "markdown_mixed", payload
+        return "text", payload
+
+    return "text", str(payload)
+
+
+def _looks_like_markdown(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    heading = any(line.startswith("#") for line in lines[:4])
+    table = any(line.startswith("|") and line.endswith("|") for line in lines)
+    image = any("![" in line and "](" in line for line in lines)
+    return heading or table or image
 
 
 def _extract_compound_units(
@@ -1964,7 +2053,28 @@ def _source_reliability(chunk: Chunk) -> float:
     if chunk.modality == "image_ocr_stub":
         reliability -= 0.22
 
+    route_quality = _ingestion_route_quality(chunk)
+    reliability = (reliability * 0.84) + (route_quality * 0.16)
+
     return max(0.0, min(1.0, reliability))
+
+
+def _ingestion_route_quality(chunk: Chunk) -> float:
+    route = str(chunk.metadata.get("ingestion_route", "")).strip().lower()
+    route_scores = {
+        "pipeline_verified": 0.98,
+        "repository_scan": 0.94,
+        "artifact_bundle": 0.90,
+        "normalized_record": 0.84,
+        "explicit_record": 0.82,
+        "pipeline_ocr_stub": 0.40,
+        "ocr_stub": 0.40,
+    }
+    if route:
+        return max(0.0, min(1.0, route_scores.get(route, 0.76)))
+    if chunk.modality == "image_ocr_stub":
+        return 0.35
+    return 0.88
 
 
 def _chunk_completeness(chunk: Chunk, avg_chunk_size: int = 360) -> float:
@@ -2135,6 +2245,7 @@ def _calibrate_retrieval_confidence(
         source_concentration = _source_concentration(ranked)
         extraction_reliability = sum(_extraction_quality(item.chunk) for item in ranked) / len(ranked)
         source_reliability = sum(_source_reliability(item.chunk) for item in ranked) / len(ranked)
+        ingestion_route_quality = sum(_ingestion_route_quality(item.chunk) for item in ranked) / len(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
@@ -2142,6 +2253,7 @@ def _calibrate_retrieval_confidence(
         source_concentration = 0.0
         extraction_reliability = 0.0
         source_reliability = 0.0
+        ingestion_route_quality = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -2154,6 +2266,7 @@ def _calibrate_retrieval_confidence(
     consensus_multiplier = 0.96 + (0.04 * cross_source_consensus)
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
+    route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio)
     availability_penalty = 0.08 * unavailable_pressure
     concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
@@ -2164,6 +2277,7 @@ def _calibrate_retrieval_confidence(
         * consensus_multiplier
         * extraction_multiplier
         * reliability_multiplier
+        * route_multiplier
     )
     calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty - concentration_penalty)
     calibrated = max(0.0, min(1.0, calibrated))
@@ -2178,6 +2292,7 @@ def _calibrate_retrieval_confidence(
         "source_concentration": round(max(0.0, min(1.0, source_concentration)), 4),
         "extraction_reliability": round(max(0.0, min(1.0, extraction_reliability)), 4),
         "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),
+        "ingestion_route_quality": round(max(0.0, min(1.0, ingestion_route_quality)), 4),
     }
     return round(calibrated, 4), factors
 

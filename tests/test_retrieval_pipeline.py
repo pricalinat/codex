@@ -8,6 +8,7 @@ from src.test_analysis_assistant.retrieval import (
     DummyEmbeddingProvider,
     FocusedEvidence,
     HybridRetrievalEngine,
+    IngestionRecord,
     IngestDocument,
     MultiSourceIngestor,
     QueryPlan,
@@ -717,6 +718,83 @@ Missing negative authorization tests are release blocking.
         self.assertEqual(1, len(ranked))
         self.assertEqual("analysis:auth-visual", ranked[0].chunk.source_id)
         self.assertEqual("image_ocr_stub", ranked[0].chunk.modality)
+
+    def test_ingest_records_normalizes_multimodal_payloads(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:compound",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "text": "Auth retry storms impact release stability.",
+                        "tables": [{"rows": [{"component": "auth", "risk": "high"}]}],
+                        "images": [{"image_path": "screens/auth.png", "alt_text": "auth retry heatmap"}],
+                    },
+                    metadata={"origin_path": "docs/incidents/auth.json"},
+                ),
+                IngestionRecord(
+                    source_id="record:table",
+                    source_type=SourceType.REQUIREMENTS,
+                    payload={"rows": [{"requirement": "negative_auth", "status": "missing"}]},
+                ),
+            ]
+        )
+
+        self.assertGreaterEqual(len(chunks), 4)
+        self.assertTrue(any(chunk.modality == "text" for chunk in chunks))
+        self.assertTrue(any(chunk.modality == "table" for chunk in chunks))
+        self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in chunks))
+        self.assertTrue(all("ingestion_route" in chunk.metadata for chunk in chunks))
+
+    def test_retrieve_evidence_reports_ingestion_route_quality_factor(self):
+        verified_engine = RetrievalEngine()
+        verified_ingestor = MultiSourceIngestor(verified_engine)
+        verified_ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="verified:req",
+                    source_type=SourceType.REQUIREMENTS,
+                    payload="Auth retry heatmap risk matrix requires mitigation.",
+                    metadata={"ingestion_route": "pipeline_verified"},
+                )
+            ]
+        )
+        verified = verified_engine.retrieve_evidence(
+            "auth retry heatmap risk matrix",
+            top_k=1,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        stub_engine = RetrievalEngine()
+        stub_ingestor = MultiSourceIngestor(stub_engine)
+        stub_ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="stub:image",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={"image_path": "screens/auth.png", "alt_text": "auth retry heatmap risk matrix"},
+                )
+            ]
+        )
+        stubbed = stub_engine.retrieve_evidence(
+            "auth retry heatmap risk matrix",
+            top_k=1,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("ingestion_route_quality", verified.confidence_factors)
+        self.assertIn("ingestion_route_quality", stubbed.confidence_factors)
+        self.assertGreater(
+            verified.confidence_factors["ingestion_route_quality"],
+            stubbed.confidence_factors["ingestion_route_quality"],
+        )
 
     def test_ingest_documents_can_emit_source_summary_chunks(self):
         engine = RetrievalEngine()
