@@ -50,6 +50,12 @@ Core module lives in `src/test_analysis_assistant/` and supports two input forma
 - junit xml (`<testsuite>` / `<testsuites>`)
 - pytest text output (failure sections from terminal logs)
 
+It now also includes a retrieval foundation for AI-native analysis:
+- multi-source ingestion (`code`, `repository`, `requirements`, `system analysis`, `knowledge`)
+- mixed-modality normalization (`text`, `table`, `image` with OCR stub fallback)
+- deterministic chunking, ranking, and confidence scoring
+- prompt builder that emits citation-ready context blocks
+
 ### Quick Start
 ```bash
 # analyze report file and print JSON
