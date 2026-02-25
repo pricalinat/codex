@@ -212,6 +212,30 @@ def login(user, password):
         assert "recommended_chunker" in chunk.metadata
         assert "recommended_source_type" in chunk.metadata
 
+    def test_process_compound_document_emits_multimodal_chunks(self):
+        """Compound payloads should be decomposed into text/table/image chunks."""
+        pipeline = UnifiedIngestionPipeline()
+        doc = IngestDocument(
+            source_id="incident-auth-1",
+            source_type=SourceType.SYSTEM_ANALYSIS,
+            modality="compound",
+            content={
+                "text": "Auth retries spike after deploy and block release.",
+                "tables": [{"rows": [{"component": "gateway", "risk": "high"}]}],
+                "images": [{"image_path": "artifacts/auth-heatmap.png", "alt_text": "auth retry heatmap"}],
+            },
+        )
+
+        result = pipeline.process_document(doc)
+
+        assert result.success is True
+        assert len(result.chunks) >= 3
+        modalities = {chunk.modality for chunk in result.chunks}
+        assert "text" in modalities
+        assert "table" in modalities
+        assert "image" in modalities
+        assert any(chunk.metadata.get("processing_handler") == "compound" for chunk in result.chunks)
+
     def test_process_batch(self):
         """Test processing multiple documents."""
         pipeline = UnifiedIngestionPipeline()

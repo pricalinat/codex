@@ -10,6 +10,7 @@ from src.test_analysis_assistant.rag_analyzer import (
 from src.test_analysis_assistant.retrieval import (
     ArtifactBundle,
     Chunk,
+    IngestDocument,
     IngestionRecord,
     SourceType,
     compute_enhanced_confidence,
@@ -318,6 +319,34 @@ def refresh_token(token: str) -> str:
         self.assertGreaterEqual(len(code_chunks), 1)
         self.assertTrue(all(chunk.modality == "code" for chunk in code_chunks))
         self.assertTrue(any("chunk_type" in chunk.metadata for chunk in code_chunks))
+
+    def test_initialize_corpus_from_pipeline_documents_indexes_multimodal_chunks(self):
+        analyzer = RAGAnalyzer()
+        indexed = analyzer.initialize_corpus_from_pipeline_documents(
+            [
+                IngestDocument(
+                    source_id="pipeline:incident-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="compound",
+                    content={
+                        "text": "Auth retry storms increase release risk and require mitigation.",
+                        "tables": [{"rows": [{"component": "auth", "severity": "high"}]}],
+                        "images": [{"image_path": "artifacts/auth-heatmap.png", "alt_text": "auth retry heatmap"}],
+                    },
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(indexed, 3)
+        result = analyzer.analyze(
+            """<testsuite name="pytest" errors="0" failures="1" tests="2">
+                <testcase classname="test_auth" name="test_retry">
+                    <failure type="RuntimeError">auth retry failure</failure>
+                </testcase>
+            </testsuite>""",
+            query_for_context="auth retry heatmap risk matrix",
+        )
+        self.assertTrue(any(source.startswith("pipeline:incident-auth") for source in result.evidence_sources))
 
     def test_rag_analyze_accepts_ingestion_records(self):
         test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">

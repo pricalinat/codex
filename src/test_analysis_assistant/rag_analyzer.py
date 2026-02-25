@@ -10,6 +10,7 @@ from .analyzer import analyze_report_text
 from .code_chunker import ChunkingStrategy, create_chunker
 from .confidence_analysis import MetaConfidenceResult, analyze_confidence
 from .content_detector import detect_content_type, suggest_ingestion_strategy
+from .ingestion_pipeline import UnifiedIngestionPipeline
 from .models import AnalysisResult, FailureCluster, FixSuggestion
 from .query_reformulator import QueryReformulator, ReformulatedQueries
 from .retrieval import (
@@ -348,6 +349,34 @@ class RAGAnalyzer:
 
         self._initialized = total_chunks > 0
         return total_chunks
+
+    def initialize_corpus_from_pipeline_documents(
+        self,
+        documents: Sequence[IngestDocument],
+        pipeline: Optional[UnifiedIngestionPipeline] = None,
+        generate_source_summaries: bool = False,
+    ) -> int:
+        """Index documents by routing them through the unified ingestion pipeline.
+
+        This adapter preserves multimodal routing metadata and reuses
+        `ingest_prechunked` so retrieval does not re-chunk already processed data.
+        """
+        if not documents:
+            self._initialized = False
+            return 0
+
+        active_pipeline = pipeline or UnifiedIngestionPipeline()
+        pipeline_result = active_pipeline.process_batch(documents)
+        if not pipeline_result.chunks:
+            self._initialized = False
+            return 0
+
+        indexed = self._engine.ingest_prechunked(
+            pipeline_result.chunks,
+            generate_source_summaries=generate_source_summaries,
+        )
+        self._initialized = len(indexed) > 0
+        return len(indexed)
 
     def _ingest_record(
         self,

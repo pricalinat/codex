@@ -244,7 +244,10 @@ class UnifiedIngestionPipeline:
             # Route to appropriate handler
             # Route based on modality in document metadata
             route_name = "text"
-            if document.modality == "table" or content_category == ContentCategory.STRUCTURED_DATA:
+            if document.modality == "compound":
+                route_name = "compound"
+                chunks = self._process_compound_content(document, source_config)
+            elif document.modality == "table" or content_category == ContentCategory.STRUCTURED_DATA:
                 route_name = "table"
                 chunks = self._process_table_content(document, source_config)
                 if not chunks:
@@ -307,10 +310,11 @@ class UnifiedIngestionPipeline:
             return content
         if isinstance(content, dict):
             text_parts: List[str] = []
-            text_value = content.get("text")
-            if isinstance(text_value, str):
-                text_parts.append(text_value)
-            for key in ("tables", "images"):
+            for key in ("text", "summary", "body"):
+                text_value = content.get(key)
+                if isinstance(text_value, str):
+                    text_parts.append(text_value)
+            for key in ("tables", "images", "table", "image"):
                 value = content.get(key)
                 if value:
                     text_parts.append(str(value))
@@ -604,6 +608,117 @@ class UnifiedIngestionPipeline:
 
         return chunks
 
+    def _process_compound_content(
+        self, document: IngestDocument, config: SourceConfig
+    ) -> List[Chunk]:
+        """Process mixed text/table/image payloads into modality-preserving chunks."""
+        if not isinstance(document.content, dict):
+            return self._process_text_content(document, config)
+
+        chunks: List[Chunk] = []
+        payload = document.content
+
+        text_parts: List[str] = []
+        for key in ("text", "summary", "body"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                text_parts.append(value.strip())
+        if text_parts:
+            text_doc = IngestDocument(
+                source_id=document.source_id,
+                source_type=document.source_type,
+                content="\n\n".join(text_parts),
+                modality="text",
+                metadata=dict(document.metadata),
+            )
+            chunks.extend(self._process_text_content(text_doc, config))
+
+        table_payloads: List[Any] = []
+        if payload.get("table") is not None:
+            table_payloads.append(payload.get("table"))
+        tables_value = payload.get("tables")
+        if isinstance(tables_value, list):
+            table_payloads.extend(tables_value)
+        elif tables_value is not None:
+            table_payloads.append(tables_value)
+
+        for table_idx, table_payload in enumerate(table_payloads):
+            table_text = self._table_payload_to_text(table_payload)
+            if not table_text.strip():
+                continue
+            chunks.append(
+                Chunk(
+                    chunk_id=self._generate_chunk_id(document.source_id, f"compound_table_{table_idx}"),
+                    source_id=document.source_id,
+                    source_type=document.source_type,
+                    modality="table",
+                    text=table_text[: config.chunk_size],
+                    token_count=self._estimate_tokens(table_text),
+                    metadata={
+                        **document.metadata,
+                        "content_length": len(table_text),
+                        "line_count": table_text.count("\n") + 1,
+                        "table_index": table_idx,
+                        "unit_kind": "table",
+                    },
+                )
+            )
+
+        image_payloads: List[Any] = []
+        if payload.get("image") is not None:
+            image_payloads.append(payload.get("image"))
+        images_value = payload.get("images")
+        if isinstance(images_value, list):
+            image_payloads.extend(images_value)
+        elif images_value is not None:
+            image_payloads.append(images_value)
+
+        for image_idx, image_payload in enumerate(image_payloads):
+            image_doc = IngestDocument(
+                source_id=document.source_id,
+                source_type=document.source_type,
+                content=image_payload,
+                modality="image",
+                metadata={
+                    **document.metadata,
+                    "image_index": image_idx,
+                },
+            )
+            chunks.extend(self._process_image_content(image_doc, config))
+
+        if chunks:
+            return chunks
+        return self._process_text_content(document, config)
+
+    def _table_payload_to_text(self, payload: Any) -> str:
+        """Render structured table payloads into retrieval-friendly text."""
+        if isinstance(payload, str):
+            tables = self._table_extractor.extract_from_markdown(payload)
+            if tables:
+                rendered: List[str] = []
+                for table in tables:
+                    lines = [" | ".join(table.headers)] if table.headers else []
+                    lines.extend(" | ".join(row) for row in table.rows)
+                    rendered.append("\n".join(lines))
+                return "\n\n".join(rendered)
+            return payload
+        if isinstance(payload, dict):
+            rows = payload.get("rows")
+            if isinstance(rows, list):
+                rendered_rows: List[str] = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        rendered_rows.append(", ".join(f"{k}={v}" for k, v in sorted(row.items())))
+                    elif isinstance(row, list):
+                        rendered_rows.append(" | ".join(str(cell) for cell in row))
+                    else:
+                        rendered_rows.append(str(row))
+                return "\n".join(rendered_rows)
+            return str(payload)
+        if isinstance(payload, list):
+            return "\n".join(self._table_payload_to_text(item) for item in payload)
+        return str(payload)
+
     def _process_image_content(
         self, document: IngestDocument, config: SourceConfig
     ) -> List[Chunk]:
@@ -616,13 +731,53 @@ class UnifiedIngestionPipeline:
         Returns:
             List of chunks
         """
-        # This is a stub - in production, this would integrate with OCR
-        # For now, return empty list unless extract_images is enabled
-        if not self._config.extract_images:
+        image_text = ""
+        image_path = ""
+        alt_text = ""
+        extraction_confidence = 0.3
+
+        if isinstance(document.content, dict):
+            ocr_text = str(document.content.get("ocr_text", "")).strip()
+            image_path = str(document.content.get("image_path", "")).strip()
+            alt_text = str(document.content.get("alt_text", "")).strip()
+            if ocr_text:
+                image_text = ocr_text
+                extraction_confidence = 0.8
+            else:
+                subject = image_path or "image"
+                if alt_text:
+                    image_text = f"[OCR_STUB] {subject}: {alt_text}"
+                else:
+                    image_text = f"[OCR_STUB] no OCR pipeline connected for {subject}"
+                extraction_confidence = 0.3 if not self._config.extract_images else 0.5
+        else:
+            rendered = str(document.content).strip()
+            if rendered:
+                image_text = rendered
+                extraction_confidence = 0.6
+
+        if not image_text:
             return []
 
-        # Placeholder for OCR processing
-        return []
+        return [
+            Chunk(
+                chunk_id=self._generate_chunk_id(document.source_id, f"image_{image_path or 'stub'}"),
+                source_id=document.source_id,
+                source_type=document.source_type,
+                modality="image",
+                text=image_text[: config.chunk_size],
+                token_count=self._estimate_tokens(image_text),
+                metadata={
+                    **document.metadata,
+                    "content_length": len(image_text),
+                    "line_count": image_text.count("\n") + 1,
+                    "unit_kind": "image",
+                    "image_path": image_path,
+                    "alt_text": alt_text,
+                    "extraction_confidence": round(extraction_confidence, 4),
+                },
+            )
+        ]
 
     def _split_large_text(
         self, text: str, document: IngestDocument, config: SourceConfig
