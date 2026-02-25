@@ -777,6 +777,42 @@ class TestRetrievalPipeline(unittest.TestCase):
             self.assertGreaterEqual(len(repo_chunks), 1)
             self.assertTrue(any(chunk.modality == "code" for chunk in repo_chunks))
 
+    def test_repository_ingestion_adds_binary_image_artifacts_as_ocr_stub_chunks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "artifacts").mkdir()
+            (root / "artifacts" / "auth-heatmap.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            image_chunks = [chunk for chunk in chunks if chunk.source_id == "repo:artifacts/auth-heatmap.png"]
+            self.assertGreaterEqual(len(image_chunks), 1)
+            self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in image_chunks))
+            self.assertTrue(any(chunk.metadata.get("ingestion_route") == "repository_scan" for chunk in image_chunks))
+
+    def test_repository_ingestion_adds_pdf_stub_with_sidecar_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "incident-report.pdf"
+            pdf_path.write_bytes(b"%PDF-1.7\n%fake")
+            (root / "incident-report.pdf.txt").write_text(
+                "Incident report: auth token refresh failures spike under retry storms.",
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            pdf_chunks = [chunk for chunk in chunks if chunk.source_id == "repo:incident-report.pdf"]
+            self.assertGreaterEqual(len(pdf_chunks), 1)
+            self.assertTrue(any(chunk.modality == "text" for chunk in pdf_chunks))
+            joined = "\n".join(chunk.text for chunk in pdf_chunks)
+            self.assertIn("Incident report: auth token refresh failures", joined)
+            self.assertTrue(any(chunk.metadata.get("document_text_source") == "sidecar" for chunk in pdf_chunks))
+
     def test_repository_ingestion_emits_repo_manifest_for_structure_retrieval(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -824,6 +860,24 @@ class TestRetrievalPipeline(unittest.TestCase):
             manifest_chunks = [chunk for chunk in chunks if chunk.metadata.get("manifest_type")]
             self.assertGreaterEqual(len(manifest_chunks), 1)
             self.assertTrue(any(chunk.source_id.startswith("repo:__manifest__") for chunk in manifest_chunks))
+
+    def test_code_aware_repository_ingestion_includes_binary_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "service").mkdir()
+            (root / "service" / "auth_handler.py").write_text(
+                "def validate_session(payload):\n    return bool(payload)\n",
+                encoding="utf-8",
+            )
+            (root / "artifacts").mkdir()
+            (root / "artifacts" / "auth-flow.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            engine, ingestor = create_code_aware_engine()
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            image_chunks = [chunk for chunk in chunks if chunk.source_id == "repo:artifacts/auth-flow.png"]
+            self.assertGreaterEqual(len(image_chunks), 1)
+            self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in image_chunks))
 
     def test_markdown_requirements_extracts_table_and_image_units(self):
         markdown = """

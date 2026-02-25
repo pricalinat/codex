@@ -881,6 +881,8 @@ class MultiSourceIngestor:
             ".toml",
             ".ini",
             ".cfg",
+            *sorted(_REPO_IMAGE_EXTENSIONS),
+            *sorted(_REPO_BINARY_DOC_EXTENSIONS),
         }
         allow = set(ext.lower() for ext in (include_extensions or list(default_extensions)))
 
@@ -894,17 +896,29 @@ class MultiSourceIngestor:
             if path.suffix.lower() not in allow:
                 continue
             rel_path = path.relative_to(root).as_posix()
+            ext = path.suffix.lower()
+            if _is_repository_binary_artifact(ext):
+                docs.append(_build_repository_binary_document(path, rel_path))
+                file_records.append(
+                    {
+                        "rel_path": rel_path,
+                        "extension": ext,
+                        "modality": "image" if ext in _REPO_IMAGE_EXTENSIONS else "document",
+                        "content": "",
+                    }
+                )
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
             if not text.strip():
                 continue
-            modality = _infer_repository_modality(path.suffix.lower())
+            modality = _infer_repository_modality(ext)
             content: Any = text
-            metadata: Dict[str, Any] = {"path": rel_path, "extension": path.suffix.lower()}
+            metadata: Dict[str, Any] = {"path": rel_path, "extension": ext}
             if modality == "table":
-                content = _parse_delimited_table(text, path.suffix.lower())
+                content = _parse_delimited_table(text, ext)
                 metadata["format"] = "delimited_table"
             elif modality == "markdown_mixed":
                 metadata["format"] = "markdown"
@@ -921,8 +935,8 @@ class MultiSourceIngestor:
             file_records.append(
                 {
                     "rel_path": rel_path,
-                    "extension": path.suffix.lower(),
-                    "modality": "code" if path.suffix.lower() in _REPO_CODE_EXTENSIONS else modality,
+                    "extension": ext,
+                    "modality": "code" if ext in _REPO_CODE_EXTENSIONS else modality,
                     "content": text,
                 }
             )
@@ -1025,6 +1039,9 @@ class CodeAwareIngestor:
             raise ValueError(f"Repository path does not exist or is not a directory: {repo_root}")
 
         default_extensions = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
+        default_extensions.update(_REPO_IMAGE_EXTENSIONS)
+        default_extensions.update(_REPO_BINARY_DOC_EXTENSIONS)
+        default_extensions.update({".md", ".markdown", ".mdx", ".rst", ".csv", ".tsv", ".txt"})
         allow = set(ext.lower() for ext in (include_extensions or list(default_extensions)))
 
         code_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
@@ -1040,6 +1057,19 @@ class CodeAwareIngestor:
                 continue
             files_seen += 1
             rel_path = path.relative_to(root).as_posix()
+            ext = path.suffix.lower()
+            if _is_repository_binary_artifact(ext):
+                binary_doc = _build_repository_binary_document(path, rel_path)
+                chunks.extend(self._engine.ingest_documents([binary_doc]))
+                file_records.append(
+                    {
+                        "rel_path": rel_path,
+                        "extension": ext,
+                        "modality": "image" if ext in _REPO_IMAGE_EXTENSIONS else "document",
+                        "content": "",
+                    }
+                )
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
@@ -1047,7 +1077,6 @@ class CodeAwareIngestor:
             if not text.strip():
                 continue
 
-            ext = path.suffix.lower()
             file_records.append(
                 {
                     "rel_path": rel_path,
@@ -2120,6 +2149,93 @@ def _infer_repository_modality(extension: str) -> str:
 
 
 _REPO_CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
+_REPO_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+_REPO_BINARY_DOC_EXTENSIONS = {".pdf"}
+
+
+def _is_repository_binary_artifact(extension: str) -> bool:
+    return extension in _REPO_IMAGE_EXTENSIONS or extension in _REPO_BINARY_DOC_EXTENSIONS
+
+
+def _resolve_repository_document_text(path: Path, rel_path: str) -> Tuple[str, float, str]:
+    candidates = [
+        Path(f"{path.as_posix()}.txt"),
+        Path(f"{path.as_posix()}.ocr.txt"),
+        path.with_suffix(".txt"),
+        path.with_suffix(".ocr.txt"),
+    ]
+
+    seen: set = set()
+    for candidate in candidates:
+        key = candidate.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if text:
+            return text, 0.78, "sidecar"
+
+    return (
+        (
+            f"[DOC_STUB] no document extraction pipeline connected for {rel_path}. "
+            "Add extracted text sidecar (.txt/.ocr.txt) or connect a PDF parser."
+        ),
+        0.34,
+        "stub",
+    )
+
+
+def _build_repository_binary_document(path: Path, rel_path: str) -> IngestDocument:
+    ext = path.suffix.lower()
+    metadata: Dict[str, Any] = {
+        "path": rel_path,
+        "origin_path": path.as_posix(),
+        "extension": ext,
+        "ingestion_route": "repository_scan",
+    }
+    source_id = f"repo:{rel_path}"
+
+    if ext in _REPO_IMAGE_EXTENSIONS:
+        return IngestDocument(
+            source_id=source_id,
+            source_type=SourceType.REPOSITORY,
+            content={
+                "image_path": path.as_posix(),
+                "alt_text": f"repository artifact {rel_path}",
+            },
+            modality="image",
+            metadata={
+                **metadata,
+                "format": "repository_image_artifact",
+            },
+        )
+
+    doc_text, text_confidence, text_source = _resolve_repository_document_text(path, rel_path)
+    return IngestDocument(
+        source_id=source_id,
+        source_type=SourceType.REPOSITORY,
+        content={
+            "text": doc_text,
+            "images": [
+                {
+                    "image_path": path.as_posix(),
+                    "alt_text": f"repository document artifact {rel_path}",
+                }
+            ],
+        },
+        modality="compound",
+        metadata={
+            **metadata,
+            "format": "repository_binary_document",
+            "text_extraction_confidence": text_confidence,
+            "document_text_source": text_source,
+        },
+    )
 
 
 def _build_repository_manifest_documents(file_records: Sequence[Dict[str, Any]]) -> List[IngestDocument]:
