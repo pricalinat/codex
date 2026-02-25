@@ -642,3 +642,258 @@ def _hash_id(source_id: str, unit_idx: int, chunk_idx: int, text: str) -> str:
     h.update(str(chunk_idx).encode("utf-8"))
     h.update(text.encode("utf-8"))
     return h.hexdigest()[:16]
+
+
+class EmbeddingProvider:
+    """Interface for embedding-based retrieval."""
+
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        """Encode texts into embedding vectors.
+
+        Args:
+            texts: List of text strings to encode
+
+        Returns:
+            List of embedding vectors (one per input text)
+        """
+        raise NotImplementedError
+
+
+class DummyEmbeddingProvider(EmbeddingProvider):
+    """Fallback provider that uses word frequency as pseudo-embeddings."""
+
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        """Encode using simplified bag-of-words approach."""
+        vectors: List[List[float]] = []
+        for text in texts:
+            tokens = set(_tokenize(text.lower()))
+            # Create a sparse vector using hash-like projection
+            vector = [1.0 if t in tokens else 0.0 for t in sorted(tokens)][:64]
+            # Pad to 64 dimensions
+            vector.extend([0.0] * (64 - len(vector)))
+            vectors.append(vector)
+        return vectors
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    if not a or not b:
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+class HybridRetrievalEngine(RetrievalEngine):
+    """Enhanced retrieval engine with hybrid (lexical + semantic) search."""
+
+    def __init__(
+        self,
+        chunk_size: int = 360,
+        chunk_overlap: int = 40,
+        embedding_provider: Optional[EmbeddingProvider] = None,
+        lexical_weight: float = 0.5,
+    ) -> None:
+        super().__init__(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        self._embedding_provider = embedding_provider or DummyEmbeddingProvider()
+        self._lexical_weight = max(0.0, min(1.0, lexical_weight))
+        self._semantic_weight = 1.0 - self._lexical_weight
+        self._chunk_embeddings: Dict[str, List[float]] = {}
+
+    def ingest_documents(self, docs: Sequence[IngestDocument]) -> List[Chunk]:
+        """Ingest documents and compute embeddings."""
+        chunks = super().ingest_documents(docs)
+        self._compute_embeddings()
+        return chunks
+
+    def _compute_embeddings(self) -> None:
+        """Compute embeddings for all chunks."""
+        if not self._chunks:
+            return
+        texts = [chunk.text for chunk in self._chunks]
+        try:
+            embeddings = self._embedding_provider.encode(texts)
+            for chunk, embedding in zip(self._chunks, embeddings):
+                self._chunk_embeddings[chunk.chunk_id] = embedding
+        except Exception:
+            # Fallback to dummy embeddings if encoding fails
+            dummy = DummyEmbeddingProvider()
+            embeddings = dummy.encode(texts)
+            for chunk, embedding in zip(self._chunks, embeddings):
+                self._chunk_embeddings[chunk.chunk_id] = embedding
+
+    def query(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        diversify: bool = True,
+        use_hybrid: bool = True,
+    ) -> List[RankedChunk]:
+        """Query with hybrid lexical + semantic search.
+
+        Args:
+            query_text: The query string
+            top_k: Number of results to return
+            diversify: Whether to diversify results across sources
+            use_hybrid: Whether to use hybrid search (True) or lexical only (False)
+        """
+        plan = self.build_query_plan(query_text)
+        if not self._chunks or not plan.tokens:
+            return []
+
+        # Get lexical scores
+        lexical_scores: Dict[str, float] = {}
+        for chunk in self._chunks:
+            chunk_tokens = set(_tokenize(chunk.text))
+            overlap = plan.tokens  # Already normalized tokens
+            lexical_score = len(set(overlap).intersection(chunk_tokens)) / max(len(plan.tokens), 1)
+            lexical_scores[chunk.chunk_id] = lexical_score
+
+        # Get semantic scores if hybrid mode
+        semantic_scores: Dict[str, float] = {}
+        if use_hybrid and self._chunk_embeddings:
+            try:
+                query_embedding = self._embedding_provider.encode([query_text])[0]
+                for chunk in self._chunks:
+                    chunk_emb = self._chunk_embeddings.get(chunk.chunk_id)
+                    if chunk_emb:
+                        sim = _cosine_similarity(query_embedding, chunk_emb)
+                        semantic_scores[chunk.chunk_id] = sim
+            except Exception:
+                pass  # Fall back to lexical-only
+
+        # Combine scores
+        scored: List[RankedChunk] = []
+        fallback: List[RankedChunk] = []
+
+        for chunk in self._chunks:
+            lex_score = lexical_scores.get(chunk.chunk_id, 0.0)
+            sem_score = semantic_scores.get(chunk.chunk_id, 0.0)
+
+            if use_hybrid and semantic_scores:
+                # Hybrid combination
+                final_score = (self._lexical_weight * lex_score) + (self._semantic_weight * sem_score)
+                source_boost = _source_weight(chunk.source_type)
+                intent_boost = _intent_alignment(plan, chunk)
+                modality_boost = _modality_alignment(plan, chunk.modality)
+                extraction_quality = _extraction_quality(chunk)
+                score = (
+                    final_score * 0.50
+                    + source_boost * 0.15
+                    + intent_boost * 0.15
+                    + modality_boost * 0.05
+                    + extraction_quality * 0.10
+                )
+            else:
+                # Lexical-only (original behavior)
+                source_boost = _source_weight(chunk.source_type)
+                intent_boost = _intent_alignment(plan, chunk)
+                modality_boost = _modality_alignment(plan, chunk.modality)
+                extraction_quality = _extraction_quality(chunk)
+                score = (
+                    lex_score * 0.55
+                    + source_boost * 0.15
+                    + intent_boost * 0.15
+                    + modality_boost * 0.05
+                    + extraction_quality * 0.10
+                )
+
+            breakdown = {
+                "lexical": round(lex_score, 4),
+                "semantic": round(sem_score, 4) if use_hybrid else 0.0,
+                "source": round(source_boost, 4),
+                "intent": round(intent_boost, 4),
+                "modality": round(modality_boost, 4),
+                "extraction": round(extraction_quality, 4),
+            }
+
+            overlap = sorted(set(plan.tokens).intersection(set(_tokenize(chunk.text))))
+            if overlap:
+                scored.append(
+                    RankedChunk(
+                        chunk=chunk,
+                        score=score,
+                        confidence=0.0,
+                        matched_terms=overlap,
+                        score_breakdown=breakdown,
+                    )
+                )
+            else:
+                fallback.append(
+                    RankedChunk(
+                        chunk=chunk,
+                        score=score * 0.15,
+                        confidence=0.0,
+                        matched_terms=[],
+                        score_breakdown=breakdown,
+                    )
+                )
+
+        # Sort and select results
+        scored.sort(
+            key=lambda item: (
+                -item.score,
+                -len(item.matched_terms),
+                item.chunk.source_id,
+                item.chunk.chunk_id,
+            )
+        )
+
+        if len(scored) < max(1, top_k):
+            fallback.sort(key=lambda item: (-item.score, item.chunk.source_id, item.chunk.chunk_id))
+            scored.extend(fallback)
+
+        limit = max(1, top_k)
+        top = _select_diverse_top(scored, limit) if diversify else scored[:limit]
+
+        if not top:
+            return []
+
+        # Compute confidence
+        max_score = top[0].score
+        source_span = len({item.chunk.source_id for item in top})
+        modality_span = len({item.chunk.modality for item in top})
+        diversity_bonus = ((source_span / len(top)) * 0.6) + ((modality_span / len(top)) * 0.4)
+
+        for rank, item in enumerate(top):
+            normalized = item.score / max(max_score, 1e-9)
+            coverage = len(item.matched_terms) / max(len(plan.tokens), 1)
+            extraction = item.score_breakdown.get("extraction", 1.0)
+            decay = 1.0 - (rank * 0.12)
+            confidence = (
+                (normalized * 0.50)
+                + (coverage * 0.22)
+                + (extraction * 0.18)
+                + (diversity_bonus * 0.10)
+            )
+            item.confidence = round(max(0.0, min(1.0, confidence * decay)), 4)
+
+        return top
+
+
+def create_hybrid_engine(
+    chunk_size: int = 360,
+    chunk_overlap: int = 40,
+    embedding_provider: Optional[EmbeddingProvider] = None,
+    lexical_weight: float = 0.5,
+) -> HybridRetrievalEngine:
+    """Factory function to create a hybrid retrieval engine.
+
+    Args:
+        chunk_size: Maximum tokens per chunk
+        chunk_overlap: Token overlap between chunks
+        embedding_provider: Optional custom embedding provider
+        lexical_weight: Weight for lexical search (0-1), semantic gets 1-lexical_weight
+
+    Returns:
+        Configured HybridRetrievalEngine instance
+    """
+    return HybridRetrievalEngine(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        embedding_provider=embedding_provider,
+        lexical_weight=lexical_weight,
+    )
