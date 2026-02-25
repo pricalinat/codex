@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 from src.test_analysis_assistant.retrieval import (
+    ArtifactBundle,
     DummyEmbeddingProvider,
     HybridRetrievalEngine,
     IngestDocument,
@@ -318,6 +319,51 @@ Missing negative authorization tests are release blocking.
         self.assertIn("text", modalities)
         self.assertIn("table", modalities)
         self.assertIn("image_ocr_stub", modalities)
+
+    def test_ingest_artifact_bundle_creates_multimodal_chunks_with_provenance(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_artifact_bundle(
+            ArtifactBundle(
+                source_id="analysis:auth-incident",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                text="Authentication failures spike during token refresh under high concurrency.",
+                tables=[
+                    {"rows": [{"component": "auth", "risk": "high", "owner": "qa"}]},
+                ],
+                images=[
+                    {"image_path": "screens/auth-heatmap.png", "alt_text": "auth failure heatmap"},
+                ],
+                metadata={"origin_path": "docs/incidents/auth.md", "page_number": 4},
+            )
+        )
+
+        self.assertGreaterEqual(len(chunks), 3)
+        modalities = {chunk.modality for chunk in chunks}
+        self.assertIn("text", modalities)
+        self.assertIn("table", modalities)
+        self.assertIn("image_ocr_stub", modalities)
+        self.assertTrue(all(chunk.metadata.get("origin_path") == "docs/incidents/auth.md" for chunk in chunks))
+        self.assertTrue(all(chunk.metadata.get("page_number") == 4 for chunk in chunks))
+
+    def test_artifact_bundle_image_alt_text_is_retrievable(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        ingestor.ingest_artifact_bundle(
+            ArtifactBundle(
+                source_id="analysis:auth-visual",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                images=[{"image_path": "screens/auth-heatmap.png", "alt_text": "retry storm heatmap"}],
+            )
+        )
+
+        ranked = engine.query("retry storm heatmap", top_k=1, diversify=False)
+
+        self.assertEqual(1, len(ranked))
+        self.assertEqual("analysis:auth-visual", ranked[0].chunk.source_id)
+        self.assertEqual("image_ocr_stub", ranked[0].chunk.modality)
 
     def test_compound_modality_extracts_multimodal_units_with_provenance(self):
         docs = [

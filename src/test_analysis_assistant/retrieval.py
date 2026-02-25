@@ -97,6 +97,18 @@ class ExtractedUnit:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class ArtifactBundle:
+    """Normalized mixed-modality payload produced by extraction/OCR stubs."""
+
+    source_id: str
+    source_type: SourceType
+    text: Optional[str] = None
+    tables: List[Any] = field(default_factory=list)
+    images: List[Any] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class RetrievalEngine:
     def __init__(self, chunk_size: int = 360, chunk_overlap: int = 40) -> None:
         self._chunk_size = max(80, chunk_size)
@@ -587,6 +599,34 @@ class MultiSourceIngestor:
             metadata={"format": "markdown"},
         )
 
+    def ingest_artifact_bundle(self, bundle: ArtifactBundle) -> List[Chunk]:
+        """Ingest one mixed-modality artifact bundle.
+
+        This is a stable interface for OCR/extraction pipelines to emit a
+        degraded-but-usable payload without introducing extra dependencies.
+        """
+        content: Dict[str, Any] = {}
+        if bundle.text and bundle.text.strip():
+            content["text"] = bundle.text
+        if bundle.tables:
+            content["tables"] = list(bundle.tables)
+        if bundle.images:
+            content["images"] = list(bundle.images)
+
+        if not content:
+            return []
+
+        metadata = dict(bundle.metadata)
+        metadata.setdefault("format", "artifact_bundle")
+
+        return self.ingest_raw(
+            source_id=bundle.source_id,
+            source_type=bundle.source_type,
+            content=content,
+            modality="compound",
+            metadata=metadata,
+        )
+
 
 class CodeAwareIngestor:
     """Enhanced ingestor that uses code-structure-aware chunking.
@@ -972,12 +1012,22 @@ def _extract_compound_units(content: Any) -> List[ExtractedUnit]:
             normalized_payload = {"image_path": image_payload}
         image_text = _image_to_ocr_stub(normalized_payload)
         extraction_confidence = 0.30 if image_text.startswith("[OCR_STUB]") else 0.68
+        image_path = None
+        alt_text = ""
+        if isinstance(normalized_payload, dict):
+            image_path = normalized_payload.get("image_path")
+            alt_text = str(normalized_payload.get("alt_text", "")).strip()
         units.append(
             ExtractedUnit(
                 text=image_text,
                 modality="image",
                 extraction_confidence=extraction_confidence,
-                metadata={"unit_kind": "image", "image_index": image_idx},
+                metadata={
+                    "unit_kind": "image",
+                    "image_index": image_idx,
+                    "image_path": image_path,
+                    "alt_text": alt_text,
+                },
             )
         )
 

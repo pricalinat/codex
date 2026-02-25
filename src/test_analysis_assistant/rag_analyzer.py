@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .analyzer import analyze_report_text
 from .models import AnalysisResult, FailureCluster, FixSuggestion
 from .retrieval import (
+    ArtifactBundle,
     CodeAwareIngestor,
     DummyEmbeddingProvider,
     HybridRetrievalEngine,
@@ -208,6 +209,7 @@ class RAGAnalyzer:
         requirements_docs: Optional[Sequence[tuple]] = None,
         system_analysis_docs: Optional[Sequence[tuple]] = None,
         knowledge_docs: Optional[Sequence[tuple]] = None,
+        artifact_bundles: Optional[Sequence[ArtifactBundle]] = None,
     ) -> int:
         """Initialize the retrieval corpus with various document sources.
 
@@ -216,6 +218,7 @@ class RAGAnalyzer:
             requirements_docs: List of (source_id, markdown_content) tuples
             system_analysis_docs: List of (source_id, content) tuples
             knowledge_docs: List of (source_id, content) tuples
+            artifact_bundles: Mixed-modality extraction/OCR payloads
 
         Returns:
             Total number of chunks indexed
@@ -250,6 +253,25 @@ class RAGAnalyzer:
                     source_type=SourceType.KNOWLEDGE,
                     content=content,
                 )
+                total_chunks += len(chunks)
+
+        if artifact_bundles:
+            for bundle in artifact_bundles:
+                ingestor = self._select_ingestor(bundle.source_type, bundle.source_id)
+                if hasattr(ingestor, "ingest_artifact_bundle"):
+                    chunks = ingestor.ingest_artifact_bundle(bundle)
+                else:
+                    chunks = ingestor.ingest_raw(
+                        source_id=bundle.source_id,
+                        source_type=bundle.source_type,
+                        content={
+                            "text": bundle.text,
+                            "tables": list(bundle.tables),
+                            "images": list(bundle.images),
+                        },
+                        modality="compound",
+                        metadata=bundle.metadata,
+                    )
                 total_chunks += len(chunks)
 
         self._initialized = total_chunks > 0

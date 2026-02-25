@@ -54,6 +54,7 @@ It now also includes a retrieval foundation for AI-native analysis:
 - multi-source ingestion (`code`, `repository`, `requirements`, `system analysis`, `knowledge`)
 - mixed-modality normalization (`text`, `table`, `image` with OCR stub fallback)
 - `MultiSourceIngestor` helper for repository crawling and markdown requirements ingestion (table/image extraction stubs)
+- `ArtifactBundle` ingestion API for OCR/extraction pipeline outputs (single payload with text/tables/images + provenance metadata)
 - intent-aware query planning for test-gap/risk/root-cause workflows
 - explainable ranking with score breakdown (`lexical`, `source`, `intent`, `modality`, `extraction`)
 - diversity-aware final ranking to improve cross-source evidence coverage

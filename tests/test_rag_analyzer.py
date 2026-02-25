@@ -8,6 +8,7 @@ from src.test_analysis_assistant.rag_analyzer import (
     rag_analyze,
 )
 from src.test_analysis_assistant.retrieval import (
+    ArtifactBundle,
     Chunk,
     SourceType,
     compute_enhanced_confidence,
@@ -155,6 +156,30 @@ Missing negative authorization tests are release blocking.
 
         self.assertIn("Source bundle summary", result.augmented_prompt)
         self.assertIn("req-md-summary", result.augmented_prompt)
+
+    def test_initialize_corpus_accepts_artifact_bundles(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_refresh">
+                <failure type="AssertionError">token refresh failed</failure>
+            </testcase>
+        </testsuite>"""
+        analyzer = RAGAnalyzer()
+        indexed = analyzer.initialize_corpus(
+            artifact_bundles=[
+                ArtifactBundle(
+                    source_id="incident:auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    text="Token refresh failures increase under high request concurrency.",
+                    tables=[{"rows": [{"component": "auth", "risk": "high"}]}],
+                    images=[{"image_path": "artifacts/auth-heatmap.png", "alt_text": "auth retry heatmap"}],
+                    metadata={"origin_path": "docs/incidents/auth.md"},
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(indexed, 3)
+        result = analyzer.analyze(test_report, query_for_context="auth retry heatmap risk")
+        self.assertTrue(any(source.startswith("incident:auth") for source in result.evidence_sources))
 
 
 class TestRAGSeverityAssessment(unittest.TestCase):
