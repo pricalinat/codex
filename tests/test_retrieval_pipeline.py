@@ -1365,6 +1365,10 @@ Missing negative authorization tests are release blocking.
             by_source["record:bundle-auth::artifact:summary"].score_breakdown.get("artifact_graph", 0.0),
             0.0,
         )
+        self.assertGreater(
+            by_source["record:bundle-auth::artifact:summary"].score_breakdown.get("artifact_parent", 0.0),
+            0.0,
+        )
 
         evidence = engine.retrieve_evidence(
             "auth retry storms risk matrix image evidence",
@@ -1374,6 +1378,7 @@ Missing negative authorization tests are release blocking.
             adaptive_recovery=False,
         )
         self.assertGreater(evidence.confidence_factors.get("artifact_graph_support", 0.0), 0.0)
+        self.assertGreater(evidence.confidence_factors.get("artifact_parent_support", 0.0), 0.0)
 
     def test_ingest_records_resolves_markdown_file_reference_payload(self):
         with tempfile.TemporaryDirectory() as temp_dir:

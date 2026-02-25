@@ -3132,6 +3132,10 @@ def _calibrate_retrieval_confidence(
             max(0.0, min(1.0, float(item.score_breakdown.get("artifact_graph", 0.0))))
             for item in ranked
         ) / len(ranked)
+        artifact_parent_support = sum(
+            max(0.0, min(1.0, float(item.score_breakdown.get("artifact_parent", 0.0))))
+            for item in ranked
+        ) / len(ranked)
         citation_graph_support = sum(
             max(0.0, min(1.0, float(item.score_breakdown.get("citation_graph", 0.0))))
             for item in ranked
@@ -3151,6 +3155,7 @@ def _calibrate_retrieval_confidence(
         source_reliability = 0.0
         ingestion_route_quality = 0.0
         artifact_graph_support = 0.0
+        artifact_parent_support = 0.0
         citation_graph_support = 0.0
         repository_map_support = 0.0
 
@@ -3171,6 +3176,7 @@ def _calibrate_retrieval_confidence(
     graph_multiplier = (
         1.0
         + (0.008 * artifact_graph_support)
+        + (0.012 * artifact_parent_support)
         + (0.012 * citation_graph_support)
         + (0.010 * repository_map_support)
     )
@@ -3207,6 +3213,7 @@ def _calibrate_retrieval_confidence(
         "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),
         "ingestion_route_quality": round(max(0.0, min(1.0, ingestion_route_quality)), 4),
         "artifact_graph_support": round(max(0.0, min(1.0, artifact_graph_support)), 4),
+        "artifact_parent_support": round(max(0.0, min(1.0, artifact_parent_support)), 4),
         "citation_graph_support": round(max(0.0, min(1.0, citation_graph_support)), 4),
         "repository_map_support": round(max(0.0, min(1.0, repository_map_support)), 4),
     }
@@ -3518,9 +3525,13 @@ def _apply_artifact_graph_bonus(
         return
 
     index: Dict[str, List[Chunk]] = {}
+    parent_index: Dict[str, List[Chunk]] = {}
     for chunk in corpus_chunks:
         for key in _chunk_link_keys(chunk):
             index.setdefault(key, []).append(chunk)
+        parent_source_id = _chunk_parent_source_id(chunk)
+        if parent_source_id:
+            parent_index.setdefault(parent_source_id, []).append(chunk)
 
     modality_targets = [modality for modality in plan.preferred_modalities if modality != "text"]
     source_targets = set(plan.preferred_source_types)
@@ -3534,8 +3545,15 @@ def _apply_artifact_graph_bonus(
                     continue
                 related[neighbor.chunk_id] = neighbor
 
-        if not related:
+        parent_support = _artifact_parent_support(
+            chunk=item.chunk,
+            parent_index=parent_index,
+            plan=plan,
+            query_terms=query_terms,
+        )
+        if not related and parent_support <= 0.0:
             item.score_breakdown["artifact_graph"] = 0.0
+            item.score_breakdown["artifact_parent"] = 0.0
             item.score_breakdown["citation_graph"] = 0.0
             continue
 
@@ -3555,15 +3573,20 @@ def _apply_artifact_graph_bonus(
             if source_targets
             else 0.0
         )
-        lexical_bridge = lexical_hits / max(1, len(related_chunks))
+        lexical_bridge = lexical_hits / max(1, len(related_chunks)) if related_chunks else 0.0
 
         aggregate = min(
             1.0,
-            (modality_support * 0.40) + (source_support * 0.15) + (lexical_bridge * 0.25) + (citation_support * 0.20),
+            (modality_support * 0.34)
+            + (source_support * 0.13)
+            + (lexical_bridge * 0.20)
+            + (citation_support * 0.18)
+            + (parent_support * 0.15),
         )
         bonus = min(max_bonus, aggregate * max_bonus)
         item.score += bonus
         item.score_breakdown["artifact_graph"] = round(aggregate, 4)
+        item.score_breakdown["artifact_parent"] = round(parent_support, 4)
         item.score_breakdown["citation_graph"] = round(citation_support, 4)
 
 
@@ -3642,6 +3665,62 @@ def _extract_bundle_parent_source(source_id: str) -> str:
     if idx <= 0:
         return ""
     return source_id[:idx]
+
+
+def _chunk_parent_source_id(chunk: Chunk) -> str:
+    parent_source = str(chunk.metadata.get("parent_source_id", "")).strip()
+    if parent_source:
+        return parent_source
+    return _extract_bundle_parent_source(str(chunk.source_id).strip())
+
+
+def _artifact_parent_support(
+    chunk: Chunk,
+    parent_index: Dict[str, List[Chunk]],
+    plan: QueryPlan,
+    query_terms: set,
+) -> float:
+    parent_source_id = _chunk_parent_source_id(chunk)
+    if not parent_source_id:
+        return 0.0
+
+    siblings = [
+        sibling
+        for sibling in parent_index.get(parent_source_id, [])
+        if sibling.chunk_id != chunk.chunk_id
+    ]
+    if not siblings:
+        return 0.0
+
+    sibling_modalities = {sibling.modality for sibling in siblings}
+    modality_targets = [modality for modality in plan.preferred_modalities if modality != "text"]
+    if modality_targets:
+        modality_support = len(sibling_modalities.intersection(set(modality_targets))) / len(modality_targets)
+    else:
+        non_text_modalities = {modality for modality in sibling_modalities if modality != "text"}
+        modality_support = min(1.0, len(non_text_modalities) / 2.0)
+
+    preferred_sources = set(plan.preferred_source_types)
+    sibling_sources = {sibling.source_type for sibling in siblings}
+    source_support = (
+        len(sibling_sources.intersection(preferred_sources)) / len(preferred_sources)
+        if preferred_sources
+        else 0.0
+    )
+
+    lexical_hits = sum(
+        1 for sibling in siblings if query_terms.intersection(set(_tokenize(sibling.text)))
+    )
+    lexical_support = lexical_hits / max(1, len(siblings))
+    density_support = min(1.0, len(siblings) / 3.0)
+
+    aggregate = (
+        (modality_support * 0.40)
+        + (lexical_support * 0.30)
+        + (source_support * 0.15)
+        + (density_support * 0.15)
+    )
+    return max(0.0, min(1.0, aggregate))
 
 
 def _select_coverage_aware_top(
