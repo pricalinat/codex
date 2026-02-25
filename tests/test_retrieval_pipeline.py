@@ -96,6 +96,76 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertLessEqual(evidence.aggregate_confidence, 1.0)
         self.assertIn(evidence.confidence_band, {"low", "medium", "high"})
 
+    def test_retrieve_evidence_adaptive_recovery_adds_missing_modalities(self):
+        docs = [
+            IngestDocument(
+                source_id="req-core",
+                source_type=SourceType.REQUIREMENTS,
+                content=(
+                    "Authentication release risk requires prioritization and mitigation plan for failures."
+                ),
+            ),
+            IngestDocument(
+                source_id="sys-table",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content={"rows": [{"component": "auth", "risk": "high", "evidence": "matrix"}]},
+                modality="table",
+            ),
+            IngestDocument(
+                source_id="sys-image",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content={"ocr_text": "auth failure heatmap from screenshot"},
+                modality="image",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        baseline = engine.retrieve_evidence(
+            "image table risk matrix for auth gaps",
+            top_k=1,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+        adaptive = engine.retrieve_evidence(
+            "image table risk matrix for auth gaps",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=True,
+        )
+
+        self.assertIn("image", baseline.missing_modalities)
+        self.assertIn("table", {chunk.chunk.modality for chunk in adaptive.ranked_chunks})
+        self.assertNotIn("image", adaptive.missing_modalities)
+        self.assertTrue(adaptive.recovery_applied)
+        self.assertGreater(len(adaptive.recovery_queries), 0)
+
+    def test_retrieve_evidence_adaptive_recovery_tracks_strategy_metadata(self):
+        docs = [
+            IngestDocument(
+                source_id="req-plan",
+                source_type=SourceType.REQUIREMENTS,
+                content="Release risk triage plan for authentication regressions.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table risk matrix for auth",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=True,
+        )
+
+        self.assertIn(evidence.retrieval_strategy, {"baseline", "adaptive_recovery"})
+        if evidence.recovery_applied:
+            self.assertEqual(evidence.retrieval_strategy, "adaptive_recovery")
+            self.assertGreaterEqual(len(evidence.recovery_queries), 1)
+
     def test_multisource_ingestor_reads_repository_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -71,6 +71,9 @@ class RetrievalEvidence:
     missing_modalities: List[str] = field(default_factory=list)
     aggregate_confidence: float = 0.0
     confidence_band: str = "low"
+    retrieval_strategy: str = "baseline"
+    recovery_applied: bool = False
+    recovery_queries: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -361,6 +364,7 @@ class RetrievalEngine:
         top_k: int = 5,
         diversify: bool = True,
         use_expansion: bool = True,
+        adaptive_recovery: bool = True,
     ) -> RetrievalEvidence:
         plan = self.build_query_plan(query_text)
         ranked = (
@@ -374,6 +378,52 @@ class RetrievalEngine:
         missing_modalities = [modality for modality in plan.preferred_modalities if modality not in covered_modalities]
 
         aggregate_confidence = _aggregate_confidence(ranked)
+        recovery_applied = False
+        recovery_queries: List[str] = []
+        retrieval_strategy = "baseline"
+
+        if adaptive_recovery and _should_apply_recovery(
+            aggregate_confidence=aggregate_confidence,
+            missing_sources=missing_sources,
+            missing_modalities=missing_modalities,
+        ):
+            recovery_queries = _build_recovery_queries(
+                query_text=query_text,
+                plan=plan,
+                missing_sources=missing_sources,
+                missing_modalities=missing_modalities,
+            )
+            if recovery_queries:
+                supplemental: List[RankedChunk] = []
+                recovery_top_k = max(3, top_k)
+                for recovery_query in recovery_queries:
+                    recovered = (
+                        self.query_with_expansion(recovery_query, top_k=recovery_top_k, diversify=False)
+                        if use_expansion
+                        else self.query(recovery_query, top_k=recovery_top_k, diversify=False)
+                    )
+                    supplemental.extend(recovered)
+
+                if supplemental:
+                    fused = _fuse_ranked_chunks(ranked, supplemental)
+                    ranked = _select_coverage_aware_top(
+                        fused,
+                        plan=plan,
+                        top_k=max(1, top_k),
+                        diversify=diversify,
+                    )
+                    recovery_applied = True
+                    retrieval_strategy = "adaptive_recovery"
+                    aggregate_confidence = _aggregate_confidence(ranked)
+                    covered_sources = _dedupe([item.chunk.source_type for item in ranked])
+                    covered_modalities = _dedupe([item.chunk.modality for item in ranked])
+                    missing_sources = [
+                        stype for stype in plan.preferred_source_types if stype not in covered_sources
+                    ]
+                    missing_modalities = [
+                        modality for modality in plan.preferred_modalities if modality not in covered_modalities
+                    ]
+
         source_bundles = _build_source_bundles(ranked, plan)
         if aggregate_confidence >= 0.72:
             band = "high"
@@ -393,6 +443,9 @@ class RetrievalEngine:
             missing_modalities=missing_modalities,
             aggregate_confidence=aggregate_confidence,
             confidence_band=band,
+            retrieval_strategy=retrieval_strategy,
+            recovery_applied=recovery_applied,
+            recovery_queries=recovery_queries,
         )
 
     def _expand_query_variants(self, query_text: str, max_variants: int = 4) -> List[Tuple[str, float]]:
@@ -1329,6 +1382,165 @@ def _build_source_bundles(
         )
     )
     return bundles[: max(1, max_bundles)]
+
+
+def _should_apply_recovery(
+    aggregate_confidence: float,
+    missing_sources: Sequence[SourceType],
+    missing_modalities: Sequence[str],
+) -> bool:
+    if aggregate_confidence < 0.55:
+        return True
+    if missing_modalities:
+        return True
+    if len(missing_sources) >= 2:
+        return True
+    return False
+
+
+def _build_recovery_queries(
+    query_text: str,
+    plan: QueryPlan,
+    missing_sources: Sequence[SourceType],
+    missing_modalities: Sequence[str],
+    max_queries: int = 3,
+) -> List[str]:
+    queries: List[str] = []
+
+    if "table" in missing_modalities:
+        queries.append(f"{query_text} table matrix rows columns evidence")
+    if "image" in missing_modalities or "image_ocr_stub" in missing_modalities:
+        queries.append(f"{query_text} image screenshot diagram ocr evidence")
+
+    source_hint = {
+        SourceType.REQUIREMENTS: "requirements acceptance criteria expected behavior",
+        SourceType.SYSTEM_ANALYSIS: "system analysis architecture diagnostics failure modes",
+        SourceType.CODE_SNIPPET: "code snippet function logic edge case branch handling",
+        SourceType.REPOSITORY: "repository module implementation traceback call path",
+        SourceType.KNOWLEDGE: "background knowledge prior incidents mitigations",
+    }
+    for source_type in missing_sources[:2]:
+        hint = source_hint.get(source_type)
+        if hint:
+            queries.append(f"{query_text} {hint}")
+
+    if not queries:
+        intent_terms = " ".join(plan.intent_labels) if plan.intent_labels else "test analysis"
+        queries.append(f"{query_text} {intent_terms} evidence")
+
+    deduped: List[str] = []
+    seen = set()
+    for query in queries:
+        if query in seen:
+            continue
+        seen.add(query)
+        deduped.append(query)
+        if len(deduped) >= max(1, max_queries):
+            break
+    return deduped
+
+
+def _fuse_ranked_chunks(primary: Sequence[RankedChunk], supplemental: Sequence[RankedChunk]) -> List[RankedChunk]:
+    merged: Dict[str, RankedChunk] = {}
+    recovery_hits: Dict[str, int] = {}
+
+    for item in primary:
+        merged[item.chunk.chunk_id] = RankedChunk(
+            chunk=item.chunk,
+            score=item.score,
+            confidence=item.confidence,
+            matched_terms=list(item.matched_terms),
+            score_breakdown=dict(item.score_breakdown),
+        )
+        recovery_hits[item.chunk.chunk_id] = 0
+
+    for item in supplemental:
+        key = item.chunk.chunk_id
+        recovery_hits[key] = recovery_hits.get(key, 0) + 1
+        if key not in merged:
+            merged[key] = RankedChunk(
+                chunk=item.chunk,
+                score=item.score,
+                confidence=item.confidence,
+                matched_terms=list(item.matched_terms),
+                score_breakdown=dict(item.score_breakdown),
+            )
+            continue
+        existing = merged[key]
+        existing.score = max(existing.score, item.score)
+        existing.confidence = max(existing.confidence, item.confidence)
+        existing_terms = set(existing.matched_terms)
+        existing_terms.update(item.matched_terms)
+        existing.matched_terms = sorted(existing_terms)
+        for name, value in item.score_breakdown.items():
+            existing.score_breakdown[name] = max(existing.score_breakdown.get(name, 0.0), value)
+
+    fused: List[RankedChunk] = []
+    for key, item in merged.items():
+        hits = recovery_hits.get(key, 0)
+        if hits > 0:
+            item.score += min(0.06, 0.02 * hits)
+            item.confidence = round(max(0.0, min(1.0, item.confidence + min(0.08, 0.02 * hits))), 4)
+            item.score_breakdown["recovery_hits"] = float(hits)
+        fused.append(item)
+
+    fused.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            -len(candidate.matched_terms),
+            candidate.chunk.source_id,
+            candidate.chunk.chunk_id,
+        )
+    )
+    return fused
+
+
+def _select_coverage_aware_top(
+    candidates: Sequence[RankedChunk],
+    plan: QueryPlan,
+    top_k: int,
+    diversify: bool,
+) -> List[RankedChunk]:
+    if top_k <= 0 or not candidates:
+        return []
+    if len(candidates) <= top_k:
+        return list(candidates)
+
+    selected: List[RankedChunk] = []
+    remaining = list(candidates)
+    needed_modalities = set(mod for mod in plan.preferred_modalities if mod != "text")
+    needed_sources = set(plan.preferred_source_types[:3])
+
+    while remaining and len(selected) < top_k:
+        best_idx = 0
+        best_value = float("-inf")
+        for idx, candidate in enumerate(remaining):
+            value = candidate.score
+            if candidate.chunk.modality in needed_modalities:
+                value += 0.24
+            if candidate.chunk.source_type in needed_sources:
+                value += 0.10
+            if selected:
+                similarity = max(_chunk_similarity(candidate.chunk, existing.chunk) for existing in selected)
+                value -= (0.12 * similarity)
+            if value > best_value:
+                best_value = value
+                best_idx = idx
+        picked = remaining.pop(best_idx)
+        selected.append(picked)
+        needed_modalities.discard(picked.chunk.modality)
+        needed_sources.discard(picked.chunk.source_type)
+
+    if diversify:
+        selected.sort(
+            key=lambda candidate: (
+                -candidate.score,
+                -len(candidate.matched_terms),
+                candidate.chunk.source_id,
+                candidate.chunk.chunk_id,
+            )
+        )
+    return selected[:top_k]
 
 
 def _dedupe(items: Sequence[Any]) -> List[Any]:
