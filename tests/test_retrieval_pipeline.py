@@ -189,6 +189,49 @@ class TestRetrievalPipeline(unittest.TestCase):
             self.assertIn("repo:README.md", source_ids)
             self.assertIn("repo:src/service.py", source_ids)
 
+    def test_repository_ingestion_preserves_markdown_modalities(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text(
+                (
+                    "# Release Risks\n"
+                    "Missing negative auth tests are release blocking.\n\n"
+                    "| risk | severity |\n"
+                    "| ---- | -------- |\n"
+                    "| auth | high |\n\n"
+                    "![auth matrix](artifacts/auth-matrix.png)\n"
+                ),
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            self.assertGreaterEqual(len(chunks), 3)
+            modalities = {chunk.modality for chunk in chunks}
+            self.assertIn("text", modalities)
+            self.assertIn("table", modalities)
+            self.assertIn("image_ocr_stub", modalities)
+
+    def test_repository_ingestion_parses_csv_as_table_modality(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "risk-matrix.csv").write_text(
+                "component,severity,evidence\nauth,high,token expiry gaps\n",
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            self.assertGreaterEqual(len(chunks), 1)
+            self.assertTrue(any(chunk.modality == "table" for chunk in chunks))
+            table_text = "\n".join(chunk.text for chunk in chunks if chunk.modality == "table")
+            self.assertIn("component=auth", table_text)
+            self.assertIn("severity=high", table_text)
+
     def test_markdown_requirements_extracts_table_and_image_units(self):
         markdown = """
 # Auth Requirements

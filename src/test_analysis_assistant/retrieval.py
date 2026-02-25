@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import math
@@ -524,8 +525,12 @@ class MultiSourceIngestor:
         default_extensions = {
             ".py",
             ".md",
+            ".markdown",
+            ".mdx",
             ".rst",
             ".txt",
+            ".csv",
+            ".tsv",
             ".json",
             ".yaml",
             ".yml",
@@ -550,13 +555,22 @@ class MultiSourceIngestor:
                 continue
             if not text.strip():
                 continue
+            modality = _infer_repository_modality(path.suffix.lower())
+            content: Any = text
+            metadata: Dict[str, Any] = {"path": rel_path, "extension": path.suffix.lower()}
+            if modality == "table":
+                content = _parse_delimited_table(text, path.suffix.lower())
+                metadata["format"] = "delimited_table"
+            elif modality == "markdown_mixed":
+                metadata["format"] = "markdown"
+
             docs.append(
                 IngestDocument(
                     source_id=f"repo:{rel_path}",
                     source_type=SourceType.REPOSITORY,
-                    content=text,
-                    modality="text",
-                    metadata={"path": rel_path, "extension": path.suffix.lower()},
+                    content=content,
+                    modality=modality,
+                    metadata=metadata,
                 )
             )
 
@@ -616,14 +630,17 @@ class CodeAwareIngestor:
         default_extensions = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
         allow = set(ext.lower() for ext in (include_extensions or list(default_extensions)))
 
+        code_exts = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
         chunks: List[Chunk] = []
+        files_seen = 0
         for path in sorted(root.rglob("*")):
-            if len(chunks) >= max_files:
+            if files_seen >= max_files:
                 break
             if not path.is_file():
                 continue
             if path.suffix.lower() not in allow:
                 continue
+            files_seen += 1
             rel_path = path.relative_to(root).as_posix()
             try:
                 text = path.read_text(encoding="utf-8")
@@ -632,7 +649,32 @@ class CodeAwareIngestor:
             if not text.strip():
                 continue
 
-            # Use code-aware chunking
+            ext = path.suffix.lower()
+            if ext not in code_exts:
+                modality = _infer_repository_modality(ext)
+                content: Any = text
+                metadata: Dict[str, Any] = {"path": rel_path, "extension": ext}
+                if modality == "table":
+                    content = _parse_delimited_table(text, ext)
+                    metadata["format"] = "delimited_table"
+                elif modality == "markdown_mixed":
+                    metadata["format"] = "markdown"
+                chunks.extend(
+                    self._engine.ingest_documents(
+                        [
+                            IngestDocument(
+                                source_id=f"repo:{rel_path}",
+                                source_type=SourceType.REPOSITORY,
+                                content=content,
+                                modality=modality,
+                                metadata=metadata,
+                            )
+                        ]
+                    )
+                )
+                continue
+
+            # Use code-aware chunking for source code files.
             code_chunks = self._code_chunker.chunk(text, rel_path)
             for cc in code_chunks:
                 chunks.append(Chunk(
@@ -1076,6 +1118,39 @@ def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
     if units:
         return units
     return [ExtractedUnit(text=markdown, modality="text", extraction_confidence=0.9)]
+
+
+def _infer_repository_modality(extension: str) -> str:
+    if extension in {".md", ".markdown", ".mdx", ".rst"}:
+        return "markdown_mixed"
+    if extension in {".csv", ".tsv"}:
+        return "table"
+    return "text"
+
+
+def _parse_delimited_table(content: str, extension: str) -> Dict[str, Any]:
+    delimiter = "," if extension == ".csv" else "\t"
+    rows: List[List[str]] = []
+    for row in csv.reader(content.splitlines(), delimiter=delimiter):
+        cleaned = [cell.strip() for cell in row]
+        if not any(cleaned):
+            continue
+        rows.append(cleaned)
+
+    if not rows:
+        return {"rows": []}
+
+    header = rows[0]
+    body = rows[1:]
+    if body and all(header) and len(set(header)) == len(header):
+        structured_rows: List[Dict[str, str]] = []
+        width = len(header)
+        for values in body:
+            padded = values[:width] + ([""] * max(0, width - len(values)))
+            structured_rows.append({header[idx]: padded[idx] for idx in range(width)})
+        return {"rows": structured_rows}
+
+    return {"rows": rows}
 
 
 def _tokenize(text: str) -> List[str]:
