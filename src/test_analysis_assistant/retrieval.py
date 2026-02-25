@@ -336,6 +336,7 @@ class RetrievalEngine:
             intent_boost = _intent_alignment(plan, chunk)
             modality_boost = _modality_alignment(plan, chunk.modality)
             structural_boost = _structural_alignment(plan, chunk)
+            repo_map_boost = _repository_map_alignment(plan, chunk)
             extraction_quality = _extraction_quality(chunk)
             score = (
                 lexical_score * 0.50
@@ -343,6 +344,7 @@ class RetrievalEngine:
                 + intent_boost * 0.15
                 + modality_boost * 0.05
                 + structural_boost * 0.06
+                + repo_map_boost * 0.04
                 + extraction_quality * 0.06
                 + _source_reliability(chunk) * 0.03
             )
@@ -352,6 +354,7 @@ class RetrievalEngine:
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
                 "structural": round(structural_boost, 4),
+                "repo_map": round(repo_map_boost, 4),
                 "extraction": round(extraction_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
@@ -2312,7 +2315,7 @@ def _build_repository_manifest_documents(file_records: Sequence[Dict[str, Any]])
     ]
     catalog = "\n".join(catalog_header + file_lines[:300])
 
-    return [
+    docs = [
         IngestDocument(
             source_id="repo:__manifest__/overview",
             source_type=SourceType.REPOSITORY,
@@ -2334,6 +2337,93 @@ def _build_repository_manifest_documents(file_records: Sequence[Dict[str, Any]])
             },
         ),
     ]
+    docs.extend(_build_repository_directory_map_documents(file_records))
+    return docs
+
+
+def _build_repository_directory_map_documents(
+    file_records: Sequence[Dict[str, Any]],
+    max_directories: int = 24,
+    max_files_per_directory: int = 14,
+) -> List[IngestDocument]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for record in file_records:
+        rel_path = str(record.get("rel_path", "")).strip()
+        if not rel_path:
+            continue
+        directory = Path(rel_path).parent.as_posix()
+        grouped.setdefault(directory, []).append(record)
+
+    if not grouped:
+        return []
+
+    directory_items = sorted(
+        grouped.items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    )[: max(1, max_directories)]
+
+    docs: List[IngestDocument] = []
+    for directory, records in directory_items:
+        extension_counts: Dict[str, int] = {}
+        modality_counts: Dict[str, int] = {}
+        lines: List[str] = []
+
+        for record in sorted(records, key=lambda item: str(item.get("rel_path", "")))[: max(1, max_files_per_directory)]:
+            rel_path = str(record.get("rel_path", "")).strip()
+            if not rel_path:
+                continue
+            extension = str(record.get("extension", "")).lower()
+            modality = str(record.get("modality", "text")).strip() or "text"
+            content = str(record.get("content", ""))
+
+            extension_counts[extension] = extension_counts.get(extension, 0) + 1
+            modality_counts[modality] = modality_counts.get(modality, 0) + 1
+
+            symbols = _extract_repository_symbols(rel_path=rel_path, extension=extension, content=content)
+            symbol_text = ",".join(symbols[:6]) if symbols else "none"
+            lines.append(
+                f"- file={rel_path} source_id=repo:{rel_path} modality={modality} symbols={symbol_text}"
+            )
+
+        extension_summary = ",".join(
+            f"{ext or '[no_ext]'}:{count}"
+            for ext, count in sorted(extension_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+        )
+        modality_summary = ",".join(
+            f"{name}:{count}"
+            for name, count in sorted(modality_counts.items(), key=lambda item: (-item[1], item[0]))[:6]
+        )
+        doc_text = "\n".join(
+            [
+                "Repository directory map",
+                f"directory={directory}",
+                f"files={len(records)}",
+                f"extensions={extension_summary}",
+                f"modalities={modality_summary}",
+                "Use this map for codewiki-style repository understanding and path-scoped retrieval.",
+                *lines,
+            ]
+        )
+
+        sanitized_dir = re.sub(r"[^A-Za-z0-9._/-]+", "-", directory).strip("-")
+        manifest_id = sanitized_dir or "root"
+        docs.append(
+            IngestDocument(
+                source_id=f"repo:__manifest__/dir/{manifest_id}",
+                source_type=SourceType.REPOSITORY,
+                content=doc_text,
+                modality="text",
+                metadata={
+                    "manifest_type": "repo_directory_map",
+                    "path": directory,
+                    "directory": directory,
+                    "directory_file_count": len(records),
+                    "extraction_confidence": 0.9,
+                },
+            )
+        )
+
+    return docs
 
 
 def _extract_repository_symbols(rel_path: str, extension: str, content: str) -> List[str]:
@@ -2557,6 +2647,42 @@ def _structural_alignment(plan: QueryPlan, chunk: Chunk) -> float:
     if path_ratio == 0.0 and symbol_ratio == 0.0:
         return 0.20
     return min(1.0, 0.35 + (path_ratio * 0.45) + (symbol_ratio * 0.30))
+
+
+def _repository_map_alignment(plan: QueryPlan, chunk: Chunk) -> float:
+    manifest_type = str(chunk.metadata.get("manifest_type", "")).strip().lower()
+    if not manifest_type.startswith("repo_"):
+        return 0.0
+
+    query_tokens = set(plan.tokens)
+    chunk_paths, _ = _chunk_structural_signals(chunk)
+    has_path_match = any(
+        _path_match(target, candidate)
+        for target in plan.target_paths
+        for candidate in chunk_paths
+    )
+
+    if manifest_type == "repo_directory_map":
+        base = 0.55
+        if has_path_match:
+            base += 0.35
+        if query_tokens.intersection({"directory", "module", "package", "subsystem", "tree", "map"}):
+            base += 0.10
+        return max(0.0, min(1.0, base))
+
+    if manifest_type == "repo_file_inventory":
+        base = 0.28
+        if query_tokens.intersection({"inventory", "file", "files", "path", "symbol", "codewiki"}):
+            base += 0.42
+        return max(0.0, min(1.0, base))
+
+    if manifest_type == "repo_overview":
+        base = 0.22
+        if query_tokens.intersection({"overview", "architecture", "structure", "system"}):
+            base += 0.35
+        return max(0.0, min(1.0, base))
+
+    return 0.10
 
 
 def _effective_modality(modality: str, text: str) -> str:
@@ -2950,6 +3076,10 @@ def _calibrate_retrieval_confidence(
             max(0.0, min(1.0, float(item.score_breakdown.get("citation_graph", 0.0))))
             for item in ranked
         ) / len(ranked)
+        repository_map_support = sum(
+            max(0.0, min(1.0, float(item.score_breakdown.get("repo_map", 0.0))))
+            for item in ranked
+        ) / len(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
@@ -2961,6 +3091,7 @@ def _calibrate_retrieval_confidence(
         ingestion_route_quality = 0.0
         artifact_graph_support = 0.0
         citation_graph_support = 0.0
+        repository_map_support = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -2975,7 +3106,12 @@ def _calibrate_retrieval_confidence(
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
     route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
-    graph_multiplier = 1.0 + (0.008 * artifact_graph_support) + (0.012 * citation_graph_support)
+    graph_multiplier = (
+        1.0
+        + (0.008 * artifact_graph_support)
+        + (0.012 * citation_graph_support)
+        + (0.010 * repository_map_support)
+    )
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio) + (0.16 * cross_source_conflict)
     availability_penalty = 0.08 * unavailable_pressure
     concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
@@ -3008,6 +3144,7 @@ def _calibrate_retrieval_confidence(
         "ingestion_route_quality": round(max(0.0, min(1.0, ingestion_route_quality)), 4),
         "artifact_graph_support": round(max(0.0, min(1.0, artifact_graph_support)), 4),
         "citation_graph_support": round(max(0.0, min(1.0, citation_graph_support)), 4),
+        "repository_map_support": round(max(0.0, min(1.0, repository_map_support)), 4),
     }
     return round(calibrated, 4), factors
 
@@ -3888,6 +4025,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 intent_boost = _intent_alignment(plan, chunk)
                 modality_boost = _modality_alignment(plan, chunk.modality)
                 structural_boost = _structural_alignment(plan, chunk)
+                repo_map_boost = _repository_map_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
                 score = (
                     final_score * 0.47
@@ -3895,6 +4033,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + intent_boost * 0.15
                     + modality_boost * 0.05
                     + structural_boost * 0.08
+                    + repo_map_boost * 0.04
                     + extraction_quality * 0.06
                     + _source_reliability(chunk) * 0.04
                 )
@@ -3904,6 +4043,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 intent_boost = _intent_alignment(plan, chunk)
                 modality_boost = _modality_alignment(plan, chunk.modality)
                 structural_boost = _structural_alignment(plan, chunk)
+                repo_map_boost = _repository_map_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
                 score = (
                     lex_score * 0.50
@@ -3911,6 +4051,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + intent_boost * 0.15
                     + modality_boost * 0.05
                     + structural_boost * 0.06
+                    + repo_map_boost * 0.04
                     + extraction_quality * 0.06
                     + _source_reliability(chunk) * 0.03
                 )
@@ -3922,6 +4063,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
                 "structural": round(structural_boost, 4),
+                "repo_map": round(repo_map_boost, 4),
                 "extraction": round(extraction_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),

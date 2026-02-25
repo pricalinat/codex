@@ -938,6 +938,64 @@ class TestRetrievalPipeline(unittest.TestCase):
             self.assertGreaterEqual(len(manifest_chunks), 1)
             self.assertTrue(any(chunk.source_id.startswith("repo:__manifest__") for chunk in manifest_chunks))
 
+    def test_repository_ingestion_emits_directory_map_manifest_chunks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "src" / "auth").mkdir(parents=True)
+            (root / "src" / "billing").mkdir(parents=True)
+            (root / "src" / "auth" / "token.py").write_text(
+                "def refresh_token(value):\n    return value.strip()\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "billing" / "invoice.py").write_text(
+                "def recalc_invoice(total):\n    return total\n",
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=20)
+
+            directory_manifests = [
+                chunk
+                for chunk in chunks
+                if chunk.metadata.get("manifest_type") == "repo_directory_map"
+            ]
+            self.assertGreaterEqual(len(directory_manifests), 2)
+            self.assertTrue(any(chunk.metadata.get("path") == "src/auth" for chunk in directory_manifests))
+
+    def test_query_surfaces_directory_map_manifest_for_path_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "src" / "auth").mkdir(parents=True)
+            (root / "src" / "billing").mkdir(parents=True)
+            (root / "src" / "auth" / "token.py").write_text(
+                "def refresh_token(value):\n    return value.strip()\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "billing" / "invoice.py").write_text(
+                "def recalc_invoice(total):\n    return total\n",
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            ingestor.ingest_repository(str(root), max_files=20)
+
+            ranked = engine.query(
+                "root cause path:src/auth/token.py directory map",
+                top_k=4,
+                diversify=False,
+            )
+
+            directory_map_items = [
+                item
+                for item in ranked
+                if item.chunk.metadata.get("manifest_type") == "repo_directory_map"
+            ]
+            self.assertGreaterEqual(len(directory_map_items), 1)
+            self.assertGreater(directory_map_items[0].score_breakdown.get("repo_map", 0.0), 0.0)
+
     def test_code_aware_repository_ingestion_includes_binary_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
