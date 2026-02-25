@@ -49,6 +49,7 @@ from .rag_analyzer import (
     rag_analyze,
 )
 from .retrieval import (
+    ArtifactBundle,
     CodeAwareIngestor,
     DummyEmbeddingProvider,
     HybridRetrievalEngine,
@@ -86,10 +87,20 @@ from .store import (
     StoredChunk,
     create_persistent_engine,
 )
+from .multimodal import (
+    ExtractedTable,
+    ImageOCRProcessor,
+    ModalityType,
+    MultimodalIngestor,
+    OCRResult,
+    ProcessedArtifact,
+    TableExtractor,
+)
 
 __all__ = [
     "analyze_report_text",
     "AnalysisResult",
+    "ArtifactBundle",
     "ChunkerType",
     "FailureRecord",
     "FixSuggestion",
@@ -163,4 +174,12 @@ __all__ = [
     "estimate_token_count",
     "truncate_for_context",
     "default_strategy",
+    # Multimodal ingestion exports
+    "ExtractedTable",
+    "ImageOCRProcessor",
+    "ModalityType",
+    "MultimodalIngestor",
+    "OCRResult",
+    "ProcessedArtifact",
+    "TableExtractor",
 ]
