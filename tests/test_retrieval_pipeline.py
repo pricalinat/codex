@@ -170,6 +170,70 @@ Missing negative authorization tests are release blocking.
         self.assertIn("table", modalities)
         self.assertIn("image_ocr_stub", modalities)
 
+    def test_compound_modality_extracts_multimodal_units_with_provenance(self):
+        docs = [
+            IngestDocument(
+                source_id="compound-1",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Auth flow fails under high latency.",
+                    "tables": [{"rows": [{"risk": "auth", "severity": "high"}]}],
+                    "images": [
+                        {
+                            "image_path": "diag/auth-failure.png",
+                            "ocr_text": "retry budget exceeded in auth gateway",
+                        }
+                    ],
+                },
+                metadata={"origin_path": "docs/system/auth.md"},
+            ),
+        ]
+
+        engine = RetrievalEngine()
+        chunks = engine.ingest_documents(docs)
+
+        self.assertGreaterEqual(len(chunks), 3)
+        modality_set = {chunk.modality for chunk in chunks}
+        self.assertIn("text", modality_set)
+        self.assertIn("table", modality_set)
+        self.assertIn("image", modality_set)
+
+        kinds = {chunk.metadata.get("unit_kind") for chunk in chunks}
+        self.assertIn("text", kinds)
+        self.assertIn("table", kinds)
+        self.assertIn("image", kinds)
+        self.assertTrue(all(chunk.metadata.get("origin_path") == "docs/system/auth.md" for chunk in chunks))
+
+    def test_compound_ingestion_surfaces_image_and_table_coverage_in_evidence(self):
+        docs = [
+            IngestDocument(
+                source_id="compound-coverage",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Failure clustering indicates auth retry storms.",
+                    "tables": [{"rows": [{"component": "auth", "risk": "high"}]}],
+                    "images": [{"ocr_text": "heatmap shows auth hotspot failures"}],
+                },
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table risk matrix for auth failure clustering",
+            top_k=5,
+            diversify=False,
+        )
+
+        covered = set(evidence.covered_modalities)
+        self.assertIn("table", covered)
+        self.assertIn("image", covered)
+        self.assertGreater(evidence.aggregate_confidence, 0.4)
+        self.assertNotIn("table", evidence.missing_modalities)
+        self.assertNotIn("image", evidence.missing_modalities)
+
     def test_query_ranks_goal_aligned_requirement_first(self):
         docs = [
             IngestDocument(

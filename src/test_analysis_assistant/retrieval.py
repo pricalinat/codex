@@ -773,6 +773,8 @@ def build_analysis_prompt(
 
 
 def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
+    if doc.modality == "compound":
+        return _extract_compound_units(doc.content)
     if doc.modality == "markdown_mixed" and isinstance(doc.content, str):
         return _extract_markdown_mixed_units(doc.content)
     if doc.modality == "table":
@@ -812,6 +814,89 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
             )
         ]
     return [ExtractedUnit(text=str(doc.content), modality=doc.modality or "text", extraction_confidence=0.8)]
+
+
+def _extract_compound_units(content: Any) -> List[ExtractedUnit]:
+    if not isinstance(content, dict):
+        return [
+            ExtractedUnit(
+                text=str(content),
+                modality="text",
+                extraction_confidence=0.75,
+                metadata={"unit_kind": "fallback"},
+            )
+        ]
+
+    units: List[ExtractedUnit] = []
+    text_parts: List[str] = []
+
+    for key in ("text", "summary", "body"):
+        value = content.get(key)
+        if isinstance(value, str) and value.strip():
+            text_parts.append(value.strip())
+
+    if text_parts:
+        units.append(
+            ExtractedUnit(
+                text="\n\n".join(text_parts),
+                modality="text",
+                extraction_confidence=0.94,
+                metadata={"unit_kind": "text"},
+            )
+        )
+
+    raw_tables: List[Any] = []
+    if isinstance(content.get("tables"), list):
+        raw_tables.extend(content["tables"])
+    elif content.get("tables") is not None:
+        raw_tables.append(content["tables"])
+    if content.get("table") is not None:
+        raw_tables.append(content["table"])
+
+    for table_idx, table_payload in enumerate(raw_tables):
+        units.append(
+            ExtractedUnit(
+                text=_table_to_text(table_payload),
+                modality="table",
+                extraction_confidence=0.84,
+                metadata={"unit_kind": "table", "table_index": table_idx},
+            )
+        )
+
+    raw_images: List[Any] = []
+    if isinstance(content.get("images"), list):
+        raw_images.extend(content["images"])
+    elif content.get("images") is not None:
+        raw_images.append(content["images"])
+    if content.get("image") is not None:
+        raw_images.append(content["image"])
+
+    for image_idx, image_payload in enumerate(raw_images):
+        normalized_payload = image_payload
+        if isinstance(image_payload, str):
+            normalized_payload = {"image_path": image_payload}
+        image_text = _image_to_ocr_stub(normalized_payload)
+        extraction_confidence = 0.30 if image_text.startswith("[OCR_STUB]") else 0.68
+        units.append(
+            ExtractedUnit(
+                text=image_text,
+                modality="image",
+                extraction_confidence=extraction_confidence,
+                metadata={"unit_kind": "image", "image_index": image_idx},
+            )
+        )
+
+    if units:
+        return units
+
+    return [
+        ExtractedUnit(
+            text=json.dumps(content, sort_keys=True),
+            modality="text",
+            extraction_confidence=0.78,
+            metadata={"unit_kind": "structured_fallback"},
+        )
+    ]
 
 
 def _table_to_text(content: Any) -> str:
@@ -993,7 +1078,17 @@ def _extraction_quality(chunk: Chunk) -> float:
         numeric = float(value)
     except (TypeError, ValueError):
         return 0.7
-    return max(0.0, min(1.0, numeric))
+    quality = max(0.0, min(1.0, numeric))
+
+    # Provenance metadata from multimodal/compound extraction increases trust.
+    if chunk.metadata.get("unit_kind"):
+        quality += 0.03
+    if chunk.metadata.get("origin_path") or chunk.metadata.get("image_path"):
+        quality += 0.02
+    if chunk.modality == "image_ocr_stub":
+        quality -= 0.10
+
+    return max(0.0, min(1.0, quality))
 
 
 def _position_score(chunk: Chunk, total_chunks: int = 100) -> float:
