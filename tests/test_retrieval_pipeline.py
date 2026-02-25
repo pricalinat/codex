@@ -957,6 +957,58 @@ Missing negative authorization tests are release blocking.
             any(chunk.source_id == "record:bundle-auth::artifact:summary" for chunk in chunks)
         )
 
+    def test_artifact_bundle_parent_links_enable_graph_bonus_and_confidence_support(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:bundle-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "artifacts": [
+                            {
+                                "artifact_id": "summary",
+                                "content": "Auth retry storms spike on release candidates.",
+                            },
+                            {
+                                "artifact_id": "risk-table",
+                                "content": {"rows": [{"component": "auth", "risk": "high"}]},
+                                "modality": "table",
+                            },
+                            {
+                                "artifact_id": "heatmap",
+                                "content": {"ocr_text": "authentication retry heatmap screenshot"},
+                                "modality": "image",
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry storms risk matrix image evidence",
+            top_k=3,
+            diversify=False,
+        )
+
+        by_source = {item.chunk.source_id: item for item in ranked}
+        self.assertIn("record:bundle-auth::artifact:summary", by_source)
+        self.assertGreater(
+            by_source["record:bundle-auth::artifact:summary"].score_breakdown.get("artifact_graph", 0.0),
+            0.0,
+        )
+
+        evidence = engine.retrieve_evidence(
+            "auth retry storms risk matrix image evidence",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+        self.assertGreater(evidence.confidence_factors.get("artifact_graph_support", 0.0), 0.0)
+
     def test_ingest_records_resolves_markdown_file_reference_payload(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

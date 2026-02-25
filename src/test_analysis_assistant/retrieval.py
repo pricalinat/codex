@@ -3029,12 +3029,18 @@ def _chunk_link_keys(chunk: Chunk) -> List[str]:
     source_id = str(chunk.source_id).strip()
     if source_id:
         keys.append(f"source:{source_id}")
+        bundle_parent = _extract_bundle_parent_source(source_id)
+        if bundle_parent:
+            keys.append(f"source:{bundle_parent}")
         if source_id.endswith("::__summary__"):
             keys.append(f"source:{source_id[:-12]}")
 
     linked_source = str(chunk.metadata.get("linked_source_id", "")).strip()
     if linked_source:
         keys.append(f"source:{linked_source}")
+    parent_source = str(chunk.metadata.get("parent_source_id", "")).strip()
+    if parent_source:
+        keys.append(f"source:{parent_source}")
 
     path_value = str(chunk.metadata.get("path", "")).strip()
     origin_path = str(chunk.metadata.get("origin_path", "")).strip()
@@ -3048,6 +3054,14 @@ def _chunk_link_keys(chunk: Chunk) -> List[str]:
             keys.append(f"dir:{parent}")
 
     return _dedupe(keys)
+
+
+def _extract_bundle_parent_source(source_id: str) -> str:
+    marker = "::artifact:"
+    idx = source_id.find(marker)
+    if idx <= 0:
+        return ""
+    return source_id[:idx]
 
 
 def _select_coverage_aware_top(
