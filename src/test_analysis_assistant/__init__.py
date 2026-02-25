@@ -7,9 +7,17 @@ from .actionable_plan import (
     generate_actionable_plan,
 )
 from .analyzer import analyze_report_text
+from .code_chunker import (
+    CodeAwareChunker,
+    CodeChunk,
+    CodeLanguage,
+    CodeUnit,
+    detect_language,
+)
 from .models import AnalysisResult, FailureRecord, FixSuggestion
 from .rag_analyzer import RAGAnalyzer, RAGAnalysisResult, RetrievalInsight, rag_analyze
 from .retrieval import (
+    CodeAwareIngestor,
     DummyEmbeddingProvider,
     HybridRetrievalEngine,
     IngestDocument,
@@ -18,6 +26,7 @@ from .retrieval import (
     SourceType,
     TFIDFEmbeddingProvider,
     build_analysis_prompt,
+    create_code_aware_engine,
     create_hybrid_engine,
 )
 
@@ -43,4 +52,11 @@ __all__ = [
     "ActionableStep",
     "generate_actionable_plan",
     "build_plan_prompt",
+    "CodeAwareChunker",
+    "CodeChunk",
+    "CodeLanguage",
+    "CodeUnit",
+    "detect_language",
+    "CodeAwareIngestor",
+    "create_code_aware_engine",
 ]

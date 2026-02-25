@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from .code_chunker import CodeAwareChunker, CodeChunk, CodeLanguage
+
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 
@@ -326,6 +328,153 @@ class MultiSourceIngestor:
             modality="markdown_mixed",
             metadata={"format": "markdown"},
         )
+
+
+class CodeAwareIngestor:
+    """Enhanced ingestor that uses code-structure-aware chunking.
+
+    This ingestor respects function, class, and module boundaries when
+    chunking code files, providing better context for test analysis.
+    """
+
+    def __init__(
+        self,
+        engine: RetrievalEngine,
+        chunk_size: int = 360,
+        chunk_overlap: int = 40,
+    ) -> None:
+        self._engine = engine
+        self._code_chunker = CodeAwareChunker(
+            max_chunk_tokens=chunk_size,
+            overlap_tokens=chunk_overlap,
+        )
+
+    def ingest_repository(
+        self,
+        repo_root: str,
+        max_files: int = 200,
+        include_extensions: Optional[Sequence[str]] = None,
+    ) -> List[Chunk]:
+        """Ingest repository files with code-aware chunking.
+
+        Args:
+            repo_root: Path to repository root
+            max_files: Maximum number of files to ingest
+            include_extensions: File extensions to include
+
+        Returns:
+            List of Chunk objects
+        """
+        root = Path(repo_root)
+        if not root.exists() or not root.is_dir():
+            raise ValueError(f"Repository path does not exist or is not a directory: {repo_root}")
+
+        default_extensions = {".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rs"}
+        allow = set(ext.lower() for ext in (include_extensions or list(default_extensions)))
+
+        chunks: List[Chunk] = []
+        for path in sorted(root.rglob("*")):
+            if len(chunks) >= max_files:
+                break
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in allow:
+                continue
+            rel_path = path.relative_to(root).as_posix()
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if not text.strip():
+                continue
+
+            # Use code-aware chunking
+            code_chunks = self._code_chunker.chunk(text, rel_path)
+            for cc in code_chunks:
+                chunks.append(Chunk(
+                    chunk_id=cc.chunk_id,
+                    source_id=f"repo:{rel_path}",
+                    source_type=SourceType.REPOSITORY,
+                    modality="code",
+                    text=cc.text,
+                    token_count=cc.token_count,
+                    metadata={
+                        "path": rel_path,
+                        "extension": path.suffix.lower(),
+                        "language": cc.language.value,
+                        "unit_name": cc.metadata.get("unit_name"),
+                        "unit_type": cc.metadata.get("unit_type"),
+                        "chunk_type": cc.chunk_type,
+                        "start_line": cc.start_line,
+                        "end_line": cc.end_line,
+                        "extraction_confidence": 0.95,
+                    },
+                ))
+
+        if chunks:
+            self._engine._chunks.extend(chunks)
+        return chunks
+
+    def ingest_code_snippet(
+        self,
+        source_id: str,
+        code_content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Chunk]:
+        """Ingest a code snippet with structure-aware chunking.
+
+        Args:
+            source_id: Source identifier
+            code_content: Code content
+            metadata: Optional metadata
+
+        Returns:
+            List of Chunk objects
+        """
+        code_chunks = self._code_chunker.chunk(code_content, source_id)
+        chunks: List[Chunk] = []
+
+        for cc in code_chunks:
+            chunks.append(Chunk(
+                chunk_id=cc.chunk_id,
+                source_id=source_id,
+                source_type=SourceType.CODE_SNIPPET,
+                modality="code",
+                text=cc.text,
+                token_count=cc.token_count,
+                metadata={
+                    "language": cc.language.value,
+                    "unit_name": cc.metadata.get("unit_name"),
+                    "unit_type": cc.metadata.get("unit_type"),
+                    "chunk_type": cc.chunk_type,
+                    "start_line": cc.start_line,
+                    "end_line": cc.end_line,
+                    "extraction_confidence": 0.95,
+                    **(metadata or {}),
+                },
+            ))
+
+        if chunks:
+            self._engine._chunks.extend(chunks)
+        return chunks
+
+
+def create_code_aware_engine(
+    chunk_size: int = 360,
+    chunk_overlap: int = 40,
+) -> tuple:
+    """Factory to create a retrieval engine with code-aware ingestion.
+
+    Args:
+        chunk_size: Maximum tokens per chunk
+        chunk_overlap: Token overlap between chunks
+
+    Returns:
+        Tuple of (RetrievalEngine, CodeAwareIngestor)
+    """
+    engine = RetrievalEngine(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    ingestor = CodeAwareIngestor(engine, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return engine, ingestor
 
 
 def build_analysis_prompt(question: str, ranked_context: Sequence[RankedChunk]) -> str:
