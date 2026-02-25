@@ -874,6 +874,44 @@ Missing negative authorization tests increase release risk.
         source_types = {item.chunk.source_type for item in evidence.ranked_chunks}
         self.assertIn(SourceType.SYSTEM_ANALYSIS, source_types)
 
+    def test_retrieve_evidence_limits_single_source_dominance_when_alternatives_exist(self):
+        docs = [
+            IngestDocument(
+                source_id="req-monolith",
+                source_type=SourceType.REQUIREMENTS,
+                content="auth risk matrix negative test gap root cause traceback token refresh",
+            ),
+            IngestDocument(
+                source_id="req-monolith",
+                source_type=SourceType.REQUIREMENTS,
+                content="auth risk matrix negative test gap release blocking root cause",
+            ),
+            IngestDocument(
+                source_id="req-monolith",
+                source_type=SourceType.REQUIREMENTS,
+                content="auth risk matrix negative test gap mitigation plan root cause",
+            ),
+            IngestDocument(
+                source_id="sys-incident",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="auth root cause traceback in gateway service diagnostics",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth root cause traceback risk matrix negative test gap",
+            top_k=3,
+            diversify=True,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertEqual(3, len(evidence.ranked_chunks))
+        source_ids = [item.chunk.source_id for item in evidence.ranked_chunks]
+        self.assertIn("sys-incident", source_ids)
+
     def test_build_analysis_prompt_from_evidence_includes_confidence_and_missing_signals(self):
         docs = [
             IngestDocument(

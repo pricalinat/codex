@@ -2294,25 +2294,40 @@ def _select_coverage_aware_top(
     selected: List[RankedChunk] = []
     remaining = list(candidates)
     needed_modalities = set(mod for mod in plan.preferred_modalities if mod != "text")
-    needed_sources = set(plan.preferred_source_types[:3])
+    available_source_types = {candidate.chunk.source_type for candidate in candidates}
+    preferred_available = [stype for stype in plan.preferred_source_types if stype in available_source_types]
+    source_target_budget = min(len(preferred_available), max(1, min(top_k, 3)))
+    needed_sources = set(preferred_available[:source_target_budget])
+    source_counts: Dict[str, int] = {}
+    max_per_source = max(1, top_k - 1)
 
     while remaining and len(selected) < top_k:
         best_idx = 0
         best_value = float("-inf")
+        selected_source_ids = {item.chunk.source_id for item in selected}
         for idx, candidate in enumerate(remaining):
             value = candidate.score
             if candidate.chunk.modality in needed_modalities:
                 value += 0.24
             if candidate.chunk.source_type in needed_sources:
                 value += 0.10
+            if diversify and candidate.chunk.source_id not in selected_source_ids:
+                value += 0.22
             if selected:
                 similarity = max(_chunk_similarity(candidate.chunk, existing.chunk) for existing in selected)
                 value -= (0.12 * similarity)
+            if diversify:
+                source_id = candidate.chunk.source_id
+                if source_counts.get(source_id, 0) >= max_per_source:
+                    alternatives = any(item.chunk.source_id != source_id for item in remaining)
+                    if alternatives:
+                        value -= 0.40
             if value > best_value:
                 best_value = value
                 best_idx = idx
         picked = remaining.pop(best_idx)
         selected.append(picked)
+        source_counts[picked.chunk.source_id] = source_counts.get(picked.chunk.source_id, 0) + 1
         needed_modalities.discard(picked.chunk.modality)
         needed_sources.discard(picked.chunk.source_type)
 
