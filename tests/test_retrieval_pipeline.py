@@ -1257,6 +1257,61 @@ class TestHybridRetrievalEngine(unittest.TestCase):
         self.assertIn("extraction_reliability", evidence.confidence_factors)
         self.assertLess(evidence.confidence_factors["extraction_reliability"], 0.9)
 
+    def test_retrieve_evidence_reports_source_reliability_factor(self):
+        docs = [
+            IngestDocument(
+                source_id="sys-ocr-stub",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content={"image_path": "screens/auth.png", "alt_text": "auth retry heatmap risk"},
+                modality="image",
+            ),
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication retries are release blocking and need mitigation.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth retry heatmap risk mitigation",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("source_reliability", evidence.confidence_factors)
+        self.assertGreaterEqual(evidence.confidence_factors["source_reliability"], 0.0)
+        self.assertLessEqual(evidence.confidence_factors["source_reliability"], 1.0)
+
+    def test_prompt_source_bundle_summary_includes_reliability(self):
+        docs = [
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Auth retries fail under load and create release risk.",
+                    "tables": [{"rows": [{"component": "auth", "risk": "high"}]}],
+                    "images": [{"ocr_text": "auth retry heatmap risk matrix"}],
+                },
+                metadata={"origin_path": "docs/incidents/auth.md"},
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        evidence = engine.retrieve_evidence("auth retry heatmap risk matrix", top_k=4, diversify=False)
+
+        prompt = build_analysis_prompt(
+            question="Summarize risk evidence.",
+            ranked_context=evidence.ranked_chunks,
+            source_bundles=evidence.source_bundles,
+        )
+
+        self.assertIn("reliability=", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

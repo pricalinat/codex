@@ -93,6 +93,7 @@ class SourceEvidenceBundle:
     aggregate_score: float = 0.0
     aggregate_confidence: float = 0.0
     coverage_ratio: float = 0.0
+    reliability_score: float = 0.0
 
 
 @dataclass
@@ -218,7 +219,8 @@ class RetrievalEngine:
                 + source_boost * 0.15
                 + intent_boost * 0.15
                 + modality_boost * 0.05
-                + extraction_quality * 0.10
+                + extraction_quality * 0.06
+                + _source_reliability(chunk) * 0.04
             )
             breakdown = {
                 "lexical": round(lexical_score, 4),
@@ -226,6 +228,7 @@ class RetrievalEngine:
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
                 "extraction": round(extraction_quality, 4),
+                "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
                 "authority": round(_source_authority(chunk), 4),
                 "completeness": round(_chunk_completeness(chunk, avg_chunk_size=self._chunk_size), 4),
@@ -954,6 +957,7 @@ def build_analysis_prompt(
                 f"modalities={','.join(bundle.modalities)} "
                 f"confidence={bundle.aggregate_confidence:.2f} "
                 f"coverage={bundle.coverage_ratio:.2f} "
+                f"reliability={bundle.reliability_score:.2f} "
                 f"terms={','.join(bundle.matched_terms)}"
             )
 
@@ -1589,6 +1593,23 @@ def _source_authority(chunk: Chunk) -> float:
     return min(1.0, base_authority + modality_bonus)
 
 
+def _source_reliability(chunk: Chunk) -> float:
+    """Reliability signal for ingestion provenance and extraction path quality."""
+    reliability = (_source_authority(chunk) * 0.60) + (_extraction_quality(chunk) * 0.40)
+
+    if chunk.metadata.get("origin_path") or chunk.metadata.get("path"):
+        reliability += 0.04
+    if chunk.metadata.get("unit_kind") in {"text", "table", "image"}:
+        reliability += 0.03
+    if chunk.metadata.get("chunk_type") == "full_unit":
+        reliability += 0.02
+
+    if chunk.modality == "image_ocr_stub":
+        reliability -= 0.22
+
+    return max(0.0, min(1.0, reliability))
+
+
 def _chunk_completeness(chunk: Chunk, avg_chunk_size: int = 360) -> float:
     """Score based on chunk completeness.
 
@@ -1664,22 +1685,26 @@ def compute_enhanced_confidence(
     # 4. Source authority
     authority = _source_authority(chunk)
 
-    # 5. Chunk completeness
+    # 5. Source reliability/provenance quality
+    reliability = _source_reliability(chunk)
+
+    # 6. Chunk completeness
     completeness = _chunk_completeness(chunk)
 
-    # 6. Rank-based decay (lower ranks get slight penalty)
+    # 7. Rank-based decay (lower ranks get slight penalty)
     rank_decay = 1.0 - (rank * 0.08)
 
-    # 7. Score-based confidence from retrieval
+    # 8. Score-based confidence from retrieval
     base_score = score_breakdown.get("lexical", 0.0) + score_breakdown.get("semantic", 0.0)
     score_confidence = min(1.0, base_score * 2)
 
     # Weighted combination
     confidence = (
         coverage * 0.20 +
-        extraction * 0.18 +
+        extraction * 0.14 +
         position * 0.08 +
-        authority * 0.15 +
+        authority * 0.11 +
+        reliability * 0.18 +
         completeness * 0.12 +
         score_confidence * 0.17 +
         rank_decay * 0.10
@@ -1752,12 +1777,14 @@ def _calibrate_retrieval_confidence(
         cross_source_consensus = _cross_source_consensus(ranked)
         source_concentration = _source_concentration(ranked)
         extraction_reliability = sum(_extraction_quality(item.chunk) for item in ranked) / len(ranked)
+        source_reliability = sum(_source_reliability(item.chunk) for item in ranked) / len(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
         cross_source_consensus = 0.0
         source_concentration = 0.0
         extraction_reliability = 0.0
+        source_reliability = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -1769,11 +1796,18 @@ def _calibrate_retrieval_confidence(
     coverage_multiplier = (0.56 + (0.24 * source_coverage) + (0.20 * modality_coverage))
     consensus_multiplier = 0.96 + (0.04 * cross_source_consensus)
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
+    reliability_multiplier = 0.90 + (0.10 * source_reliability)
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio)
     availability_penalty = 0.08 * unavailable_pressure
     concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
 
-    calibrated = aggregate_confidence * coverage_multiplier * consensus_multiplier * extraction_multiplier
+    calibrated = (
+        aggregate_confidence
+        * coverage_multiplier
+        * consensus_multiplier
+        * extraction_multiplier
+        * reliability_multiplier
+    )
     calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty - concentration_penalty)
     calibrated = max(0.0, min(1.0, calibrated))
 
@@ -1786,6 +1820,7 @@ def _calibrate_retrieval_confidence(
         "cross_source_consensus": round(max(0.0, min(1.0, cross_source_consensus)), 4),
         "source_concentration": round(max(0.0, min(1.0, source_concentration)), 4),
         "extraction_reliability": round(max(0.0, min(1.0, extraction_reliability)), 4),
+        "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),
     }
     return round(calibrated, 4), factors
 
@@ -1811,6 +1846,7 @@ def _build_source_bundles(
                 "matched_terms": set(),
                 "score_weighted": 0.0,
                 "confidence_weighted": 0.0,
+                "reliability_weighted": 0.0,
                 "weight_sum": 0.0,
             },
         )
@@ -1822,6 +1858,7 @@ def _build_source_bundles(
         weight = 1.0 / (1.0 + len(entry["chunk_ids"]) * 0.6)
         entry["score_weighted"] += item.score * weight
         entry["confidence_weighted"] += item.confidence * weight
+        entry["reliability_weighted"] += _source_reliability(item.chunk) * weight
         entry["weight_sum"] += weight
 
     bundles: List[SourceEvidenceBundle] = []
@@ -1839,6 +1876,7 @@ def _build_source_bundles(
                 aggregate_score=round(entry["score_weighted"] / weight_sum, 4),
                 aggregate_confidence=round(entry["confidence_weighted"] / weight_sum, 4),
                 coverage_ratio=round(coverage_ratio, 4),
+                reliability_score=round(entry["reliability_weighted"] / weight_sum, 4),
             )
         )
 
@@ -2373,7 +2411,8 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + source_boost * 0.15
                     + intent_boost * 0.15
                     + modality_boost * 0.05
-                    + extraction_quality * 0.10
+                    + extraction_quality * 0.06
+                    + _source_reliability(chunk) * 0.04
                 )
             else:
                 # Lexical-only (original behavior)
@@ -2386,7 +2425,8 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + source_boost * 0.15
                     + intent_boost * 0.15
                     + modality_boost * 0.05
-                    + extraction_quality * 0.10
+                    + extraction_quality * 0.06
+                    + _source_reliability(chunk) * 0.04
                 )
 
             breakdown = {
@@ -2396,6 +2436,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
                 "extraction": round(extraction_quality, 4),
+                "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
                 "authority": round(_source_authority(chunk), 4),
                 "completeness": round(_chunk_completeness(chunk, avg_chunk_size=self._chunk_size), 4),
