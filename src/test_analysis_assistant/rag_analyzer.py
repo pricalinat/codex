@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .analyzer import analyze_report_text
 from .models import AnalysisResult, FailureCluster, FixSuggestion
+from .query_reformulator import QueryReformulator, ReformulatedQueries
 from .retrieval import (
     AnalysisEvidencePack,
     ArtifactBundle,
@@ -171,6 +172,10 @@ class RAGAnalyzer:
             self._basic_ingestor = self._ingestor
             self._code_ingestor = None
         self._initialized = False
+
+        # Set up query reformulator for improved retrieval
+        self._reformulator = QueryReformulator(max_variants_per_failure=3)
+        self._reformulated_queries: Optional[ReformulatedQueries] = None
 
     def _select_ingestor(self, source_type: SourceType, source_id: str) -> Any:
         """Select appropriate ingestor based on source type and content.
@@ -520,28 +525,52 @@ class RAGAnalyzer:
         base_result: AnalysisResult,
         extra_query: Optional[str],
     ) -> List[str]:
-        """Build queries for retrieval based on analysis results."""
-        queries = []
+        """Build queries for retrieval based on analysis results.
 
-        # Query for test gaps based on failure types
-        if base_result.clusters:
-            error_types = [c.error_type for c in base_result.clusters]
-            queries.append(f"test gap {', '.join(error_types)} missing coverage")
+        Uses query reformulation to generate targeted variants from failures.
+        """
+        queries: List[str] = []
 
-        # Query for root cause evidence
+        # Use query reformulator to generate improved queries from failures
         if base_result.failures:
-            sample_errors = [f.error_type for f in base_result.failures[:3]]
-            queries.append(f"root cause analysis {', '.join(sample_errors)}")
+            reformulated = self._reformulator.reformulate_from_failures(
+                failures=base_result.failures,
+                original_query=extra_query or "",
+            )
+            # Store reformulated queries for later use
+            self._reformulated_queries = reformulated
 
-        # Query for risk factors
-        queries.append("release risk prioritization blocking issues")
+            # Add reformulated query variants sorted by weight
+            reformulated_queries = [
+                v.query_text for v in sorted(
+                    reformulated.variants,
+                    key=lambda v: v.weight,
+                    reverse=True,
+                )
+            ]
+            queries.extend(reformulated_queries[:6])  # Limit to top 6 variants
 
-        # Query for requirements-based coverage gaps
-        queries.append("requirements coverage missing test scenarios")
+        # Also add base queries for coverage if no failures
+        if not queries:
+            # Query for test gaps based on failure types
+            if base_result.clusters:
+                error_types = [c.error_type for c in base_result.clusters]
+                queries.append(f"test gap {', '.join(error_types)} missing coverage")
 
-        # Add user-provided query
-        if extra_query:
-            queries.append(extra_query)
+            # Query for root cause evidence
+            if base_result.failures:
+                sample_errors = [f.error_type for f in base_result.failures[:3]]
+                queries.append(f"root cause analysis {', '.join(sample_errors)}")
+
+            # Query for risk factors
+            queries.append("release risk prioritization blocking issues")
+
+            # Query for requirements-based coverage gaps
+            queries.append("requirements coverage missing test scenarios")
+
+            # Add user-provided query
+            if extra_query:
+                queries.append(extra_query)
 
         return queries
 

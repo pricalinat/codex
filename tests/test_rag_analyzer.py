@@ -553,5 +553,132 @@ class TestEnhancedConfidenceScoring(unittest.TestCase):
         self.assertGreater(confidence, 0.3)
 
 
+class TestQueryReformulationIntegration(unittest.TestCase):
+    """Tests for query reformulation integration in RAG analyzer."""
+
+    def test_rag_analyzer_has_reformulator(self):
+        """Test that RAGAnalyzer has a query reformulator."""
+        analyzer = RAGAnalyzer()
+        self.assertIsNotNone(analyzer._reformulator)
+        from src.test_analysis_assistant.query_reformulator import QueryReformulator
+        self.assertIsInstance(analyzer._reformulator, QueryReformulator)
+
+    def test_analyze_generates_reformulated_queries(self):
+        """Test that analyze generates reformulated queries from failures."""
+        test_report = """<testsuite name="pytest" errors="0" failures="2" tests="5">
+            <testcase classname="test_auth" name="test_login_failure">
+                <failure type="AssertionError">Expected True, got False</failure>
+            </testcase>
+            <testcase classname="test_auth" name="test_token_refresh">
+                <failure type="RuntimeError">token refresh failed</failure>
+            </testcase>
+        </testsuite>"""
+
+        analyzer = RAGAnalyzer()
+        analyzer.add_knowledge(
+            "auth-module",
+            "Authentication module handles token refresh and login validation.",
+        )
+
+        result = analyzer.analyze(test_report)
+
+        # Check reformulated queries were stored
+        self.assertIsNotNone(analyzer._reformulated_queries)
+        self.assertGreater(len(analyzer._reformulated_queries.variants), 0)
+
+        # Verify queries include extracted symbols from test names
+        query_texts = [v.query_text for v in analyzer._reformulated_queries.variants]
+        combined_queries = " ".join(query_texts).lower()
+
+        # Should contain symbols from test names
+        self.assertTrue(
+            "login" in combined_queries or "test" in combined_queries or "auth" in combined_queries,
+            f"Expected login/auth in queries, got: {query_texts}",
+        )
+
+    def test_reformulated_queries_have_weights(self):
+        """Test that reformulated queries have associated weights."""
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_api" name="test_status_check">
+                <failure type="TypeError">invalid type</failure>
+            </testcase>
+        </testsuite>"""
+
+        analyzer = RAGAnalyzer()
+        analyzer.add_knowledge("api-doc", "API status endpoint documentation.")
+        result = analyzer.analyze(test_report)
+
+        # Verify variants have weights
+        self.assertIsNotNone(analyzer._reformulated_queries)
+        for variant in analyzer._reformulated_queries.variants:
+            self.assertGreater(variant.weight, 0.0)
+            self.assertLessEqual(variant.weight, 1.0)
+
+    def test_reformulated_queries_include_original(self):
+        """Test that original query is included in reformulated variants."""
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_x" name="test_y">
+                <failure type="Error">failed</failure>
+            </testcase>
+        </testsuite>"""
+
+        analyzer = RAGAnalyzer()
+        analyzer.add_knowledge("doc", "content")
+        result = analyzer.analyze(test_report, query_for_context="custom query about auth")
+
+        # Original query should be included
+        self.assertIsNotNone(analyzer._reformulated_queries)
+        original_queries = [
+            v.query_text for v in analyzer._reformulated_queries.variants
+            if v.intent == "original"
+        ]
+        self.assertTrue(
+            any("custom query" in q.lower() for q in original_queries),
+            f"Expected original query in variants, got: {original_queries}",
+        )
+
+    def test_reformulator_extracts_error_specific_queries(self):
+        """Test that reformulator generates error-specific query variants."""
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_db" name="test_connection">
+                <failure type="ModuleNotFoundError">No module named 'psycopg2'</failure>
+            </testcase>
+        </testsuite>"""
+
+        analyzer = RAGAnalyzer()
+        analyzer.add_knowledge("db-doc", "Database connection module.")
+        result = analyzer.analyze(test_report)
+
+        self.assertIsNotNone(analyzer._reformulated_queries)
+        query_texts = " ".join(
+            v.query_text for v in analyzer._reformulated_queries.variants
+        ).lower()
+
+        # Should include import-related queries
+        self.assertTrue(
+            "import" in query_texts or "module" in query_texts or "dependency" in query_texts,
+            f"Expected import-related queries, got: {query_texts}",
+        )
+
+    def test_rag_analyze_preserves_functionality(self):
+        """Test that rag_analyze convenience function works with reformulation."""
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_login">
+                <failure type="AssertionError">Login failed</failure>
+            </testcase>
+        </testsuite>"""
+
+        result = rag_analyze(
+            test_report_content=test_report,
+            requirements_docs=[("req-1", "Authentication must work correctly.")],
+            query="auth test gaps",
+        )
+
+        self.assertIsInstance(result, RAGAnalysisResult)
+        self.assertEqual(result.base_result.total_failures, 1)
+        # Should still have retrieval insights
+        self.assertTrue(len(result.retrieval_insights) > 0 or len(result.test_gap_analysis) > 0)
+
+
 if __name__ == "__main__":
     unittest.main()
