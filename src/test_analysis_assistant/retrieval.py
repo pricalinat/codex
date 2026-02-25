@@ -94,6 +94,8 @@ class QueryPlan:
     intent_labels: List[str] = field(default_factory=list)
     preferred_source_types: List[SourceType] = field(default_factory=list)
     preferred_modalities: List[str] = field(default_factory=list)
+    target_paths: List[str] = field(default_factory=list)
+    target_symbols: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -272,6 +274,7 @@ class RetrievalEngine:
     def build_query_plan(self, query_text: str) -> QueryPlan:
         tokens = sorted(set(_tokenize(query_text)))
         token_set = set(tokens)
+        target_paths, target_symbols = _extract_structural_targets(query_text)
         intent_rules = {
             "failure_clustering": {"cluster", "group", "pattern", "recurring", "flaky", "flake"},
             "root_cause": {"root", "cause", "traceback", "hypothesis", "why"},
@@ -313,6 +316,8 @@ class RetrievalEngine:
             intent_labels=intent_labels,
             preferred_source_types=_dedupe(preferred_source_types),
             preferred_modalities=_dedupe(preferred_modalities),
+            target_paths=target_paths,
+            target_symbols=target_symbols,
         )
 
     def query(self, query_text: str, top_k: int = 5, diversify: bool = True) -> List[RankedChunk]:
@@ -330,20 +335,23 @@ class RetrievalEngine:
             source_boost = _source_weight(chunk.source_type)
             intent_boost = _intent_alignment(plan, chunk)
             modality_boost = _modality_alignment(plan, chunk.modality)
+            structural_boost = _structural_alignment(plan, chunk)
             extraction_quality = _extraction_quality(chunk)
             score = (
-                lexical_score * 0.55
+                lexical_score * 0.50
                 + source_boost * 0.15
                 + intent_boost * 0.15
                 + modality_boost * 0.05
+                + structural_boost * 0.06
                 + extraction_quality * 0.06
-                + _source_reliability(chunk) * 0.04
+                + _source_reliability(chunk) * 0.03
             )
             breakdown = {
                 "lexical": round(lexical_score, 4),
                 "source": round(source_boost, 4),
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
+                "structural": round(structural_boost, 4),
                 "extraction": round(extraction_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
@@ -802,6 +810,10 @@ class RetrievalEngine:
             variants.append((f"{query_text} table matrix evidence", 0.60))
         if "image" in plan.preferred_modalities or "image_ocr_stub" in plan.preferred_modalities:
             variants.append((f"{query_text} image ocr diagram evidence", 0.60))
+        if plan.target_paths:
+            variants.append((f"{query_text} file path {' '.join(plan.target_paths[:2])}", 0.66))
+        if plan.target_symbols:
+            variants.append((f"{query_text} function symbol {' '.join(plan.target_symbols[:2])}", 0.66))
 
         deduped: List[Tuple[str, float]] = []
         seen = set()
@@ -1333,6 +1345,12 @@ def build_analysis_prompt_from_evidence(question: str, evidence: RetrievalEviden
             f"{name}={value:.2f}" for name, value in sorted(evidence.confidence_factors.items())
         )
         lines.append(f"confidence_factors: {factor_text}")
+    if evidence.query_plan.target_paths or evidence.query_plan.target_symbols:
+        lines.append(
+            "Structural query targets: "
+            f"paths={evidence.query_plan.target_paths} "
+            f"symbols={evidence.query_plan.target_symbols}"
+        )
 
     if evidence.missing_source_types or evidence.missing_modalities:
         lines.append(
@@ -2359,6 +2377,39 @@ def _tokenize(text: str) -> List[str]:
     return [_normalize_token(token.lower()) for token in _WORD_RE.findall(text)]
 
 
+def _extract_structural_targets(query_text: str) -> Tuple[List[str], List[str]]:
+    target_paths: List[str] = []
+    target_symbols: List[str] = []
+
+    path_patterns = (
+        r"(?:path|file)\s*[:=]\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+)",
+        r"`([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+)`",
+    )
+    for pattern in path_patterns:
+        for match in re.finditer(pattern, query_text, flags=re.IGNORECASE):
+            normalized = _normalize_reference_path(match.group(1))
+            if normalized:
+                target_paths.append(normalized)
+
+    for token in query_text.split():
+        normalized = _normalize_reference_path(token)
+        if normalized and "/" in normalized:
+            target_paths.append(normalized)
+
+    symbol_patterns = (
+        r"(?:function|func|method|class|symbol)\s*[:=]?\s*([A-Za-z_][A-Za-z0-9_]*)",
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        r"::([A-Za-z_][A-Za-z0-9_]*)",
+    )
+    for pattern in symbol_patterns:
+        for match in re.finditer(pattern, query_text, flags=re.IGNORECASE):
+            symbol = str(match.group(1)).strip()
+            if symbol and len(symbol) >= 3:
+                target_symbols.append(symbol.lower())
+
+    return _dedupe(target_paths), _dedupe(target_symbols)
+
+
 def _extract_reference_signals(text: str) -> Dict[str, List[str]]:
     source_ids: List[str] = []
     referenced_paths: List[str] = []
@@ -2440,6 +2491,65 @@ def _source_weight(source_type: SourceType) -> float:
         SourceType.KNOWLEDGE: 0.7,
     }
     return weights.get(source_type, 0.75)
+
+
+def _chunk_structural_signals(chunk: Chunk) -> Tuple[List[str], List[str]]:
+    paths: List[str] = []
+    symbols: List[str] = []
+
+    for raw in (
+        chunk.metadata.get("path"),
+        chunk.metadata.get("origin_path"),
+        chunk.source_id[5:] if str(chunk.source_id).startswith("repo:") else "",
+    ):
+        if not raw:
+            continue
+        normalized = _normalize_reference_path(str(raw))
+        if normalized:
+            paths.append(normalized)
+
+    for raw_path in _coerce_str_list(chunk.metadata.get("referenced_paths")):
+        normalized = _normalize_reference_path(raw_path)
+        if normalized:
+            paths.append(normalized)
+
+    unit_name = str(chunk.metadata.get("unit_name", "")).strip().lower()
+    if unit_name:
+        symbols.append(unit_name)
+    for token in _tokenize(chunk.text):
+        if len(token) >= 3 and ("_" in token or token.isalpha()):
+            symbols.append(token.lower())
+
+    return _dedupe(paths), _dedupe(symbols)
+
+
+def _path_match(target_path: str, candidate_path: str) -> bool:
+    target = Path(target_path).as_posix()
+    candidate = Path(candidate_path).as_posix()
+    return target == candidate or target.endswith(candidate) or candidate.endswith(target)
+
+
+def _structural_alignment(plan: QueryPlan, chunk: Chunk) -> float:
+    if not plan.target_paths and not plan.target_symbols:
+        return 0.55
+
+    chunk_paths, chunk_symbols = _chunk_structural_signals(chunk)
+    path_hits = 0
+    symbol_hits = 0
+
+    for target in plan.target_paths:
+        if any(_path_match(target, candidate) for candidate in chunk_paths):
+            path_hits += 1
+    for target in plan.target_symbols:
+        if target.lower() in set(chunk_symbols):
+            symbol_hits += 1
+
+    path_ratio = (path_hits / len(plan.target_paths)) if plan.target_paths else 0.0
+    symbol_ratio = (symbol_hits / len(plan.target_symbols)) if plan.target_symbols else 0.0
+
+    if path_ratio == 0.0 and symbol_ratio == 0.0:
+        return 0.20
+    return min(1.0, 0.35 + (path_ratio * 0.45) + (symbol_ratio * 0.30))
 
 
 def _effective_modality(modality: str, text: str) -> str:
@@ -2731,6 +2841,34 @@ def _source_concentration(ranked: Sequence[RankedChunk]) -> float:
     return max(0.0, min(1.0, max_share))
 
 
+def _structural_coverage(plan: QueryPlan, ranked: Sequence[RankedChunk]) -> float:
+    if not plan.target_paths and not plan.target_symbols:
+        return 1.0
+    if not ranked:
+        return 0.0
+
+    covered_paths = set()
+    covered_symbols = set()
+    wanted_paths = {Path(path).as_posix() for path in plan.target_paths}
+    wanted_symbols = {symbol.lower() for symbol in plan.target_symbols}
+
+    for item in ranked:
+        chunk_paths, chunk_symbols = _chunk_structural_signals(item.chunk)
+        for path in wanted_paths:
+            if any(_path_match(path, candidate) for candidate in chunk_paths):
+                covered_paths.add(path)
+        for symbol in wanted_symbols:
+            if symbol in set(chunk_symbols):
+                covered_symbols.add(symbol)
+
+    path_ratio = (len(covered_paths) / len(wanted_paths)) if wanted_paths else 1.0
+    symbol_ratio = (len(covered_symbols) / len(wanted_symbols)) if wanted_symbols else 1.0
+
+    if wanted_paths and wanted_symbols:
+        return max(0.0, min(1.0, (path_ratio * 0.6) + (symbol_ratio * 0.4)))
+    return max(0.0, min(1.0, path_ratio if wanted_paths else symbol_ratio))
+
+
 def _cross_source_conflict(ranked: Sequence[RankedChunk]) -> float:
     if len(ranked) < 2:
         return 0.0
@@ -2784,6 +2922,7 @@ def _calibrate_retrieval_confidence(
     preferred_modalities = len(plan.preferred_modalities)
     source_coverage = 1.0 - (len(missing_sources) / preferred_sources) if preferred_sources else 1.0
     modality_coverage = 1.0 - (len(missing_modalities) / preferred_modalities) if preferred_modalities else 1.0
+    structural_coverage = _structural_coverage(plan, ranked)
 
     if ranked:
         ocr_stub_count = sum(1 for item in ranked if item.chunk.modality == "image_ocr_stub")
@@ -2824,6 +2963,7 @@ def _calibrate_retrieval_confidence(
     unavailable_pressure = max(0.0, min(1.0, unavailable_pressure))
 
     coverage_multiplier = (0.56 + (0.24 * source_coverage) + (0.20 * modality_coverage))
+    structural_multiplier = 0.90 + (0.10 * structural_coverage)
     consensus_multiplier = 0.96 + (0.04 * cross_source_consensus)
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
@@ -2836,6 +2976,7 @@ def _calibrate_retrieval_confidence(
     calibrated = (
         aggregate_confidence
         * coverage_multiplier
+        * structural_multiplier
         * consensus_multiplier
         * extraction_multiplier
         * reliability_multiplier
@@ -2848,6 +2989,7 @@ def _calibrate_retrieval_confidence(
     factors = {
         "source_coverage": round(max(0.0, min(1.0, source_coverage)), 4),
         "modality_coverage": round(max(0.0, min(1.0, modality_coverage)), 4),
+        "structural_coverage": round(max(0.0, min(1.0, structural_coverage)), 4),
         "ocr_stub_ratio": round(max(0.0, min(1.0, ocr_stub_ratio)), 4),
         "low_signal_ratio": round(max(0.0, min(1.0, low_signal_ratio)), 4),
         "unavailable_pressure": round(unavailable_pressure, 4),
@@ -3681,12 +3823,14 @@ class HybridRetrievalEngine(RetrievalEngine):
                 source_boost = _source_weight(chunk.source_type)
                 intent_boost = _intent_alignment(plan, chunk)
                 modality_boost = _modality_alignment(plan, chunk.modality)
+                structural_boost = _structural_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
                 score = (
-                    final_score * 0.50
+                    final_score * 0.47
                     + source_boost * 0.15
                     + intent_boost * 0.15
                     + modality_boost * 0.05
+                    + structural_boost * 0.08
                     + extraction_quality * 0.06
                     + _source_reliability(chunk) * 0.04
                 )
@@ -3695,14 +3839,16 @@ class HybridRetrievalEngine(RetrievalEngine):
                 source_boost = _source_weight(chunk.source_type)
                 intent_boost = _intent_alignment(plan, chunk)
                 modality_boost = _modality_alignment(plan, chunk.modality)
+                structural_boost = _structural_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
                 score = (
-                    lex_score * 0.55
+                    lex_score * 0.50
                     + source_boost * 0.15
                     + intent_boost * 0.15
                     + modality_boost * 0.05
+                    + structural_boost * 0.06
                     + extraction_quality * 0.06
-                    + _source_reliability(chunk) * 0.04
+                    + _source_reliability(chunk) * 0.03
                 )
 
             breakdown = {
@@ -3711,6 +3857,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 "source": round(source_boost, 4),
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
+                "structural": round(structural_boost, 4),
                 "extraction": round(extraction_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),

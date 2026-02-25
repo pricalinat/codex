@@ -24,6 +24,49 @@ from src.test_analysis_assistant.retrieval import (
 
 
 class TestRetrievalPipeline(unittest.TestCase):
+    def test_build_query_plan_extracts_structural_targets(self):
+        engine = RetrievalEngine()
+
+        plan = engine.build_query_plan(
+            "root cause in path:src/auth/token.py function refresh_token with retry storm"
+        )
+
+        self.assertIn("src/auth/token.py", plan.target_paths)
+        self.assertIn("refresh_token", plan.target_symbols)
+
+    def test_retrieve_evidence_prioritizes_structural_targets(self):
+        docs = [
+            IngestDocument(
+                source_id="repo:src/auth/token.py",
+                source_type=SourceType.REPOSITORY,
+                modality="code",
+                content="def refresh_token(token): return token.strip()  # retry mitigation",
+                metadata={"path": "src/auth/token.py", "unit_name": "refresh_token"},
+            ),
+            IngestDocument(
+                source_id="repo:src/billing/token.py",
+                source_type=SourceType.REPOSITORY,
+                modality="code",
+                content="def refresh_token(token): return token.strip()  # retry mitigation",
+                metadata={"path": "src/billing/token.py", "unit_name": "refresh_token"},
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "traceback root cause for path:src/auth/token.py function refresh_token",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertGreaterEqual(len(evidence.ranked_chunks), 1)
+        self.assertEqual(evidence.ranked_chunks[0].chunk.source_id, "repo:src/auth/token.py")
+        self.assertIn("structural_coverage", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["structural_coverage"], 0.5)
+
     def test_retrieve_analysis_evidence_pack_builds_focus_and_merged_results(self):
         docs = [
             IngestDocument(
