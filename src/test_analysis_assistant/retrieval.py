@@ -96,6 +96,10 @@ class QueryPlan:
     preferred_modalities: List[str] = field(default_factory=list)
     required_source_types: List[SourceType] = field(default_factory=list)
     required_modalities: List[str] = field(default_factory=list)
+    required_ingestion_routes: List[str] = field(default_factory=list)
+    excluded_ingestion_routes: List[str] = field(default_factory=list)
+    min_extraction_confidence: Optional[float] = None
+    prefer_verified_extraction: bool = False
     target_paths: List[str] = field(default_factory=list)
     target_symbols: List[str] = field(default_factory=list)
 
@@ -340,7 +344,14 @@ class RetrievalEngine:
         tokens = sorted(set(_tokenize(query_text)))
         token_set = set(tokens)
         target_paths, target_symbols = _extract_structural_targets(query_text)
-        required_source_types, required_modalities = _extract_query_constraints(query_text)
+        (
+            required_source_types,
+            required_modalities,
+            required_ingestion_routes,
+            excluded_ingestion_routes,
+            min_extraction_confidence,
+            prefer_verified_extraction,
+        ) = _extract_query_constraints(query_text)
         intent_rules = {
             "failure_clustering": {"cluster", "group", "pattern", "recurring", "flaky", "flake"},
             "root_cause": {"root", "cause", "traceback", "hypothesis", "why"},
@@ -388,6 +399,10 @@ class RetrievalEngine:
             preferred_modalities=_dedupe(preferred_modalities),
             required_source_types=required_source_types,
             required_modalities=required_modalities,
+            required_ingestion_routes=required_ingestion_routes,
+            excluded_ingestion_routes=excluded_ingestion_routes,
+            min_extraction_confidence=min_extraction_confidence,
+            prefer_verified_extraction=prefer_verified_extraction,
             target_paths=target_paths,
             target_symbols=target_symbols,
         )
@@ -621,6 +636,23 @@ class RetrievalEngine:
             if use_expansion
             else self.query(query_text, top_k=candidate_top_k, diversify=diversify)
         )
+        recovery_applied = False
+        recovery_queries: List[str] = []
+        retrieval_strategy = "baseline"
+
+        if not ranked and _plan_has_quality_constraints(plan):
+            relaxed_query = _strip_quality_constraints_from_query(query_text)
+            if relaxed_query:
+                ranked = (
+                    self.query_with_expansion(relaxed_query, top_k=candidate_top_k, diversify=diversify)
+                    if use_expansion
+                    else self.query(relaxed_query, top_k=candidate_top_k, diversify=diversify)
+                )
+                if ranked:
+                    recovery_applied = True
+                    retrieval_strategy = "quality_constraint_relaxation"
+                    recovery_queries = [f"relaxed constraints: {relaxed_query}"]
+
         coverage_candidates = list(ranked)
         ranked = _select_coverage_aware_top(
             ranked,
@@ -656,9 +688,6 @@ class RetrievalEngine:
             unavailable_sources=unavailable_sources,
             unavailable_modalities=unavailable_modalities,
         )
-        recovery_applied = False
-        recovery_queries: List[str] = []
-        retrieval_strategy = "baseline"
 
         if adaptive_recovery and _should_apply_recovery(
             aggregate_confidence=aggregate_confidence,
@@ -1440,11 +1469,22 @@ def build_analysis_prompt_from_evidence(question: str, evidence: RetrievalEviden
             f"paths={evidence.query_plan.target_paths} "
             f"symbols={evidence.query_plan.target_symbols}"
         )
-    if evidence.query_plan.required_source_types or evidence.query_plan.required_modalities:
+    if (
+        evidence.query_plan.required_source_types
+        or evidence.query_plan.required_modalities
+        or evidence.query_plan.required_ingestion_routes
+        or evidence.query_plan.excluded_ingestion_routes
+        or evidence.query_plan.min_extraction_confidence is not None
+        or evidence.query_plan.prefer_verified_extraction
+    ):
         lines.append(
             "Explicit query constraints: "
             f"source_types={[item.value for item in evidence.query_plan.required_source_types]} "
-            f"modalities={evidence.query_plan.required_modalities}"
+            f"modalities={evidence.query_plan.required_modalities} "
+            f"required_routes={evidence.query_plan.required_ingestion_routes} "
+            f"excluded_routes={evidence.query_plan.excluded_ingestion_routes} "
+            f"min_extraction={evidence.query_plan.min_extraction_confidence} "
+            f"prefer_verified={evidence.query_plan.prefer_verified_extraction}"
         )
 
     if evidence.missing_source_types or evidence.missing_modalities:
@@ -2720,9 +2760,15 @@ def _extract_structural_targets(query_text: str) -> Tuple[List[str], List[str]]:
     return _dedupe(target_paths), _dedupe(target_symbols)
 
 
-def _extract_query_constraints(query_text: str) -> Tuple[List[SourceType], List[str]]:
+def _extract_query_constraints(
+    query_text: str,
+) -> Tuple[List[SourceType], List[str], List[str], List[str], Optional[float], bool]:
     required_sources: List[SourceType] = []
     required_modalities: List[str] = []
+    required_routes: List[str] = []
+    excluded_routes: List[str] = []
+    min_extraction_confidence: Optional[float] = None
+    prefer_verified_extraction = False
 
     source_matches = re.findall(r"(?:source|source_type|type)\s*[:=]\s*([A-Za-z0-9_,|/-]+)", query_text, flags=re.IGNORECASE)
     for raw_value in source_matches:
@@ -2750,19 +2796,152 @@ def _extract_query_constraints(query_text: str) -> Tuple[List[SourceType], List[
             if normalized in {"text", "code", "table", "image", "image_ocr_stub", "markdown_mixed"}:
                 required_modalities.append(normalized)
 
-    return _dedupe(required_sources), _dedupe(required_modalities)
+    route_matches = re.findall(
+        r"(?:route|ingestion_route)\s*[:=]\s*([A-Za-z0-9_!,-|/]+)",
+        query_text,
+        flags=re.IGNORECASE,
+    )
+    for raw_value in route_matches:
+        for token in re.split(r"[,|]", raw_value):
+            raw_token = str(token).strip().lower()
+            if not raw_token:
+                continue
+
+            negate = raw_token.startswith(("!", "-"))
+            normalized = raw_token[1:] if negate else raw_token
+            normalized = normalized.replace("-", "_")
+
+            if normalized in {"verified", "high_quality"}:
+                prefer_verified_extraction = True
+                verified_aliases = [
+                    "pipeline_verified",
+                    "pipeline_verified_sidecar",
+                    "pipeline_detected",
+                    "repository_scan",
+                ]
+                if negate:
+                    excluded_routes.extend(verified_aliases)
+                else:
+                    required_routes.extend(verified_aliases)
+                continue
+
+            if normalized in {"stub", "ocr_stub"}:
+                stub_aliases = ["pipeline_ocr_stub", "ocr_stub"]
+                if negate:
+                    excluded_routes.extend(stub_aliases)
+                else:
+                    required_routes.extend(stub_aliases)
+                continue
+
+            if negate:
+                excluded_routes.append(normalized)
+            else:
+                required_routes.append(normalized)
+
+    quality_matches = re.findall(
+        r"(?:quality|min_quality)\s*[:=]\s*([A-Za-z0-9_.-]+)",
+        query_text,
+        flags=re.IGNORECASE,
+    )
+    quality_alias = {
+        "high": 0.8,
+        "medium": 0.6,
+        "low": 0.3,
+    }
+    for raw_value in quality_matches:
+        token = str(raw_value).strip().lower()
+        if token in quality_alias:
+            min_extraction_confidence = max(min_extraction_confidence or 0.0, quality_alias[token])
+            if token == "high":
+                prefer_verified_extraction = True
+            continue
+        try:
+            parsed = float(token)
+        except ValueError:
+            continue
+        min_extraction_confidence = max(min_extraction_confidence or 0.0, max(0.0, min(1.0, parsed)))
+
+    min_extraction_matches = re.findall(
+        r"(?:min_extraction|min_extraction_confidence|extraction_confidence)\s*[:=]\s*([0-9]*\.?[0-9]+)",
+        query_text,
+        flags=re.IGNORECASE,
+    )
+    for raw_value in min_extraction_matches:
+        try:
+            parsed = float(raw_value)
+        except ValueError:
+            continue
+        min_extraction_confidence = max(min_extraction_confidence or 0.0, max(0.0, min(1.0, parsed)))
+
+    return (
+        _dedupe(required_sources),
+        _dedupe(required_modalities),
+        _dedupe(required_routes),
+        _dedupe(excluded_routes),
+        min_extraction_confidence,
+        prefer_verified_extraction,
+    )
 
 
 def _chunk_satisfies_constraints(plan: QueryPlan, chunk: Chunk) -> bool:
     if plan.required_source_types and chunk.source_type not in plan.required_source_types:
         return False
     if not plan.required_modalities:
-        return True
-    if chunk.modality in plan.required_modalities:
-        return True
-    if "image" in plan.required_modalities and chunk.modality == "image_ocr_stub":
-        return True
-    return False
+        modality_ok = True
+    elif chunk.modality in plan.required_modalities:
+        modality_ok = True
+    elif "image" in plan.required_modalities and chunk.modality == "image_ocr_stub":
+        modality_ok = True
+    else:
+        modality_ok = False
+    if not modality_ok:
+        return False
+
+    route = str(chunk.metadata.get("ingestion_route", "")).strip().lower().replace("-", "_")
+    if plan.required_ingestion_routes and route not in set(plan.required_ingestion_routes):
+        return False
+    if route and route in set(plan.excluded_ingestion_routes):
+        return False
+
+    if plan.prefer_verified_extraction:
+        if route in {"pipeline_ocr_stub", "ocr_stub"} or chunk.modality == "image_ocr_stub":
+            return False
+
+    if plan.min_extraction_confidence is not None:
+        extraction = _resolve_chunk_extraction_confidence(chunk)
+        if extraction < plan.min_extraction_confidence:
+            return False
+
+    return True
+
+
+def _resolve_chunk_extraction_confidence(chunk: Chunk) -> float:
+    raw = chunk.metadata.get("extraction_confidence")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.3 if chunk.modality == "image_ocr_stub" else 0.85
+    return max(0.0, min(1.0, value))
+
+
+def _plan_has_quality_constraints(plan: QueryPlan) -> bool:
+    return bool(
+        plan.required_ingestion_routes
+        or plan.excluded_ingestion_routes
+        or (plan.min_extraction_confidence is not None)
+        or plan.prefer_verified_extraction
+    )
+
+
+def _strip_quality_constraints_from_query(query_text: str) -> str:
+    stripped = re.sub(
+        r"(?:route|ingestion_route|quality|min_quality|min_extraction|min_extraction_confidence|extraction_confidence)\s*[:=]\s*[^\s]+",
+        " ",
+        query_text,
+        flags=re.IGNORECASE,
+    )
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    return stripped or "test analysis evidence"
 
 
 def _extract_reference_signals(text: str) -> Dict[str, List[str]]:

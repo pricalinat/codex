@@ -3033,5 +3033,95 @@ class TestComprehensiveConfidenceScoring(unittest.TestCase):
         self.assertGreater(confidence_rank_0, confidence_rank_5)
 
 
+class TestRetrievalQualityConstraints(unittest.TestCase):
+    """Tests for query-level ingestion quality constraints and fallback."""
+
+    def test_build_query_plan_extracts_route_and_quality_directives(self):
+        engine = RetrievalEngine()
+
+        plan = engine.build_query_plan(
+            "root cause route:pipeline_verified route:!pipeline_ocr_stub quality:high"
+        )
+
+        self.assertIn("pipeline_verified", plan.required_ingestion_routes)
+        self.assertIn("pipeline_ocr_stub", plan.excluded_ingestion_routes)
+        self.assertAlmostEqual(0.8, plan.min_extraction_confidence, places=3)
+        self.assertTrue(plan.prefer_verified_extraction)
+
+    def test_query_applies_route_and_quality_constraints(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="verified-image",
+                    source_id="incident:image:verified",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="image",
+                    text="Auth retry heatmap shows token refresh spike and timeout errors.",
+                    token_count=11,
+                    metadata={
+                        "ingestion_route": "pipeline_verified",
+                        "extraction_confidence": 0.92,
+                    },
+                ),
+                Chunk(
+                    chunk_id="stub-image",
+                    source_id="incident:image:stub",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="image_ocr_stub",
+                    text="Auth retry heatmap shows token refresh spike and timeout errors.",
+                    token_count=11,
+                    metadata={
+                        "ingestion_route": "pipeline_ocr_stub",
+                        "extraction_confidence": 0.28,
+                    },
+                ),
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry heatmap route:pipeline_verified route:!pipeline_ocr_stub quality:high",
+            top_k=3,
+            diversify=False,
+        )
+
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertEqual("verified-image", ranked[0].chunk.chunk_id)
+        self.assertTrue(all(item.chunk.chunk_id != "stub-image" for item in ranked))
+
+    def test_retrieve_evidence_relaxes_over_strict_quality_constraints(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="only-stub",
+                    source_id="incident:image:stub",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="image_ocr_stub",
+                    text="Auth retry heatmap shows token refresh spike and timeout errors.",
+                    token_count=11,
+                    metadata={
+                        "ingestion_route": "pipeline_ocr_stub",
+                        "extraction_confidence": 0.20,
+                    },
+                )
+            ]
+        )
+
+        evidence = engine.retrieve_evidence(
+            "auth retry heatmap route:pipeline_verified quality:high",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertGreaterEqual(len(evidence.ranked_chunks), 1)
+        self.assertEqual("only-stub", evidence.ranked_chunks[0].chunk.chunk_id)
+        self.assertTrue(evidence.recovery_applied)
+        self.assertEqual("quality_constraint_relaxation", evidence.retrieval_strategy)
+        self.assertTrue(any("relaxed constraints" in query for query in evidence.recovery_queries))
+
+
 if __name__ == "__main__":
     unittest.main()
