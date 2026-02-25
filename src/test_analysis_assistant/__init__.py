@@ -29,6 +29,13 @@ from .retrieval import (
     create_code_aware_engine,
     create_hybrid_engine,
 )
+from .root_cause import (
+    RootCauseAnalysis,
+    RootCauseAnalyzer,
+    RootCauseCategory,
+    RootCauseHypothesis,
+    generate_root_cause_hypotheses,
+)
 from .store import (
     AdaptiveConfidenceCalibrator,
     CorpusStats,
@@ -72,4 +79,10 @@ __all__ = [
     "CorpusStats",
     "StoredChunk",
     "create_persistent_engine",
+    # Root cause analysis exports
+    "RootCauseAnalysis",
+    "RootCauseAnalyzer",
+    "RootCauseCategory",
+    "RootCauseHypothesis",
+    "generate_root_cause_hypotheses",
 ]
