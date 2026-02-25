@@ -235,6 +235,59 @@ Missing negative authorization tests are release blocking.
         self.assertIn("confidence=", prompt)
         self.assertIn("req-1", prompt)
 
+    def test_retrieve_evidence_builds_source_bundles(self):
+        markdown = """
+# Auth Requirements
+Authentication regressions are release blocking and require triage.
+
+| risk | severity |
+| ---- | -------- |
+| auth | high     |
+
+![failure matrix](artifacts/failure-matrix.png)
+""".strip()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        ingestor.ingest_requirements_markdown("req-md-bundle", markdown)
+
+        evidence = engine.retrieve_evidence(
+            "authentication risk matrix for test gap triage",
+            top_k=6,
+            diversify=False,
+        )
+
+        self.assertGreaterEqual(len(evidence.source_bundles), 1)
+        top_bundle = evidence.source_bundles[0]
+        self.assertEqual(top_bundle.source_id, "req-md-bundle")
+        self.assertIn("text", top_bundle.modalities)
+        self.assertIn("table", top_bundle.modalities)
+        self.assertGreater(top_bundle.coverage_ratio, 0.0)
+
+    def test_prompt_includes_source_bundle_summary(self):
+        markdown = """
+# Release Risks
+Missing negative authorization tests increase release risk.
+
+| component | severity |
+| --------- | -------- |
+| auth      | high     |
+""".strip()
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        ingestor.ingest_requirements_markdown("req-md-prompt", markdown)
+
+        evidence = engine.retrieve_evidence("authorization release risk matrix", top_k=5)
+        prompt = build_analysis_prompt(
+            question="Where are the highest-risk test gaps?",
+            ranked_context=evidence.ranked_chunks,
+            source_bundles=evidence.source_bundles,
+        )
+
+        self.assertIn("Source bundle summary", prompt)
+        self.assertIn("coverage=", prompt)
+        self.assertIn("req-md-prompt", prompt)
+
     def test_build_query_plan_detects_risk_gap_intent(self):
         engine = RetrievalEngine()
         plan = engine.build_query_plan("Identify test gaps and prioritize release risks.")

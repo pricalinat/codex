@@ -370,6 +370,7 @@ class RAGAnalyzer:
         augmented_prompt = build_analysis_prompt(
             question=query_for_context or "Analyze test failures with context from retrieved documents",
             ranked_context=ranked_for_prompt,
+            source_bundles=prompt_evidence.source_bundles,
         )
         if prompt_evidence.missing_source_types or prompt_evidence.missing_modalities:
             augmented_prompt += (

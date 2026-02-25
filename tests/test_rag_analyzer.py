@@ -133,6 +133,29 @@ class TestRAGAnalyzer(unittest.TestCase):
         self.assertGreaterEqual(result.risk_assessment["retrieval_confidence"], 0.0)
         self.assertLessEqual(result.risk_assessment["retrieval_confidence"], 1.0)
 
+    def test_analyze_prompt_includes_source_bundle_summary(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_login">
+                <failure type="AssertionError">Expected True, got False</failure>
+            </testcase>
+        </testsuite>"""
+        markdown = """
+# Auth Requirements
+Missing negative authorization tests are release blocking.
+
+| risk | severity |
+| ---- | -------- |
+| auth | high     |
+""".strip()
+
+        analyzer = RAGAnalyzer()
+        analyzer.initialize_corpus(requirements_docs=[("req-md-summary", markdown)])
+
+        result = analyzer.analyze(test_report, query_for_context="auth release risk")
+
+        self.assertIn("Source bundle summary", result.augmented_prompt)
+        self.assertIn("req-md-summary", result.augmented_prompt)
+
 
 class TestRAGSeverityAssessment(unittest.TestCase):
     def test_critical_severity_detection(self):

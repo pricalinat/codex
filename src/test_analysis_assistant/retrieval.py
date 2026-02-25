@@ -64,12 +64,25 @@ class RetrievalEvidence:
     query_text: str
     query_plan: QueryPlan
     ranked_chunks: List[RankedChunk] = field(default_factory=list)
+    source_bundles: List["SourceEvidenceBundle"] = field(default_factory=list)
     covered_source_types: List[SourceType] = field(default_factory=list)
     covered_modalities: List[str] = field(default_factory=list)
     missing_source_types: List[SourceType] = field(default_factory=list)
     missing_modalities: List[str] = field(default_factory=list)
     aggregate_confidence: float = 0.0
     confidence_band: str = "low"
+
+
+@dataclass
+class SourceEvidenceBundle:
+    source_id: str
+    source_type: SourceType
+    modalities: List[str] = field(default_factory=list)
+    chunk_ids: List[str] = field(default_factory=list)
+    matched_terms: List[str] = field(default_factory=list)
+    aggregate_score: float = 0.0
+    aggregate_confidence: float = 0.0
+    coverage_ratio: float = 0.0
 
 
 @dataclass
@@ -361,6 +374,7 @@ class RetrievalEngine:
         missing_modalities = [modality for modality in plan.preferred_modalities if modality not in covered_modalities]
 
         aggregate_confidence = _aggregate_confidence(ranked)
+        source_bundles = _build_source_bundles(ranked, plan)
         if aggregate_confidence >= 0.72:
             band = "high"
         elif aggregate_confidence >= 0.45:
@@ -372,6 +386,7 @@ class RetrievalEngine:
             query_text=query_text,
             query_plan=plan,
             ranked_chunks=ranked,
+            source_bundles=source_bundles,
             covered_source_types=covered_sources,
             covered_modalities=covered_modalities,
             missing_source_types=missing_sources,
@@ -705,7 +720,11 @@ def create_code_aware_engine(
     return engine, ingestor
 
 
-def build_analysis_prompt(question: str, ranked_context: Sequence[RankedChunk]) -> str:
+def build_analysis_prompt(
+    question: str,
+    ranked_context: Sequence[RankedChunk],
+    source_bundles: Optional[Sequence[SourceEvidenceBundle]] = None,
+) -> str:
     lines = [
         "You are an AI-native test analysis assistant.",
         "Use the retrieved context to produce: failure clustering, root-cause hypotheses, test-gap analysis, risk-based prioritization, and an actionable plan.",
@@ -730,6 +749,16 @@ def build_analysis_prompt(question: str, ranked_context: Sequence[RankedChunk]) 
                 )
             )
             lines.append(f"    {snippet}")
+    if source_bundles:
+        lines.extend(["", "Source bundle summary:"])
+        for idx, bundle in enumerate(source_bundles, start=1):
+            lines.append(
+                f"[S{idx}] source={bundle.source_id} type={bundle.source_type.value} "
+                f"modalities={','.join(bundle.modalities)} "
+                f"confidence={bundle.aggregate_confidence:.2f} "
+                f"coverage={bundle.coverage_ratio:.2f} "
+                f"terms={','.join(bundle.matched_terms)}"
+            )
 
     lines.extend(
         [
@@ -1142,6 +1171,69 @@ def _aggregate_confidence(ranked: Sequence[RankedChunk]) -> float:
     if weight_sum == 0:
         return 0.0
     return round(max(0.0, min(1.0, weighted_total / weight_sum)), 4)
+
+
+def _build_source_bundles(
+    ranked: Sequence[RankedChunk],
+    plan: QueryPlan,
+    max_bundles: int = 6,
+) -> List[SourceEvidenceBundle]:
+    if not ranked:
+        return []
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    query_tokens = set(plan.tokens)
+    for item in ranked:
+        key = item.chunk.source_id
+        entry = grouped.setdefault(
+            key,
+            {
+                "source_type": item.chunk.source_type,
+                "modalities": set(),
+                "chunk_ids": [],
+                "matched_terms": set(),
+                "score_weighted": 0.0,
+                "confidence_weighted": 0.0,
+                "weight_sum": 0.0,
+            },
+        )
+        entry["modalities"].add(item.chunk.modality)
+        entry["matched_terms"].update(item.matched_terms)
+        entry["chunk_ids"].append(item.chunk.chunk_id)
+
+        # Earlier ranked chunks contribute more strongly to source confidence.
+        weight = 1.0 / (1.0 + len(entry["chunk_ids"]) * 0.6)
+        entry["score_weighted"] += item.score * weight
+        entry["confidence_weighted"] += item.confidence * weight
+        entry["weight_sum"] += weight
+
+    bundles: List[SourceEvidenceBundle] = []
+    for source_id, entry in grouped.items():
+        weight_sum = entry["weight_sum"] if entry["weight_sum"] > 0 else 1.0
+        matched_terms = sorted(entry["matched_terms"])
+        coverage_ratio = len(set(matched_terms).intersection(query_tokens)) / max(len(query_tokens), 1)
+        bundles.append(
+            SourceEvidenceBundle(
+                source_id=source_id,
+                source_type=entry["source_type"],
+                modalities=sorted(entry["modalities"]),
+                chunk_ids=entry["chunk_ids"][:4],
+                matched_terms=matched_terms,
+                aggregate_score=round(entry["score_weighted"] / weight_sum, 4),
+                aggregate_confidence=round(entry["confidence_weighted"] / weight_sum, 4),
+                coverage_ratio=round(coverage_ratio, 4),
+            )
+        )
+
+    bundles.sort(
+        key=lambda b: (
+            -b.aggregate_confidence,
+            -b.coverage_ratio,
+            -len(b.modalities),
+            b.source_id,
+        )
+    )
+    return bundles[: max(1, max_bundles)]
 
 
 def _dedupe(items: Sequence[Any]) -> List[Any]:
