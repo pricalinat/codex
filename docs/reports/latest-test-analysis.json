@@ -1,0 +1,61 @@
+{
+  "command": "python3 -m unittest -v",
+  "generated_at_utc": "2026-02-25T09:05:31.741137+00:00",
+  "overall_status": "pass",
+  "exit_code": 0,
+  "total_tests": 36,
+  "passed": 36,
+  "failed": 0,
+  "errors": 0,
+  "duration_seconds": 0.022,
+  "module_breakdown": {
+    "agents": {
+      "total": 3,
+      "pass": 3,
+      "fail": 0,
+      "error": 0
+    },
+    "e2e": {
+      "total": 3,
+      "pass": 3,
+      "fail": 0,
+      "error": 0
+    },
+    "orchestrator": {
+      "total": 3,
+      "pass": 3,
+      "fail": 0,
+      "error": 0
+    },
+    "paper_retrieval": {
+      "total": 19,
+      "pass": 19,
+      "fail": 0,
+      "error": 0
+    },
+    "store": {
+      "total": 2,
+      "pass": 2,
+      "fail": 0,
+      "error": 0
+    },
+    "other": {
+      "total": 6,
+      "pass": 6,
+      "fail": 0,
+      "error": 0
+    }
+  },
+  "failures": [],
+  "actions": [
+    {
+      "priority": "P2",
+      "title": "Preserve current green baseline",
+      "rationale": "All tests passed; keep regression signal stable.",
+      "command": "python3 -m unittest -v"
+    }
+  ],
+  "residual_risks": [],
+  "risk_score": 0,
+  "trend_summary": "baseline report created"
+}

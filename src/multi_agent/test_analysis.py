@@ -1,7 +1,8 @@
 import re
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 TEST_RESULT_RE = re.compile(
@@ -58,6 +59,8 @@ class TestAnalysisReport:
     failures: List[FailureDetail] = field(default_factory=list)
     actions: List[ActionItem] = field(default_factory=list)
     residual_risks: List[str] = field(default_factory=list)
+    risk_score: int = 0
+    trend_summary: Optional[str] = None
 
     @property
     def pass_rate(self) -> float:
@@ -80,9 +83,16 @@ class TestAnalysisReport:
             f"- `errors`: `{self.errors}`",
             f"- `pass_rate`: `{self.pass_rate:.2%}`",
             f"- `duration_seconds`: `{self.duration_seconds:.3f}`",
-            "",
-            "## 2. Module Breakdown",
+            f"- `risk_score` (0-100): `{self.risk_score}`",
         ]
+        if self.trend_summary:
+            lines.append(f"- `trend`: {self.trend_summary}")
+        lines.extend(
+            [
+                "",
+                "## 2. Module Breakdown",
+            ]
+        )
         for module, stats in sorted(self.module_breakdown.items()):
             lines.append(
                 f"- `{module}`: total={stats['total']}, pass={stats['pass']}, fail={stats['fail']}, error={stats['error']}"
@@ -114,6 +124,9 @@ class TestAnalysisReport:
                 lines.append(f"- {risk}")
 
         return "\n".join(lines) + "\n"
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
 
 
 def analyze_unittest_output(command: str, output: str, exit_code: int) -> TestAnalysisReport:
@@ -197,6 +210,7 @@ def analyze_unittest_output(command: str, output: str, exit_code: int) -> TestAn
     overall_status = "pass" if exit_code == 0 and failed == 0 and errors == 0 else "fail"
     actions = _build_action_items(overall_status, failures)
     residual_risks = _build_residual_risks(overall_status, module_breakdown)
+    risk_score = _build_risk_score(passed, failed, errors, total_tests)
 
     return TestAnalysisReport(
         command=command,
@@ -212,6 +226,24 @@ def analyze_unittest_output(command: str, output: str, exit_code: int) -> TestAn
         failures=failures,
         actions=actions,
         residual_risks=residual_risks,
+        risk_score=risk_score,
+    )
+
+
+def summarize_trend(current: TestAnalysisReport, previous: Optional[Dict[str, object]]) -> str:
+    if not previous:
+        return "baseline report created"
+
+    prev_total = int(previous.get("total_tests", 0))
+    prev_failed = int(previous.get("failed", 0))
+    prev_errors = int(previous.get("errors", 0))
+    prev_risk = int(previous.get("risk_score", 0))
+
+    return (
+        f"tests {current.total_tests - prev_total:+d}, "
+        f"failed {current.failed - prev_failed:+d}, "
+        f"errors {current.errors - prev_errors:+d}, "
+        f"risk {current.risk_score - prev_risk:+d}"
     )
 
 
@@ -325,3 +357,11 @@ def _build_residual_risks(overall_status: str, module_breakdown: Dict[str, Dict[
     if module_breakdown.get("e2e", {}).get("total", 0) == 0:
         risks.append("No e2e tests detected in current run; integration regressions may remain hidden.")
     return risks
+
+
+def _build_risk_score(passed: int, failed: int, errors: int, total: int) -> int:
+    if total <= 0:
+        return 100
+    raw = (failed * 12) + (errors * 20)
+    pass_penalty = int((1.0 - (float(passed) / float(total))) * 40.0)
+    return max(0, min(100, raw + pass_penalty))

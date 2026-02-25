@@ -1,6 +1,6 @@
 import unittest
 
-from src.multi_agent.test_analysis import analyze_unittest_output
+from src.multi_agent.test_analysis import analyze_unittest_output, summarize_trend
 
 
 PASS_OUTPUT = """\
@@ -69,6 +69,7 @@ class TestTestAnalysis(unittest.TestCase):
         self.assertAlmostEqual(report.duration_seconds, 0.012, places=3)
         self.assertIn("paper_retrieval", report.module_breakdown)
         self.assertEqual(report.module_breakdown["paper_retrieval"]["pass"], 1)
+        self.assertEqual(report.risk_score, 0)
 
     def test_analyze_fail_output(self):
         report = analyze_unittest_output("python3 -m unittest -v", FAIL_OUTPUT, exit_code=1)
@@ -83,6 +84,7 @@ class TestTestAnalysis(unittest.TestCase):
 
         action_titles = [item.title for item in report.actions]
         self.assertIn("Fix blocking test failures", action_titles)
+        self.assertGreater(report.risk_score, 0)
 
     def test_markdown_report_contains_expected_sections(self):
         report = analyze_unittest_output("python3 -m unittest -v", FAIL_OUTPUT, exit_code=1)
@@ -98,6 +100,21 @@ class TestTestAnalysis(unittest.TestCase):
         self.assertEqual(report.total_tests, 3)
         self.assertEqual(report.passed, 2)
         self.assertEqual(report.failed, 1)
+
+    def test_trend_summary_from_previous_report(self):
+        current = analyze_unittest_output("python3 -m unittest -v", FAIL_OUTPUT, exit_code=1)
+        prev = {"total_tests": 5, "failed": 0, "errors": 0, "risk_score": 0}
+        trend = summarize_trend(current, prev)
+        self.assertIn("tests -2", trend)
+        self.assertIn("failed +1", trend)
+        self.assertIn("errors +1", trend)
+
+    def test_to_dict_has_core_fields(self):
+        report = analyze_unittest_output("python3 -m unittest -v", PASS_OUTPUT, exit_code=0)
+        payload = report.to_dict()
+        self.assertIn("overall_status", payload)
+        self.assertIn("risk_score", payload)
+        self.assertEqual(payload["total_tests"], 4)
 
 
 if __name__ == "__main__":
