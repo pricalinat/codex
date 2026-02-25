@@ -263,6 +263,30 @@ class RetrievalEngine:
             metadata = dict(chunk.metadata or {})
             metadata.setdefault("ingestion_route", "prechunked")
             metadata.setdefault("source_id", chunk.source_id)
+            # Normalize metadata-provided references and augment with inline
+            # citation/path signals so prechunked ingestion keeps graph quality.
+            metadata_refs = _extract_record_reference_metadata(payload=None, metadata=metadata)
+            if metadata_refs.get("linked_source_id"):
+                metadata["linked_source_id"] = metadata_refs["linked_source_id"]
+            if metadata_refs.get("referenced_source_ids"):
+                metadata["referenced_source_ids"] = _dedupe(
+                    _coerce_str_list(metadata.get("referenced_source_ids"))
+                    + _coerce_str_list(metadata_refs.get("referenced_source_ids"))
+                )
+            if metadata_refs.get("referenced_paths"):
+                metadata["referenced_paths"] = _dedupe(
+                    _coerce_str_list(metadata.get("referenced_paths"))
+                    + _coerce_str_list(metadata_refs.get("referenced_paths"))
+                )
+            reference_signals = _extract_reference_signals(text)
+            if reference_signals["source_ids"]:
+                metadata["referenced_source_ids"] = _dedupe(
+                    _coerce_str_list(metadata.get("referenced_source_ids")) + reference_signals["source_ids"]
+                )
+            if reference_signals["paths"]:
+                metadata["referenced_paths"] = _dedupe(
+                    _coerce_str_list(metadata.get("referenced_paths")) + reference_signals["paths"]
+                )
             token_count = int(chunk.token_count) if int(chunk.token_count or 0) > 0 else len(_tokenize(text))
             normalized.append(
                 Chunk(

@@ -100,6 +100,56 @@ class TestRetrievalPipeline(unittest.TestCase):
             ranked[1].score_breakdown.get("reliability", 0.0),
         )
 
+    def test_ingest_prechunked_extracts_reference_signals_for_citation_graph_scoring(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="req-auth",
+                    source_id="req-auth",
+                    source_type=SourceType.REQUIREMENTS,
+                    modality="text",
+                    text="Auth requirements require retry mitigation and release checks.",
+                    token_count=9,
+                    metadata={},
+                ),
+                Chunk(
+                    chunk_id="repo-auth-token",
+                    source_id="repo:src/auth/token.py",
+                    source_type=SourceType.REPOSITORY,
+                    modality="code",
+                    text="def refresh_token(token): return token.strip()",
+                    token_count=7,
+                    metadata={"path": "src/auth/token.py"},
+                ),
+                Chunk(
+                    chunk_id="pipeline-incident",
+                    source_id="pipeline:incident-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text=(
+                        "Auth retry incident references source:req-auth and "
+                        "path:src/auth/token.py for root-cause trace."
+                    ),
+                    token_count=14,
+                    metadata={"ingestion_route": "pipeline_detected"},
+                ),
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry root cause trace requirements token path",
+            top_k=3,
+            diversify=False,
+        )
+
+        by_source = {item.chunk.source_id: item for item in ranked}
+        self.assertIn("pipeline:incident-auth", by_source)
+        incident = by_source["pipeline:incident-auth"]
+        self.assertIn("req-auth", incident.chunk.metadata.get("referenced_source_ids", []))
+        self.assertIn("src/auth/token.py", incident.chunk.metadata.get("referenced_paths", []))
+        self.assertGreater(incident.score_breakdown.get("citation_graph", 0.0), 0.0)
+
     def test_build_query_plan_extracts_structural_targets(self):
         engine = RetrievalEngine()
 
