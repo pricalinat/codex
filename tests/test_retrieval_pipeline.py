@@ -1195,6 +1195,68 @@ class TestHybridRetrievalEngine(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(len(ranked), 2)
 
+    def test_artifact_bundle_respects_per_unit_extraction_confidence(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_artifact_bundle(
+            ArtifactBundle(
+                source_id="analysis:confidence-weights",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                text="Auth failures spike during token refresh.",
+                tables=[
+                    {
+                        "rows": [{"component": "auth", "risk": "high"}],
+                        "extraction_confidence": 0.31,
+                    }
+                ],
+                images=[
+                    {
+                        "ocr_text": "auth retry heatmap",
+                        "extraction_confidence": 0.22,
+                    }
+                ],
+                metadata={"text_extraction_confidence": 0.93},
+            )
+        )
+
+        self.assertGreaterEqual(len(chunks), 3)
+        table_chunk = next(item for item in chunks if item.modality == "table")
+        image_chunk = next(item for item in chunks if item.modality == "image")
+        text_chunk = next(item for item in chunks if item.modality == "text")
+
+        self.assertAlmostEqual(table_chunk.metadata["extraction_confidence"], 0.31, places=4)
+        self.assertAlmostEqual(image_chunk.metadata["extraction_confidence"], 0.22, places=4)
+        self.assertAlmostEqual(text_chunk.metadata["extraction_confidence"], 0.93, places=4)
+
+    def test_retrieve_evidence_reports_extraction_reliability_factor(self):
+        docs = [
+            IngestDocument(
+                source_id="sys-ocr-stub",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content={"image_path": "screens/auth.png"},
+                modality="image",
+            ),
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication failures require risk triage and mitigation.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "authentication risk triage with image heatmap evidence",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("extraction_reliability", evidence.confidence_factors)
+        self.assertLess(evidence.confidence_factors["extraction_reliability"], 0.9)
+
 
 if __name__ == "__main__":
     unittest.main()

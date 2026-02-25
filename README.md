@@ -55,10 +55,12 @@ It now also includes a retrieval foundation for AI-native analysis:
 - mixed-modality normalization (`text`, `table`, `image` with OCR stub fallback)
 - `MultiSourceIngestor` helper for repository crawling and markdown requirements ingestion (table/image extraction stubs)
 - `ArtifactBundle` ingestion API for OCR/extraction pipeline outputs (single payload with text/tables/images + provenance metadata)
+- payload-driven extraction confidence overrides per unit (`text`/`table`/`image`) for degraded-but-usable OCR/extraction stubs
 - intent-aware query planning for test-gap/risk/root-cause workflows
 - explainable ranking with score breakdown (`lexical`, `source`, `intent`, `modality`, `extraction`)
 - diversity-aware final ranking to improve cross-source evidence coverage
 - deterministic chunking, ranking, and confidence scoring with extraction-quality weighting
+- retrieval confidence factors include `extraction_reliability` for multimodal evidence quality calibration
 - prompt builder that emits citation-ready context blocks
 
 ### Quick Start

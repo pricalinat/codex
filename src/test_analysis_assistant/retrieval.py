@@ -1012,20 +1012,32 @@ def build_analysis_prompt_from_evidence(question: str, evidence: RetrievalEviden
 
 def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
     if doc.modality == "compound":
-        return _extract_compound_units(doc.content)
+        return _extract_compound_units(doc.content, doc.metadata)
     if doc.modality == "markdown_mixed" and isinstance(doc.content, str):
         return _extract_markdown_mixed_units(doc.content)
     if doc.modality == "table":
+        extraction_confidence = _resolve_extraction_confidence(
+            payload=doc.content,
+            modality="table",
+            default=0.85,
+            metadata=doc.metadata,
+        )
         return [
             ExtractedUnit(
                 text=_table_to_text(doc.content),
                 modality="table",
-                extraction_confidence=0.85,
+                extraction_confidence=extraction_confidence,
             )
         ]
     if doc.modality == "image":
         image_text = _image_to_ocr_stub(doc.content)
-        extraction_confidence = 0.25 if image_text.startswith("[OCR_STUB]") else 0.65
+        fallback = 0.25 if image_text.startswith("[OCR_STUB]") else 0.65
+        extraction_confidence = _resolve_extraction_confidence(
+            payload=doc.content,
+            modality="image",
+            default=fallback,
+            metadata=doc.metadata,
+        )
         return [
             ExtractedUnit(
                 text=image_text,
@@ -1034,7 +1046,13 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
             )
         ]
     if isinstance(doc.content, str):
-        return [ExtractedUnit(text=doc.content, modality="text", extraction_confidence=1.0)]
+        extraction_confidence = _resolve_extraction_confidence(
+            payload=doc.content,
+            modality="text",
+            default=1.0,
+            metadata=doc.metadata,
+        )
+        return [ExtractedUnit(text=doc.content, modality="text", extraction_confidence=extraction_confidence)]
     if isinstance(doc.content, dict):
         return [
             ExtractedUnit(
@@ -1054,7 +1072,10 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
     return [ExtractedUnit(text=str(doc.content), modality=doc.modality or "text", extraction_confidence=0.8)]
 
 
-def _extract_compound_units(content: Any) -> List[ExtractedUnit]:
+def _extract_compound_units(
+    content: Any,
+    document_metadata: Optional[Dict[str, Any]] = None,
+) -> List[ExtractedUnit]:
     if not isinstance(content, dict):
         return [
             ExtractedUnit(
@@ -1074,11 +1095,17 @@ def _extract_compound_units(content: Any) -> List[ExtractedUnit]:
             text_parts.append(value.strip())
 
     if text_parts:
+        text_payload = {"text": "\n\n".join(text_parts)}
         units.append(
             ExtractedUnit(
-                text="\n\n".join(text_parts),
+                text=text_payload["text"],
                 modality="text",
-                extraction_confidence=0.94,
+                extraction_confidence=_resolve_extraction_confidence(
+                    payload=text_payload,
+                    modality="text",
+                    default=0.94,
+                    metadata=document_metadata,
+                ),
                 metadata={"unit_kind": "text"},
             )
         )
@@ -1096,7 +1123,12 @@ def _extract_compound_units(content: Any) -> List[ExtractedUnit]:
             ExtractedUnit(
                 text=_table_to_text(table_payload),
                 modality="table",
-                extraction_confidence=0.84,
+                extraction_confidence=_resolve_extraction_confidence(
+                    payload=table_payload,
+                    modality="table",
+                    default=0.84,
+                    metadata=document_metadata,
+                ),
                 metadata={"unit_kind": "table", "table_index": table_idx},
             )
         )
@@ -1120,6 +1152,12 @@ def _extract_compound_units(content: Any) -> List[ExtractedUnit]:
         if isinstance(normalized_payload, dict):
             image_path = normalized_payload.get("image_path")
             alt_text = str(normalized_payload.get("alt_text", "")).strip()
+        extraction_confidence = _resolve_extraction_confidence(
+            payload=normalized_payload,
+            modality="image",
+            default=extraction_confidence,
+            metadata=document_metadata,
+        )
         units.append(
             ExtractedUnit(
                 text=image_text,
@@ -1170,6 +1208,45 @@ def _image_to_ocr_stub(content: Any) -> str:
             return f"[OCR_STUB] no OCR pipeline connected for {image_path}. alt_text: {alt_text}"
         return f"[OCR_STUB] no OCR pipeline connected for {image_path}."
     return "[OCR_STUB] image payload provided without OCR text."
+
+
+def _resolve_extraction_confidence(
+    payload: Any,
+    modality: str,
+    default: float,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> float:
+    candidates: List[Any] = []
+    modality = (modality or "").strip().lower()
+    if isinstance(payload, dict):
+        modality_keys = {
+            "text": ["text_extraction_confidence", "text_confidence"],
+            "table": ["table_extraction_confidence", "table_confidence"],
+            "image": ["image_extraction_confidence", "image_confidence", "ocr_confidence"],
+        }
+        for key in modality_keys.get(modality, []):
+            candidates.append(payload.get(key))
+        candidates.append(payload.get("extraction_confidence"))
+        candidates.append(payload.get("confidence"))
+
+    if isinstance(metadata, dict):
+        meta_keys = [
+            f"{modality}_extraction_confidence",
+            f"{modality}_confidence",
+            "default_extraction_confidence",
+            "extraction_confidence",
+        ]
+        for key in meta_keys:
+            candidates.append(metadata.get(key))
+
+    for value in candidates:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        return max(0.0, min(1.0, numeric))
+
+    return max(0.0, min(1.0, float(default)))
 
 
 def _chunk_text(text: str, size: int, overlap: int) -> Iterable[str]:
@@ -1674,11 +1751,13 @@ def _calibrate_retrieval_confidence(
         low_signal_ratio = low_conf_count / len(ranked)
         cross_source_consensus = _cross_source_consensus(ranked)
         source_concentration = _source_concentration(ranked)
+        extraction_reliability = sum(_extraction_quality(item.chunk) for item in ranked) / len(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
         cross_source_consensus = 0.0
         source_concentration = 0.0
+        extraction_reliability = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -1689,11 +1768,12 @@ def _calibrate_retrieval_confidence(
 
     coverage_multiplier = (0.56 + (0.24 * source_coverage) + (0.20 * modality_coverage))
     consensus_multiplier = 0.96 + (0.04 * cross_source_consensus)
+    extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio)
     availability_penalty = 0.08 * unavailable_pressure
     concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
 
-    calibrated = aggregate_confidence * coverage_multiplier * consensus_multiplier
+    calibrated = aggregate_confidence * coverage_multiplier * consensus_multiplier * extraction_multiplier
     calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty - concentration_penalty)
     calibrated = max(0.0, min(1.0, calibrated))
 
@@ -1705,6 +1785,7 @@ def _calibrate_retrieval_confidence(
         "unavailable_pressure": round(unavailable_pressure, 4),
         "cross_source_consensus": round(max(0.0, min(1.0, cross_source_consensus)), 4),
         "source_concentration": round(max(0.0, min(1.0, source_concentration)), 4),
+        "extraction_reliability": round(max(0.0, min(1.0, extraction_reliability)), 4),
     }
     return round(calibrated, 4), factors
 
