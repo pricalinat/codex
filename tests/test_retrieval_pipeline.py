@@ -1312,6 +1312,54 @@ class TestHybridRetrievalEngine(unittest.TestCase):
 
         self.assertIn("reliability=", prompt)
 
+    def test_retrieve_evidence_recommends_ingestion_actions_when_preferred_coverage_missing(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication risk is release blocking and needs mitigation planning.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table root cause traceback evidence for authentication failures",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertGreaterEqual(len(evidence.recommended_ingestion_actions), 1)
+        actions_text = "\n".join(evidence.recommended_ingestion_actions).lower()
+        self.assertIn("ocr", actions_text)
+        self.assertIn("table", actions_text)
+        self.assertIn("system analysis", actions_text)
+
+    def test_prompt_from_evidence_includes_recommended_ingestion_actions(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication risk is release blocking and needs mitigation planning.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table root cause traceback evidence for authentication failures",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+        prompt = build_analysis_prompt_from_evidence("Summarize auth risk", evidence)
+
+        self.assertIn("Recommended ingestion actions", prompt)
+        self.assertIn("ocr", prompt.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

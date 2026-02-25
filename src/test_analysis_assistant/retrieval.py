@@ -61,6 +61,14 @@ class QueryPlan:
 
 
 @dataclass
+class CorpusCoverageProfile:
+    source_type_counts: Dict[SourceType, int] = field(default_factory=dict)
+    modality_counts: Dict[str, int] = field(default_factory=dict)
+    source_type_modalities: Dict[SourceType, List[str]] = field(default_factory=dict)
+    source_type_avg_extraction: Dict[SourceType, float] = field(default_factory=dict)
+
+
+@dataclass
 class RetrievalEvidence:
     query_text: str
     query_plan: QueryPlan
@@ -81,6 +89,8 @@ class RetrievalEvidence:
     retrieval_strategy: str = "baseline"
     recovery_applied: bool = False
     recovery_queries: List[str] = field(default_factory=list)
+    corpus_profile: CorpusCoverageProfile = field(default_factory=CorpusCoverageProfile)
+    recommended_ingestion_actions: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -151,6 +161,34 @@ class RetrievalEngine:
 
         self._chunks.extend(chunked)
         return chunked
+
+    def build_corpus_profile(self) -> CorpusCoverageProfile:
+        source_type_counts: Dict[SourceType, int] = {}
+        modality_counts: Dict[str, int] = {}
+        source_modalities: Dict[SourceType, set] = {}
+        extraction_totals: Dict[SourceType, float] = {}
+        extraction_counts: Dict[SourceType, int] = {}
+
+        for chunk in self._chunks:
+            source_type_counts[chunk.source_type] = source_type_counts.get(chunk.source_type, 0) + 1
+            modality_counts[chunk.modality] = modality_counts.get(chunk.modality, 0) + 1
+            source_modalities.setdefault(chunk.source_type, set()).add(chunk.modality)
+
+            extraction = float(chunk.metadata.get("extraction_confidence", 1.0))
+            extraction_totals[chunk.source_type] = extraction_totals.get(chunk.source_type, 0.0) + extraction
+            extraction_counts[chunk.source_type] = extraction_counts.get(chunk.source_type, 0) + 1
+
+        source_type_avg_extraction: Dict[SourceType, float] = {}
+        for source_type, count in extraction_counts.items():
+            denom = max(1, count)
+            source_type_avg_extraction[source_type] = round(extraction_totals.get(source_type, 0.0) / denom, 4)
+
+        return CorpusCoverageProfile(
+            source_type_counts=source_type_counts,
+            modality_counts=modality_counts,
+            source_type_modalities={k: sorted(v) for k, v in source_modalities.items()},
+            source_type_avg_extraction=source_type_avg_extraction,
+        )
 
     def build_query_plan(self, query_text: str) -> QueryPlan:
         tokens = sorted(set(_tokenize(query_text)))
@@ -404,6 +442,7 @@ class RetrievalEngine:
         adaptive_recovery: bool = True,
     ) -> RetrievalEvidence:
         plan = self.build_query_plan(query_text)
+        corpus_profile = self.build_corpus_profile()
         requested_top_k = max(1, top_k)
         candidate_top_k = requested_top_k
         if len(self._chunks) > requested_top_k:
@@ -419,8 +458,8 @@ class RetrievalEngine:
             top_k=requested_top_k,
             diversify=diversify,
         )
-        corpus_available_sources = _dedupe([item.source_type for item in self._chunks])
-        corpus_available_modalities = _dedupe([item.modality for item in self._chunks])
+        corpus_available_sources = _dedupe(list(corpus_profile.source_type_counts.keys()))
+        corpus_available_modalities = _dedupe(list(corpus_profile.modality_counts.keys()))
         covered_sources = _dedupe([item.chunk.source_type for item in ranked])
         covered_modalities = _dedupe([item.chunk.modality for item in ranked])
         missing_sources = [stype for stype in plan.preferred_source_types if stype not in covered_sources]
@@ -503,6 +542,14 @@ class RetrievalEngine:
             band = "medium"
         else:
             band = "low"
+        recommended_ingestion_actions = _recommend_ingestion_actions(
+            plan=plan,
+            corpus_profile=corpus_profile,
+            missing_sources=missing_sources,
+            missing_modalities=missing_modalities,
+            unavailable_sources=unavailable_sources,
+            unavailable_modalities=unavailable_modalities,
+        )
 
         return RetrievalEvidence(
             query_text=query_text,
@@ -524,6 +571,8 @@ class RetrievalEngine:
             retrieval_strategy=retrieval_strategy,
             recovery_applied=recovery_applied,
             recovery_queries=recovery_queries,
+            corpus_profile=corpus_profile,
+            recommended_ingestion_actions=recommended_ingestion_actions,
         )
 
     def _expand_query_variants(self, query_text: str, max_variants: int = 4) -> List[Tuple[str, float]]:
@@ -1010,6 +1059,10 @@ def build_analysis_prompt_from_evidence(question: str, evidence: RetrievalEviden
             f"source_types={[item.value for item in evidence.unavailable_preferred_source_types]} "
             f"modalities={evidence.unavailable_preferred_modalities}"
         )
+    if evidence.recommended_ingestion_actions:
+        lines.append("Recommended ingestion actions:")
+        for action in evidence.recommended_ingestion_actions:
+            lines.append(f"- {action}")
 
     return prompt + "\n" + "\n".join(lines)
 
@@ -1943,6 +1996,74 @@ def _build_recovery_queries(
         seen.add(query)
         deduped.append(query)
         if len(deduped) >= max(1, max_queries):
+            break
+    return deduped
+
+
+def _recommend_ingestion_actions(
+    plan: QueryPlan,
+    corpus_profile: CorpusCoverageProfile,
+    missing_sources: Sequence[SourceType],
+    missing_modalities: Sequence[str],
+    unavailable_sources: Sequence[SourceType],
+    unavailable_modalities: Sequence[str],
+    max_actions: int = 5,
+) -> List[str]:
+    actions: List[str] = []
+
+    if "table" in unavailable_modalities:
+        actions.append(
+            "Add tabular artifacts (CSV/TSV/markdown tables) from incident reports or requirements to improve risk matrix evidence."
+        )
+    if "image" in unavailable_modalities or "image_ocr_stub" in unavailable_modalities:
+        actions.append(
+            "Connect OCR extraction for screenshots/diagrams and ingest image metadata (path, alt text, OCR confidence)."
+        )
+
+    source_prompts = {
+        SourceType.REPOSITORY: "Ingest targeted repository modules covering failing call paths and traceback locations.",
+        SourceType.SYSTEM_ANALYSIS: "Ingest system analysis docs (architecture, telemetry notes, incident diagnostics) for root-cause context.",
+        SourceType.CODE_SNIPPET: "Add focused code snippets around failing functions to improve precise root-cause hypotheses.",
+        SourceType.REQUIREMENTS: "Ingest requirement and acceptance-criteria docs for stronger test-gap and priority mapping.",
+        SourceType.KNOWLEDGE: "Ingest background knowledge (runbooks, prior incidents) for mitigation pattern retrieval.",
+    }
+    for source in unavailable_sources[:3]:
+        suggestion = source_prompts.get(source)
+        if suggestion:
+            actions.append(suggestion)
+
+    low_quality_sources = sorted(
+        (
+            source_type
+            for source_type, avg in corpus_profile.source_type_avg_extraction.items()
+            if avg < 0.5 and source_type in plan.preferred_source_types
+        ),
+        key=lambda stype: corpus_profile.source_type_avg_extraction.get(stype, 1.0),
+    )
+    if low_quality_sources:
+        source_names = ", ".join(source.value for source in low_quality_sources[:2])
+        actions.append(
+            f"Improve extraction quality for {source_names} (higher OCR/table parser confidence and better metadata provenance)."
+        )
+
+    if missing_modalities and not unavailable_modalities:
+        actions.append(
+            "Tune retrieval weights/query expansion for under-retrieved modalities already present in the corpus."
+        )
+    if missing_sources and not unavailable_sources:
+        actions.append(
+            "Tune retrieval diversification to surface existing but under-selected source types for this intent."
+        )
+
+    deduped: List[str] = []
+    seen = set()
+    for action in actions:
+        key = action.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(action)
+        if len(deduped) >= max(1, max_actions):
             break
     return deduped
 
