@@ -1987,6 +1987,15 @@ class EmbeddingProvider:
         """
         raise NotImplementedError
 
+    def prepare_corpus(self, texts: List[str]) -> List[List[float]]:
+        """Fit any corpus-specific state and return corpus embeddings."""
+        return self.encode(texts)
+
+    def encode_query(self, text: str) -> List[float]:
+        """Encode query text in the same vector space as corpus embeddings."""
+        vectors = self.encode([text])
+        return vectors[0] if vectors else []
+
 
 class DummyEmbeddingProvider(EmbeddingProvider):
     """Fallback provider that uses word frequency as pseudo-embeddings."""
@@ -2037,8 +2046,10 @@ class TFIDFEmbeddingProvider(EmbeddingProvider):
         if not texts:
             return []
 
-        # Build vocabulary and compute IDF
-        self._build_vocabulary(texts)
+        # Preserve backwards compatibility for corpus encoding while avoiding
+        # accidental vocabulary resets for single query encodes.
+        if len(texts) > 1 or not self._vocabulary:
+            return self.prepare_corpus(texts)
 
         # Encode each text
         vectors: List[List[float]] = []
@@ -2046,6 +2057,20 @@ class TFIDFEmbeddingProvider(EmbeddingProvider):
             vectors.append(self._text_to_vector(text))
 
         return vectors
+
+    def prepare_corpus(self, texts: List[str]) -> List[List[float]]:
+        """Fit vocabulary/IDF on corpus texts and return corpus vectors."""
+        if not texts:
+            return []
+        self._build_vocabulary(texts)
+        return [self._text_to_vector(text) for text in texts]
+
+    def encode_query(self, text: str) -> List[float]:
+        """Encode a query using the fitted vocabulary if available."""
+        if not self._vocabulary:
+            vectors = self.prepare_corpus([text])
+            return vectors[0] if vectors else []
+        return self._text_to_vector(text)
 
     def _build_vocabulary(self, texts: List[str]) -> None:
         """Build vocabulary from texts and compute IDF scores."""
@@ -2144,9 +2169,9 @@ class HybridRetrievalEngine(RetrievalEngine):
         """Compute embeddings for all chunks."""
         if not self._chunks:
             return
-        texts = [chunk.text for chunk in self._chunks]
+        texts = [_embedding_projection_text(chunk) for chunk in self._chunks]
         try:
-            embeddings = self._embedding_provider.encode(texts)
+            embeddings = self._embedding_provider.prepare_corpus(texts)
             for chunk, embedding in zip(self._chunks, embeddings):
                 self._chunk_embeddings[chunk.chunk_id] = embedding
         except Exception:
@@ -2187,7 +2212,7 @@ class HybridRetrievalEngine(RetrievalEngine):
         semantic_scores: Dict[str, float] = {}
         if use_hybrid and self._chunk_embeddings:
             try:
-                query_embedding = self._embedding_provider.encode([query_text])[0]
+                query_embedding = self._embedding_provider.encode_query(query_text)
                 for chunk in self._chunks:
                     chunk_emb = self._chunk_embeddings.get(chunk.chunk_id)
                     if chunk_emb:
@@ -2343,3 +2368,25 @@ def create_hybrid_engine(
         embedding_provider=embedding_provider,
         lexical_weight=lexical_weight,
     )
+
+
+def _embedding_projection_text(chunk: Chunk) -> str:
+    """Create a semantically useful text projection for embedding models."""
+    text = chunk.text
+    if chunk.modality == "image_ocr_stub":
+        text = text.replace("[OCR_STUB]", " ")
+        text = text.replace("no OCR pipeline connected for", " ")
+        text = text.replace("alt_text:", " ")
+
+    descriptors = [
+        f"modality {chunk.modality}",
+        f"source_type {chunk.source_type.value}",
+    ]
+    unit_kind = chunk.metadata.get("unit_kind")
+    if unit_kind:
+        descriptors.append(f"unit_kind {unit_kind}")
+    path = chunk.metadata.get("path") or chunk.metadata.get("origin_path")
+    if path:
+        descriptors.append(f"path {path}")
+
+    return " ".join(descriptors + [text]).strip()

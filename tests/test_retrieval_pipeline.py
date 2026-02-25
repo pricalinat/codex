@@ -967,6 +967,22 @@ class TestTFIDFEmbeddingProvider(unittest.TestCase):
         self.assertNotIn("uniqueword1", provider._vocabulary)
         self.assertNotIn("uniqueword2", provider._vocabulary)
 
+    def test_tfidf_query_encoding_reuses_fitted_vocabulary(self):
+        provider = TFIDFEmbeddingProvider()
+        provider.encode(
+            [
+                "authentication failure causes release blocking",
+                "authorization tests missing negative cases",
+            ]
+        )
+        fitted_vocab = dict(provider._vocabulary)
+        fitted_size = len(fitted_vocab)
+
+        query_vec = provider.encode(["authentication failure"])[0]
+
+        self.assertEqual(len(query_vec), fitted_size)
+        self.assertEqual(provider._vocabulary, fitted_vocab)
+
 
 class TestHybridRetrievalEngine(unittest.TestCase):
     def test_hybrid_engine_with_tfidf(self):
@@ -1093,6 +1109,30 @@ class TestHybridRetrievalEngine(unittest.TestCase):
         self.assertEqual(len(ranked), 2)
         source_types = {item.chunk.source_type for item in ranked}
         self.assertIn(SourceType.SYSTEM_ANALYSIS, source_types)
+
+    def test_hybrid_query_does_not_rebuild_tfidf_vocabulary(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication failures are release blocking and require mitigation.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Incident diagnostics show token refresh failures under load.",
+            ),
+        ]
+        provider = TFIDFEmbeddingProvider()
+        engine = create_hybrid_engine(embedding_provider=provider, lexical_weight=0.35)
+        engine.ingest_documents(docs)
+        before = dict(provider._vocabulary)
+
+        ranked = engine.query("authentication token refresh failure mitigation", top_k=2, use_hybrid=True)
+        after = dict(provider._vocabulary)
+
+        self.assertEqual(before, after)
+        self.assertEqual(len(ranked), 2)
 
 
 if __name__ == "__main__":
