@@ -28,6 +28,14 @@ from .content_detector import (
     detect_content_type,
     suggest_ingestion_strategy,
 )
+from .confidence_analysis import (
+    ConfidenceBand,
+    ConfidenceInterval,
+    CalibrationMetrics,
+    MetaConfidenceResult,
+    UncertaintyType,
+    analyze_confidence,
+)
 from .models import AnalysisResult, FailureRecord, FixSuggestion
 from .prompt_strategy import (
     AnalysisPromptConfig,

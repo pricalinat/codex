@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .analyzer import analyze_report_text
 from .code_chunker import ChunkingStrategy, create_chunker
+from .confidence_analysis import MetaConfidenceResult, analyze_confidence
 from .content_detector import detect_content_type, suggest_ingestion_strategy
 from .models import AnalysisResult, FailureCluster, FixSuggestion
 from .query_reformulator import QueryReformulator, ReformulatedQueries
@@ -85,6 +86,7 @@ class RAGAnalysisResult:
     risk_assessment: Dict[str, Any] = field(default_factory=dict)
     augmented_prompt: str = ""
     evidence_sources: List[str] = field(default_factory=list)
+    confidence_analysis: Optional[MetaConfidenceResult] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -126,6 +128,7 @@ class RAGAnalysisResult:
             ],
             "risk_assessment": self.risk_assessment,
             "evidence_sources": self.evidence_sources,
+            "confidence_analysis": self.confidence_analysis.to_dict() if self.confidence_analysis else None,
         }
 
 
@@ -540,6 +543,17 @@ class RAGAnalyzer:
             risk_factors["focus_confidence"] = dict(sorted(analysis_pack.focus_confidence.items()))
             risk_factors["focus_overall_confidence"] = analysis_pack.overall_confidence
 
+        # Compute confidence interval analysis
+        base_confidence = analysis_pack.overall_confidence if analysis_pack.overall_confidence > 0 else (
+            sum(retrieval_confidences) / len(retrieval_confidences) if retrieval_confidences else 0.3
+        )
+        confidence_meta = analyze_confidence(
+            base_confidence=base_confidence,
+            retrieval_evidence=analysis_pack.merged_evidence if analysis_pack.merged_evidence else None,
+            analysis_result=base_result,
+            context_chunks=analysis_pack.merged_evidence.ranked_chunks if analysis_pack.merged_evidence else None,
+        )
+
         return RAGAnalysisResult(
             base_result=base_result,
             retrieval_insights=all_insights,
@@ -549,6 +563,7 @@ class RAGAnalyzer:
             risk_assessment=risk_factors,
             augmented_prompt=augmented_prompt,
             evidence_sources=list(set(all_evidence_sources)),
+            confidence_analysis=confidence_meta,
         )
 
     def _build_analysis_queries(
