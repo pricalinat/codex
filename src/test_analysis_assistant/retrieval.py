@@ -1340,7 +1340,7 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
     if doc.modality == "compound":
         return _extract_compound_units(doc.content, doc.metadata)
     if doc.modality == "markdown_mixed" and isinstance(doc.content, str):
-        return _extract_markdown_mixed_units(doc.content)
+        return _extract_markdown_mixed_units(doc.content, document_metadata=doc.metadata)
     if doc.modality == "table":
         extraction_confidence = _resolve_extraction_confidence(
             payload=doc.content,
@@ -1356,8 +1356,13 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
             )
         ]
     if doc.modality == "image":
-        image_text = _image_to_ocr_stub(doc.content)
-        fallback = 0.25 if image_text.startswith("[OCR_STUB]") else 0.65
+        image_text, image_text_source, ocr_sidecar_path = _resolve_image_text(doc.content)
+        fallback = 0.25 if image_text_source == "stub" else (0.76 if image_text_source == "sidecar" else 0.68)
+        image_path = None
+        alt_text = ""
+        if isinstance(doc.content, dict):
+            image_path = doc.content.get("image_path")
+            alt_text = str(doc.content.get("alt_text", "")).strip()
         extraction_confidence = _resolve_extraction_confidence(
             payload=doc.content,
             modality="image",
@@ -1369,6 +1374,16 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
                 text=image_text,
                 modality="image",
                 extraction_confidence=extraction_confidence,
+                metadata=_merge_image_unit_metadata(
+                    document_metadata=doc.metadata,
+                    image_metadata={
+                    "unit_kind": "image",
+                    "image_path": image_path,
+                    "alt_text": alt_text,
+                    "image_text_source": image_text_source,
+                    "ocr_sidecar_path": ocr_sidecar_path,
+                    },
+                ),
             )
         ]
     if isinstance(doc.content, str):
@@ -1425,8 +1440,20 @@ def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:
     if normalized_modality == "compound":
         metadata.setdefault("format", "artifact_bundle")
     if normalized_modality in {"image", "image_ocr_stub"}:
-        if isinstance(normalized_payload, dict) and str(normalized_payload.get("ocr_text", "")).strip():
-            metadata.setdefault("ingestion_route", "pipeline_verified")
+        if isinstance(normalized_payload, dict):
+            if str(normalized_payload.get("ocr_text", "")).strip():
+                metadata["ingestion_route"] = "pipeline_verified"
+            else:
+                image_path = str(normalized_payload.get("image_path", "")).strip()
+                if image_path:
+                    sidecar = _read_ocr_sidecar_text(image_path)
+                    if sidecar is not None:
+                        metadata["ingestion_route"] = "pipeline_verified_sidecar"
+                        metadata.setdefault("ocr_sidecar_path", sidecar[1])
+                    else:
+                        metadata.setdefault("ingestion_route", "pipeline_ocr_stub")
+                else:
+                    metadata.setdefault("ingestion_route", "pipeline_ocr_stub")
         else:
             metadata.setdefault("ingestion_route", "pipeline_ocr_stub")
 
@@ -1608,8 +1635,8 @@ def _extract_compound_units(
         normalized_payload = image_payload
         if isinstance(image_payload, str):
             normalized_payload = {"image_path": image_payload}
-        image_text = _image_to_ocr_stub(normalized_payload)
-        extraction_confidence = 0.30 if image_text.startswith("[OCR_STUB]") else 0.68
+        image_text, image_text_source, ocr_sidecar_path = _resolve_image_text(normalized_payload)
+        extraction_confidence = 0.30 if image_text_source == "stub" else (0.76 if image_text_source == "sidecar" else 0.68)
         image_path = None
         alt_text = ""
         if isinstance(normalized_payload, dict):
@@ -1626,12 +1653,17 @@ def _extract_compound_units(
                 text=image_text,
                 modality="image",
                 extraction_confidence=extraction_confidence,
-                metadata={
-                    "unit_kind": "image",
-                    "image_index": image_idx,
-                    "image_path": image_path,
-                    "alt_text": alt_text,
-                },
+                metadata=_merge_image_unit_metadata(
+                    document_metadata=document_metadata,
+                    image_metadata={
+                        "unit_kind": "image",
+                        "image_index": image_idx,
+                        "image_path": image_path,
+                        "alt_text": alt_text,
+                        "image_text_source": image_text_source,
+                        "ocr_sidecar_path": ocr_sidecar_path,
+                    },
+                ),
             )
         )
 
@@ -1671,6 +1703,83 @@ def _image_to_ocr_stub(content: Any) -> str:
             return f"[OCR_STUB] no OCR pipeline connected for {image_path}. alt_text: {alt_text}"
         return f"[OCR_STUB] no OCR pipeline connected for {image_path}."
     return "[OCR_STUB] image payload provided without OCR text."
+
+
+def _resolve_image_text(content: Any) -> Tuple[str, str, Optional[str]]:
+    """Resolve image text via payload OCR, OCR sidecar, or stub fallback."""
+    if isinstance(content, dict):
+        ocr_text = content.get("ocr_text")
+        if isinstance(ocr_text, str) and ocr_text.strip():
+            return ocr_text.strip(), "payload", None
+
+        image_path = str(content.get("image_path", "")).strip()
+        if image_path:
+            sidecar = _read_ocr_sidecar_text(image_path)
+            if sidecar is not None:
+                return sidecar[0], "sidecar", sidecar[1]
+
+    return _image_to_ocr_stub(content), "stub", None
+
+
+def _merge_image_unit_metadata(
+    document_metadata: Optional[Dict[str, Any]],
+    image_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = dict(image_metadata)
+    if str(metadata.get("ocr_sidecar_path", "")).strip() == "":
+        metadata.pop("ocr_sidecar_path", None)
+
+    route_in_doc = ""
+    if isinstance(document_metadata, dict):
+        route_in_doc = str(document_metadata.get("ingestion_route", "")).strip()
+
+    if route_in_doc:
+        metadata["ingestion_route"] = route_in_doc
+        return metadata
+
+    image_text_source = str(metadata.get("image_text_source", "")).strip().lower()
+    metadata["ingestion_route"] = (
+        "pipeline_verified_sidecar"
+        if image_text_source == "sidecar"
+        else ("pipeline_verified" if image_text_source == "payload" else "pipeline_ocr_stub")
+    )
+    return metadata
+
+
+def _read_ocr_sidecar_text(image_path: str) -> Optional[Tuple[str, str]]:
+    path = Path(image_path)
+    candidates: List[Path] = []
+
+    if image_path:
+        candidates.extend(
+            [
+                Path(f"{image_path}.ocr.txt"),
+                Path(f"{image_path}.txt"),
+            ]
+        )
+    if path.suffix:
+        candidates.extend(
+            [
+                path.with_suffix(".ocr.txt"),
+                path.with_suffix(".txt"),
+            ]
+        )
+
+    seen: set = set()
+    for candidate in candidates:
+        candidate_key = candidate.as_posix()
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if text:
+            return text, candidate.as_posix()
+    return None
 
 
 def _resolve_extraction_confidence(
@@ -1735,7 +1844,10 @@ def _chunk_text(text: str, size: int, overlap: int) -> Iterable[str]:
     return chunks
 
 
-def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
+def _extract_markdown_mixed_units(
+    markdown: str,
+    document_metadata: Optional[Dict[str, Any]] = None,
+) -> List[ExtractedUnit]:
     lines = markdown.splitlines()
     units: List[ExtractedUnit] = []
 
@@ -1755,18 +1867,23 @@ def _extract_markdown_mixed_units(markdown: str) -> List[ExtractedUnit]:
                 payload = {"image_path": image_path}
                 if alt_text.strip():
                     payload["alt_text"] = alt_text.strip()
-                image_text = _image_to_ocr_stub(payload)
-                extraction_confidence = 0.25 if image_text.startswith("[OCR_STUB]") else 0.65
+                image_text, image_text_source, ocr_sidecar_path = _resolve_image_text(payload)
+                extraction_confidence = 0.25 if image_text_source == "stub" else (0.76 if image_text_source == "sidecar" else 0.65)
                 units.append(
                     ExtractedUnit(
                         text=image_text,
                         modality="image",
                         extraction_confidence=extraction_confidence,
-                        metadata={
-                            "image_index": image_index,
-                            "image_path": image_path,
-                            "alt_text": alt_text.strip(),
-                        },
+                        metadata=_merge_image_unit_metadata(
+                            document_metadata=document_metadata,
+                            image_metadata={
+                                "image_index": image_index,
+                                "image_path": image_path,
+                                "alt_text": alt_text.strip(),
+                                "image_text_source": image_text_source,
+                                "ocr_sidecar_path": ocr_sidecar_path,
+                            },
+                        ),
                     )
                 )
                 image_index += 1
@@ -2173,6 +2290,7 @@ def _ingestion_route_quality(chunk: Chunk) -> float:
     route = str(chunk.metadata.get("ingestion_route", "")).strip().lower()
     route_scores = {
         "pipeline_verified": 0.98,
+        "pipeline_verified_sidecar": 0.93,
         "repository_scan": 0.94,
         "artifact_bundle": 0.90,
         "normalized_record": 0.84,

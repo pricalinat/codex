@@ -912,6 +912,88 @@ Missing negative authorization tests are release blocking.
             self.assertTrue(all(chunk.modality == "code" for chunk in chunks))
             self.assertTrue(all(chunk.metadata.get("origin_path") == code_path.as_posix() for chunk in chunks))
 
+    def test_ingest_records_image_file_reference_uses_sidecar_ocr_when_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "auth-heatmap.png"
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            (root / "auth-heatmap.png.ocr.txt").write_text(
+                "retry budget exceeded in auth gateway under load",
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_records(
+                [
+                    IngestionRecord(
+                        source_id="record:image-sidecar",
+                        source_type=SourceType.SYSTEM_ANALYSIS,
+                        payload={"file_path": str(image_path)},
+                    )
+                ]
+            )
+
+            self.assertEqual(1, len(chunks))
+            image_chunk = chunks[0]
+            self.assertEqual("image", image_chunk.modality)
+            self.assertIn("retry budget exceeded", image_chunk.text)
+            self.assertEqual("pipeline_verified_sidecar", image_chunk.metadata.get("ingestion_route"))
+            self.assertTrue(image_chunk.metadata.get("ocr_sidecar_path", "").endswith(".ocr.txt"))
+
+    def test_sidecar_ocr_improves_ingestion_route_quality_vs_stub(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_path = root / "auth-graph.png"
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+            (root / "auth-graph.png.ocr.txt").write_text(
+                "auth retry storm evidence from production screenshot",
+                encoding="utf-8",
+            )
+
+            sidecar_engine = RetrievalEngine()
+            sidecar_ingestor = MultiSourceIngestor(sidecar_engine)
+            sidecar_ingestor.ingest_records(
+                [
+                    IngestionRecord(
+                        source_id="record:image-sidecar",
+                        source_type=SourceType.SYSTEM_ANALYSIS,
+                        payload={"file_path": str(image_path)},
+                    )
+                ]
+            )
+            sidecar_evidence = sidecar_engine.retrieve_evidence(
+                "auth retry storm screenshot evidence",
+                top_k=1,
+                diversify=False,
+                use_expansion=False,
+                adaptive_recovery=False,
+            )
+
+            stub_engine = RetrievalEngine()
+            stub_ingestor = MultiSourceIngestor(stub_engine)
+            stub_ingestor.ingest_records(
+                [
+                    IngestionRecord(
+                        source_id="record:image-stub",
+                        source_type=SourceType.SYSTEM_ANALYSIS,
+                        payload={"image_path": str(root / "missing.png"), "alt_text": "auth retry storm screenshot"},
+                    )
+                ]
+            )
+            stub_evidence = stub_engine.retrieve_evidence(
+                "auth retry storm screenshot evidence",
+                top_k=1,
+                diversify=False,
+                use_expansion=False,
+                adaptive_recovery=False,
+            )
+
+            self.assertGreater(
+                sidecar_evidence.confidence_factors["ingestion_route_quality"],
+                stub_evidence.confidence_factors["ingestion_route_quality"],
+            )
+
     def test_retrieve_evidence_reports_ingestion_route_quality_factor(self):
         verified_engine = RetrievalEngine()
         verified_ingestor = MultiSourceIngestor(verified_engine)

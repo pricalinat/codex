@@ -56,6 +56,7 @@ It now also includes a retrieval foundation for AI-native analysis:
 - `MultiSourceIngestor` helper for repository crawling and markdown requirements ingestion (table/image extraction stubs)
 - `ArtifactBundle` ingestion API for OCR/extraction pipeline outputs (single payload with text/tables/images + provenance metadata)
 - payload-driven extraction confidence overrides per unit (`text`/`table`/`image`) for degraded-but-usable OCR/extraction stubs
+- image OCR sidecar fallback for file-based ingestion (`<image>.ocr.txt` / `<image>.txt`) to upgrade stub-only paths without external OCR deps
 - intent-aware query planning for test-gap/risk/root-cause workflows
 - explainable ranking with score breakdown (`lexical`, `source`, `intent`, `modality`, `extraction`)
 - diversity-aware final ranking to improve cross-source evidence coverage
