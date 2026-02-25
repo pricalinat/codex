@@ -659,6 +659,58 @@ Missing negative authorization tests are release blocking.
         self.assertEqual("analysis:auth-visual", ranked[0].chunk.source_id)
         self.assertEqual("image_ocr_stub", ranked[0].chunk.modality)
 
+    def test_ingest_documents_can_emit_source_summary_chunks(self):
+        engine = RetrievalEngine()
+
+        chunks = engine.ingest_documents(
+            [
+                IngestDocument(
+                    source_id="analysis:auth-composite",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="compound",
+                    content={
+                        "text": "Auth retry storms correlate with token refresh latency spikes.",
+                        "tables": [{"rows": [{"component": "auth", "risk": "high", "signal": "retry_storm"}]}],
+                        "images": [{"ocr_text": "heatmap highlights token refresh hotspots"}],
+                    },
+                )
+            ],
+            generate_source_summaries=True,
+        )
+
+        summary_chunks = [chunk for chunk in chunks if chunk.metadata.get("synthetic_unit") == "source_summary"]
+        self.assertEqual(1, len(summary_chunks))
+        self.assertEqual("analysis:auth-composite::__summary__", summary_chunks[0].source_id)
+        self.assertEqual("text", summary_chunks[0].modality)
+
+    def test_source_summary_chunk_is_retrievable_for_multimodal_bridge_query(self):
+        engine = RetrievalEngine()
+        engine.ingest_documents(
+            [
+                IngestDocument(
+                    source_id="analysis:bridge",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="compound",
+                    content={
+                        "text": "Release risk is elevated for auth under retry storms.",
+                        "tables": [{"rows": [{"component": "auth", "priority": "p0", "risk": "high"}]}],
+                        "images": [{"ocr_text": "retry storm heatmap in auth gateway"}],
+                    },
+                ),
+            ],
+            generate_source_summaries=True,
+        )
+
+        ranked = engine.query(
+            "source summary auth retry storm release risk p0",
+            top_k=3,
+            diversify=False,
+        )
+
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertEqual("analysis:bridge::__summary__", ranked[0].chunk.source_id)
+        self.assertIn("source_summary", ranked[0].chunk.text)
+
     def test_compound_modality_extracts_multimodal_units_with_provenance(self):
         docs = [
             IngestDocument(

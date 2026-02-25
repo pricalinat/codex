@@ -132,7 +132,11 @@ class RetrievalEngine:
         self._chunk_overlap = max(0, min(chunk_overlap, self._chunk_size // 2))
         self._chunks: List[Chunk] = []
 
-    def ingest_documents(self, docs: Sequence[IngestDocument]) -> List[Chunk]:
+    def ingest_documents(
+        self,
+        docs: Sequence[IngestDocument],
+        generate_source_summaries: bool = False,
+    ) -> List[Chunk]:
         chunked: List[Chunk] = []
         for doc in docs:
             text_units = _extract_text_units(doc)
@@ -158,6 +162,9 @@ class RetrievalEngine:
                         metadata=chunk_metadata,
                     )
                     chunked.append(chunk)
+
+        if generate_source_summaries and chunked:
+            chunked.extend(_build_source_summary_chunks(chunked))
 
         self._chunks.extend(chunked)
         return chunked
@@ -628,6 +635,7 @@ class MultiSourceIngestor:
         content: Any,
         modality: str = "text",
         metadata: Optional[Dict[str, Any]] = None,
+        generate_source_summaries: bool = False,
     ) -> List[Chunk]:
         doc = IngestDocument(
             source_id=source_id,
@@ -636,13 +644,17 @@ class MultiSourceIngestor:
             modality=modality,
             metadata=metadata or {},
         )
-        return self._engine.ingest_documents([doc])
+        return self._engine.ingest_documents(
+            [doc],
+            generate_source_summaries=generate_source_summaries,
+        )
 
     def ingest_repository(
         self,
         repo_root: str,
         max_files: int = 200,
         include_extensions: Optional[Sequence[str]] = None,
+        generate_source_summaries: bool = False,
     ) -> List[Chunk]:
         root = Path(repo_root)
         if not root.exists() or not root.is_dir():
@@ -713,18 +725,31 @@ class MultiSourceIngestor:
 
         if not docs:
             return []
-        return self._engine.ingest_documents(docs)
+        return self._engine.ingest_documents(
+            docs,
+            generate_source_summaries=generate_source_summaries,
+        )
 
-    def ingest_requirements_markdown(self, source_id: str, markdown: str) -> List[Chunk]:
+    def ingest_requirements_markdown(
+        self,
+        source_id: str,
+        markdown: str,
+        generate_source_summaries: bool = False,
+    ) -> List[Chunk]:
         return self.ingest_raw(
             source_id=source_id,
             source_type=SourceType.REQUIREMENTS,
             content=markdown,
             modality="markdown_mixed",
             metadata={"format": "markdown"},
+            generate_source_summaries=generate_source_summaries,
         )
 
-    def ingest_artifact_bundle(self, bundle: ArtifactBundle) -> List[Chunk]:
+    def ingest_artifact_bundle(
+        self,
+        bundle: ArtifactBundle,
+        generate_source_summaries: bool = False,
+    ) -> List[Chunk]:
         """Ingest one mixed-modality artifact bundle.
 
         This is a stable interface for OCR/extraction pipelines to emit a
@@ -750,6 +775,7 @@ class MultiSourceIngestor:
             content=content,
             modality="compound",
             metadata=metadata,
+            generate_source_summaries=generate_source_summaries,
         )
 
 
@@ -934,15 +960,17 @@ class CodeAwareIngestor:
         """
         # For markdown/requirements, use basic text chunking via the engine
         # but add metadata indicating it's a requirement
-        return self._engine.ingest_documents([
-            IngestDocument(
-                source_id=source_id,
-                source_type=SourceType.REQUIREMENTS,
-                content=markdown,
-                modality="markdown_mixed",
-                metadata={"format": "markdown"},
-            )
-        ])
+        return self._engine.ingest_documents(
+            [
+                IngestDocument(
+                    source_id=source_id,
+                    source_type=SourceType.REQUIREMENTS,
+                    content=markdown,
+                    modality="markdown_mixed",
+                    metadata={"format": "markdown"},
+                )
+            ]
+        )
 
     def ingest_raw(
         self,
@@ -2584,9 +2612,16 @@ class HybridRetrievalEngine(RetrievalEngine):
         self._semantic_weight = 1.0 - self._lexical_weight
         self._chunk_embeddings: Dict[str, List[float]] = {}
 
-    def ingest_documents(self, docs: Sequence[IngestDocument]) -> List[Chunk]:
+    def ingest_documents(
+        self,
+        docs: Sequence[IngestDocument],
+        generate_source_summaries: bool = False,
+    ) -> List[Chunk]:
         """Ingest documents and compute embeddings."""
-        chunks = super().ingest_documents(docs)
+        chunks = super().ingest_documents(
+            docs,
+            generate_source_summaries=generate_source_summaries,
+        )
         self._compute_embeddings()
         return chunks
 
@@ -2818,3 +2853,71 @@ def _embedding_projection_text(chunk: Chunk) -> str:
         descriptors.append(f"path {path}")
 
     return " ".join(descriptors + [text]).strip()
+
+
+def _build_source_summary_chunks(chunks: Sequence[Chunk]) -> List[Chunk]:
+    grouped: Dict[Tuple[str, SourceType], List[Chunk]] = {}
+    for chunk in chunks:
+        if chunk.metadata.get("synthetic_unit") == "source_summary":
+            continue
+        if chunk.source_id.endswith("::__summary__"):
+            continue
+        grouped.setdefault((chunk.source_id, chunk.source_type), []).append(chunk)
+
+    summary_chunks: List[Chunk] = []
+    for (source_id, source_type), source_chunks in grouped.items():
+        modalities = sorted({chunk.modality for chunk in source_chunks})
+        if len(source_chunks) < 2 and len(modalities) < 2:
+            continue
+
+        token_counts: Dict[str, int] = {}
+        for chunk in source_chunks:
+            for token in _tokenize(chunk.text):
+                if len(token) < 3:
+                    continue
+                token_counts[token] = token_counts.get(token, 0) + 1
+        top_terms = [term for term, _ in sorted(token_counts.items(), key=lambda item: (-item[1], item[0]))[:10]]
+
+        sample_snippets: List[str] = []
+        for chunk in source_chunks:
+            snippet = " ".join(chunk.text.strip().split())
+            if not snippet:
+                continue
+            if len(snippet) > 120:
+                snippet = snippet[:117] + "..."
+            sample_snippets.append(f"{chunk.modality}:{snippet}")
+            if len(sample_snippets) >= 3:
+                break
+
+        avg_extraction = sum(_extraction_quality(chunk) for chunk in source_chunks) / max(len(source_chunks), 1)
+        summary_source_id = f"{source_id}::__summary__"
+        summary_lines = [
+            f"source_summary source_id={source_id}",
+            f"source_type={source_type.value} modalities={','.join(modalities)} chunks={len(source_chunks)}",
+            f"avg_extraction_quality={avg_extraction:.2f}",
+        ]
+        if top_terms:
+            summary_lines.append(f"top_terms={','.join(top_terms)}")
+        if sample_snippets:
+            summary_lines.append("highlights=" + " || ".join(sample_snippets))
+        summary_text = "\n".join(summary_lines)
+
+        summary_chunks.append(
+            Chunk(
+                chunk_id=_hash_id(summary_source_id, 0, 0, summary_text),
+                source_id=summary_source_id,
+                source_type=source_type,
+                modality="text",
+                text=summary_text,
+                token_count=len(_tokenize(summary_text)),
+                metadata={
+                    "synthetic_unit": "source_summary",
+                    "linked_source_id": source_id,
+                    "modalities": modalities,
+                    "source_chunk_count": len(source_chunks),
+                    "extraction_confidence": round(max(0.55, min(0.92, avg_extraction * 0.9)), 4),
+                },
+            )
+        )
+
+    return summary_chunks
