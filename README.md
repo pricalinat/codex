@@ -45,6 +45,38 @@ curl http://127.0.0.1:8000/health
 - Current implementation is intentionally minimal and deterministic for iterative extension.
 - The orchestration loop supports iterative execution up to `max_rounds` to prevent infinite stalls.
 
+## Test Analysis Assistant MVP (New)
+Core module lives in `src/test_analysis_assistant/` and supports two input formats:
+- junit xml (`<testsuite>` / `<testsuites>`)
+- pytest text output (failure sections from terminal logs)
+
+### Quick Start
+```bash
+# analyze report file and print JSON
+python3 -m src.test_analysis_assistant.cli analyze --input /path/to/report.txt
+
+# pretty JSON output
+python3 -m src.test_analysis_assistant.cli analyze --input /path/to/junit.xml --format pretty
+```
+
+### Output Shape (example)
+```json
+{
+  "input_format": "pytest_text",
+  "total_failures": 2,
+  "clusters": [
+    {"cluster_id": "C01", "error_type": "AssertionError", "count": 1},
+    {"cluster_id": "C02", "error_type": "ModuleNotFoundError", "count": 1}
+  ],
+  "root_cause_hypotheses": [
+    "C01: AssertionError appears in 1 case(s), likely behavior mismatch..."
+  ],
+  "fix_suggestions": [
+    {"priority": "P0", "title": "Address ModuleNotFoundError cluster"}
+  ]
+}
+```
+
 ## Paper Retrieval Iteration (New)
 - Core module: `src/multi_agent/paper_retrieval.py`
 - Agent entrypoint: `paper_search` in `src/multi_agent/agents.py`
