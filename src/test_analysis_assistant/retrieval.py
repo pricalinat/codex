@@ -1372,13 +1372,20 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
             )
         ]
     if isinstance(doc.content, str):
+        fallback_defaults = {
+            "code": 0.96,
+            "text": 1.0,
+            "markdown_mixed": 0.95,
+        }
+        normalized_modality = (doc.modality or "text").strip().lower()
+        resolved_modality = normalized_modality if normalized_modality in {"text", "code"} else "text"
         extraction_confidence = _resolve_extraction_confidence(
             payload=doc.content,
-            modality="text",
-            default=1.0,
+            modality=resolved_modality,
+            default=fallback_defaults.get(normalized_modality, 0.92),
             metadata=doc.metadata,
         )
-        return [ExtractedUnit(text=doc.content, modality="text", extraction_confidence=extraction_confidence)]
+        return [ExtractedUnit(text=doc.content, modality=resolved_modality, extraction_confidence=extraction_confidence)]
     if isinstance(doc.content, dict):
         return [
             ExtractedUnit(
@@ -1404,8 +1411,14 @@ def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:
     metadata = dict(record.metadata)
 
     if normalized_modality == "auto":
-        normalized_modality, normalized_payload = _infer_record_modality_and_payload(record.payload)
-        metadata.setdefault("ingestion_route", "normalized_record")
+        file_reference = _resolve_record_file_reference(record.payload, record.source_type)
+        if file_reference is not None:
+            normalized_modality, normalized_payload, reference_metadata = file_reference
+            metadata.update(reference_metadata)
+            metadata.setdefault("ingestion_route", "file_reference_record")
+        else:
+            normalized_modality, normalized_payload = _infer_record_modality_and_payload(record.payload)
+            metadata.setdefault("ingestion_route", "normalized_record")
     else:
         metadata.setdefault("ingestion_route", "explicit_record")
 
@@ -1451,6 +1464,65 @@ def _infer_record_modality_and_payload(payload: Any) -> Tuple[str, Any]:
         return "text", payload
 
     return "text", str(payload)
+
+
+def _resolve_record_file_reference(
+    payload: Any,
+    source_type: SourceType,
+) -> Optional[Tuple[str, Any, Dict[str, Any]]]:
+    if not isinstance(payload, dict):
+        return None
+
+    path_value = None
+    for key in ("file_path", "path", "source_path", "artifact_path"):
+        candidate = payload.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            path_value = candidate.strip()
+            break
+
+    if not path_value:
+        return None
+
+    referenced_path = Path(path_value)
+    if not referenced_path.exists() or not referenced_path.is_file():
+        return None
+
+    ext = referenced_path.suffix.lower()
+    metadata: Dict[str, Any] = {
+        "origin_path": referenced_path.as_posix(),
+        "referenced_file_extension": ext or "[none]",
+    }
+    if "alt_text" in payload:
+        metadata["alt_text"] = str(payload.get("alt_text", "")).strip()
+
+    if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}:
+        image_payload: Dict[str, Any] = {"image_path": referenced_path.as_posix()}
+        if isinstance(payload.get("ocr_text"), str) and payload["ocr_text"].strip():
+            image_payload["ocr_text"] = payload["ocr_text"].strip()
+        if isinstance(payload.get("alt_text"), str) and payload["alt_text"].strip():
+            image_payload["alt_text"] = payload["alt_text"].strip()
+        return "image", image_payload, metadata
+
+    try:
+        text = referenced_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    if ext in {".csv", ".tsv"}:
+        return "table", _parse_delimited_table(text, ext), metadata
+    if ext in {".md", ".markdown", ".mdx", ".rst"}:
+        return "markdown_mixed", text, metadata
+    if ext in _REPO_CODE_EXTENSIONS or source_type == SourceType.CODE_SNIPPET:
+        return "code", text, metadata
+    if ext == ".json":
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return "text", text, metadata
+        inferred_modality, inferred_payload = _infer_record_modality_and_payload(parsed)
+        return inferred_modality, inferred_payload, metadata
+
+    return "text", text, metadata
 
 
 def _looks_like_markdown(text: str) -> bool:
@@ -1818,6 +1890,8 @@ def _is_markdown_separator_cell(cell: str) -> bool:
 
 
 def _infer_repository_modality(extension: str) -> str:
+    if extension in _REPO_CODE_EXTENSIONS:
+        return "code"
     if extension in {".md", ".markdown", ".mdx", ".rst"}:
         return "markdown_mixed"
     if extension in {".csv", ".tsv"}:

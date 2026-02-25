@@ -618,6 +618,25 @@ class TestRetrievalPipeline(unittest.TestCase):
             self.assertIn("component=auth", table_text)
             self.assertIn("severity=high", table_text)
 
+    def test_repository_ingestion_marks_code_files_with_code_modality(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "service.py").write_text(
+                (
+                    "def validate_token(token: str) -> bool:\n"
+                    "    return bool(token and token.strip())\n"
+                ),
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_repository(str(root), max_files=10)
+
+            repo_chunks = [chunk for chunk in chunks if chunk.source_id == "repo:service.py"]
+            self.assertGreaterEqual(len(repo_chunks), 1)
+            self.assertTrue(any(chunk.modality == "code" for chunk in repo_chunks))
+
     def test_repository_ingestion_emits_repo_manifest_for_structure_retrieval(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -827,6 +846,71 @@ Missing negative authorization tests are release blocking.
         self.assertTrue(any(chunk.modality == "table" for chunk in chunks))
         self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in chunks))
         self.assertTrue(all("ingestion_route" in chunk.metadata for chunk in chunks))
+
+    def test_ingest_records_resolves_markdown_file_reference_payload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            markdown_path = root / "auth_requirements.md"
+            markdown_path.write_text(
+                (
+                    "# Auth Requirements\n"
+                    "Missing negative tests are release blocking.\n\n"
+                    "| risk | severity |\n"
+                    "| ---- | -------- |\n"
+                    "| auth | high |\n\n"
+                    "![auth heatmap](artifacts/auth-heatmap.png)\n"
+                ),
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_records(
+                [
+                    IngestionRecord(
+                        source_id="record:req-file",
+                        source_type=SourceType.REQUIREMENTS,
+                        payload={"file_path": str(markdown_path)},
+                    )
+                ]
+            )
+
+            self.assertGreaterEqual(len(chunks), 3)
+            self.assertTrue(any(chunk.modality == "text" for chunk in chunks))
+            self.assertTrue(any(chunk.modality == "table" for chunk in chunks))
+            self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in chunks))
+            self.assertTrue(all(chunk.metadata.get("ingestion_route") == "file_reference_record" for chunk in chunks))
+            self.assertTrue(all(chunk.metadata.get("origin_path") == markdown_path.as_posix() for chunk in chunks))
+
+    def test_ingest_records_resolves_code_file_reference_to_code_modality(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            code_path = root / "auth.py"
+            code_path.write_text(
+                (
+                    "def refresh(token: str) -> str:\n"
+                    "    if not token:\n"
+                    "        raise ValueError('missing token')\n"
+                    "    return token.strip()\n"
+                ),
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_records(
+                [
+                    IngestionRecord(
+                        source_id="record:code-file",
+                        source_type=SourceType.CODE_SNIPPET,
+                        payload={"path": str(code_path)},
+                    )
+                ]
+            )
+
+            self.assertGreaterEqual(len(chunks), 1)
+            self.assertTrue(all(chunk.modality == "code" for chunk in chunks))
+            self.assertTrue(all(chunk.metadata.get("origin_path") == code_path.as_posix() for chunk in chunks))
 
     def test_retrieve_evidence_reports_ingestion_route_quality_factor(self):
         verified_engine = RetrievalEngine()
