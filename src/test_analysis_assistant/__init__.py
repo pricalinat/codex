@@ -38,6 +38,14 @@ from .retrieval import (
     create_code_aware_engine,
     create_hybrid_engine,
 )
+from .query_reformulator import (
+    ErrorCategory,
+    FailureTrace,
+    QueryReformulator,
+    QueryVariant,
+    ReformulatedQueries,
+    reformulate_queries,
+)
 from .root_cause import (
     RootCauseAnalysis,
     RootCauseAnalyzer,
@@ -98,4 +106,11 @@ __all__ = [
     "RootCauseCategory",
     "RootCauseHypothesis",
     "generate_root_cause_hypotheses",
+    # Query reformulation exports
+    "ErrorCategory",
+    "FailureTrace",
+    "QueryReformulator",
+    "QueryVariant",
+    "ReformulatedQueries",
+    "reformulate_queries",
 ]
