@@ -1,10 +1,15 @@
 import unittest
 
 from src.test_analysis_assistant.code_chunker import (
+    ChunkingStrategy,
     CodeAwareChunker,
     CodeLanguage,
     CodeUnit,
+    TestAwareChunker,
     chunk_code_by_structure,
+    chunk_test_aware,
+    compute_test_relevance_score,
+    create_chunker,
     detect_language,
     extract_code_units,
     extract_python_units,
@@ -159,6 +164,128 @@ def test_logout():
         unit_names = [c.metadata.get('unit_name') for c in chunks]
         self.assertIn('test_login', unit_names)
         self.assertIn('test_logout', unit_names)
+
+
+class TestTestAwareChunking(unittest.TestCase):
+    def test_compute_test_relevance_score_test_file(self):
+        """Test that test files get high relevance scores."""
+        unit = CodeUnit(
+            unit_type='function',
+            name='test_login_success',
+            content='def test_login_success(): pass',
+            start_line=1,
+            end_line=2,
+            language=CodeLanguage.PYTHON,
+        )
+        score = compute_test_relevance_score(unit, 'tests/test_auth.py')
+        self.assertGreater(score, 0.5)
+
+    def test_compute_test_relevance_score_regular_file(self):
+        """Test that regular files get lower scores."""
+        unit = CodeUnit(
+            unit_type='function',
+            name='process_data',
+            content='def process_data(): pass',
+            start_line=1,
+            end_line=2,
+            language=CodeLanguage.PYTHON,
+        )
+        score = compute_test_relevance_score(unit, 'src/processor.py')
+        self.assertLess(score, 0.5)
+
+    def test_compute_test_relevance_score_test_function(self):
+        """Test that test functions get high scores."""
+        unit = CodeUnit(
+            unit_type='function',
+            name='test_auth_invalid_credentials',
+            content='def test_auth_invalid_credentials(): pass',
+            start_line=1,
+            end_line=2,
+            language=CodeLanguage.PYTHON,
+        )
+        score = compute_test_relevance_score(unit, 'src/auth.py')
+        # Test function name should give high score even in non-test file
+        self.assertGreater(score, 0.4)
+
+    def test_chunk_test_aware_returns_sorted_chunks(self):
+        """Test that test-aware chunking returns chunks sorted by relevance."""
+        content = """
+# Regular module code
+def process_data(data):
+    return data.upper()
+
+# Test code
+def test_process_data():
+    assert process_data("hello") == "HELLO"
+
+class TestProcessor:
+    def test_upper(self):
+        assert True
+"""
+        chunks = chunk_test_aware(content, "test_module.py")
+
+        self.assertGreater(len(chunks), 0)
+        # All chunks should have test_relevance_score metadata
+        for chunk in chunks:
+            self.assertIn('test_relevance_score', chunk.metadata)
+
+    def test_chunk_test_aware_identifies_test_functions(self):
+        """Test that test functions are identified."""
+        content = """
+def test_login():
+    assert True
+
+def regular_function():
+    return 1
+"""
+        chunks = chunk_test_aware(content, "test_file.py")
+
+        test_chunks = [c for c in chunks if c.metadata.get('is_test_related')]
+        self.assertGreater(len(test_chunks), 0)
+
+    def test_test_aware_chunker(self):
+        """Test the TestAwareChunker class."""
+        chunker = TestAwareChunker(max_chunk_tokens=200, overlap_tokens=20)
+        self.assertEqual(chunker._max_tokens, 200)
+        self.assertEqual(chunker._overlap_tokens, 20)
+
+    def test_test_aware_chunker_chunks(self):
+        """Test TestAwareChunker produces chunks with relevance scores."""
+        chunker = TestAwareChunker()
+        content = """
+def test_example():
+    assert 1 == 1
+
+def helper():
+    pass
+"""
+        chunks = chunker.chunk(content, "tests/test_example.py")
+
+        self.assertGreater(len(chunks), 0)
+        # Check test relevance scoring
+        scores = [c.metadata.get('test_relevance_score', 0) for c in chunks]
+        self.assertTrue(any(s > 0 for s in scores))
+
+    def test_create_chunker_factory(self):
+        """Test the chunker factory function."""
+        # Test creating different chunker types
+        basic_chunker = create_chunker(ChunkingStrategy.BASIC)
+        self.assertIsInstance(basic_chunker, CodeAwareChunker)
+
+        code_chunker = create_chunker(ChunkingStrategy.CODE_AWARE)
+        self.assertIsInstance(code_chunker, CodeAwareChunker)
+
+        test_chunker = create_chunker(ChunkingStrategy.TEST_AWARE)
+        self.assertIsInstance(test_chunker, TestAwareChunker)
+
+
+class TestChunkingStrategy(unittest.TestCase):
+    def test_chunking_strategy_enum(self):
+        """Test ChunkingStrategy enum values."""
+        self.assertEqual(ChunkingStrategy.BASIC.value, "basic")
+        self.assertEqual(ChunkingStrategy.CODE_AWARE.value, "code_aware")
+        self.assertEqual(ChunkingStrategy.TEST_AWARE.value, "test_aware")
+        self.assertEqual(ChunkingStrategy.SEMANTIC.value, "semantic")
 
 
 if __name__ == "__main__":

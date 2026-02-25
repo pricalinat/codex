@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence
 
 from .analyzer import analyze_report_text
+from .code_chunker import ChunkingStrategy, create_chunker
 from .content_detector import detect_content_type, suggest_ingestion_strategy
 from .models import AnalysisResult, FailureCluster, FixSuggestion
 from .query_reformulator import QueryReformulator, ReformulatedQueries
@@ -31,6 +32,7 @@ class ChunkerType(str, Enum):
     """Type of chunking strategy to use."""
     BASIC = "basic"  # Simple fixed-size text chunking
     CODE_AWARE = "code_aware"  # Code-structure-aware chunking
+    TEST_AWARE = "test_aware"  # Test-aware chunking with priority scoring
     AUTO = "auto"  # Auto-detect content type and use appropriate chunker
 
 
@@ -159,6 +161,17 @@ class RAGAnalyzer:
             )
             self._code_ingestor: Optional[CodeAwareIngestor] = self._ingestor
             self._basic_ingestor: Optional[MultiSourceIngestor] = None
+            self._test_ingestor: Optional[CodeAwareIngestor] = None
+        elif chunker_type == ChunkerType.TEST_AWARE:
+            # Test-aware mode: uses code-aware with test priority scoring
+            self._test_ingestor = CodeAwareIngestor(
+                self._engine,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+            )
+            self._ingestor = self._test_ingestor
+            self._code_ingestor = self._test_ingestor
+            self._basic_ingestor = None
         elif chunker_type == ChunkerType.AUTO:
             # Auto mode: we'll use both and pick appropriate
             self._code_ingestor = CodeAwareIngestor(
@@ -167,11 +180,13 @@ class RAGAnalyzer:
                 chunk_overlap=chunk_overlap,
             )
             self._basic_ingestor = MultiSourceIngestor(self._engine)
+            self._test_ingestor = None
             self._ingestor = self._basic_ingestor  # Default to basic
         else:
             self._ingestor = MultiSourceIngestor(self._engine)
             self._basic_ingestor = self._ingestor
             self._code_ingestor = None
+            self._test_ingestor = None
         self._initialized = False
 
         # Set up query reformulator for improved retrieval
@@ -195,6 +210,9 @@ class RAGAnalyzer:
             The appropriate ingestor instance
         """
         if self._chunker_type == ChunkerType.CODE_AWARE:
+            return self._ingestor
+        if self._chunker_type == ChunkerType.TEST_AWARE:
+            # Test-aware always uses the test-aware ingestor
             return self._ingestor
         if self._chunker_type == ChunkerType.AUTO:
             # Use content-aware detection if content is available

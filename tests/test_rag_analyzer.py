@@ -461,6 +461,34 @@ class TestRAGAnalyzerChunkingStrategies(unittest.TestCase):
         self.assertIsInstance(result, RAGAnalysisResult)
         self.assertEqual(result.base_result.total_failures, 1)
 
+    def test_rag_analyze_with_test_aware_chunker(self):
+        """Test rag_analyze convenience function with test-aware chunker."""
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_login">
+                <failure type="AssertionError">Login failed</failure>
+            </testcase>
+        </testsuite>"""
+
+        result = rag_analyze(
+            test_report_content=test_report,
+            requirements_docs=[
+                ("req-auth", "Authentication must handle invalid credentials."),
+                ("test-auth", "Test coverage for login with invalid credentials."),
+            ],
+            query="auth test gaps",
+            chunker_type=ChunkerType.TEST_AWARE,
+        )
+
+        self.assertIsInstance(result, RAGAnalysisResult)
+        self.assertEqual(result.base_result.total_failures, 1)
+
+    def test_rag_analyzer_test_aware_initialization(self):
+        """Test RAGAnalyzer with test-aware chunker initialization."""
+        analyzer = RAGAnalyzer(chunker_type=ChunkerType.TEST_AWARE)
+        self.assertIsNotNone(analyzer._engine)
+        self.assertEqual(analyzer._chunker_type, ChunkerType.TEST_AWARE)
+        self.assertIsNotNone(analyzer._test_ingestor)
+
 
 class TestEnhancedConfidenceScoring(unittest.TestCase):
     def test_compute_enhanced_confidence_basic(self):

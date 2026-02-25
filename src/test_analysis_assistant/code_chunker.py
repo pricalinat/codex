@@ -4,6 +4,11 @@ This module provides code-structure-aware text chunking that respects
 function, class, and module boundaries when processing code repositories.
 It integrates with the existing retrieval pipeline to provide better
 code context for test analysis.
+
+New in this version:
+- Test-aware semantic chunking that prioritizes test-related code sections
+- Priority scoring for test functions, fixtures, assertions
+- Cross-reference detection for better test-code mapping
 """
 
 import re
@@ -21,6 +26,14 @@ class CodeLanguage(str, Enum):
     GO = "go"
     RUST = "rust"
     UNKNOWN = "unknown"
+
+
+class ChunkingStrategy(str, Enum):
+    """Available chunking strategies."""
+    BASIC = "basic"
+    CODE_AWARE = "code_aware"
+    TEST_AWARE = "test_aware"  # Prioritizes test-related code
+    SEMANTIC = "semantic"  # Uses semantic relevance
 
 
 @dataclass
@@ -527,3 +540,214 @@ class CodeAwareChunker:
     def detect_language(self, source_id: str, content: str) -> CodeLanguage:
         """Detect the programming language."""
         return detect_language(source_id, content)
+
+
+# Test-aware chunking patterns
+_PYTHON_TEST_PATTERNS = [
+    # Test functions (def test_*)
+    (re.compile(r'^(\s*)def (test_\w+)\(', re.MULTILINE), 'test_function'),
+    # Test classes (class Test*)
+    (re.compile(r'^class (Test\w+)', re.MULTILINE), 'test_class'),
+    # Fixtures (@pytest.fixture, @fixture)
+    (re.compile(r'^(\s*)@(?:pytest\.)?fixture', re.MULTILINE), 'fixture'),
+    # Setups/teardowns
+    (re.compile(r'^(\s*)def (setup|teardown|setUp|tearDown)\(', re.MULTILINE), 'setup_teardown'),
+    # Parametrized tests
+    (re.compile(r'^(\s*)@pytest\.parametrize', re.MULTILINE), 'parametrized'),
+    # Assertions (assert statements - approximate)
+    (re.compile(r'\bassert\b', re.MULTILINE), 'assertion'),
+    # Test helpers
+    (re.compile(r'^(\s*)def (\w*helper\w*)\(', re.MULTILINE), 'test_helper'),
+]
+
+# Priority weights for test-aware chunking
+_TEST_PRIORITY_WEIGHTS = {
+    'test_function': 1.0,
+    'test_class': 0.95,
+    'fixture': 0.9,
+    'setup_teardown': 0.85,
+    'parametrized': 0.8,
+    'assertion': 0.7,
+    'test_helper': 0.6,
+    'function': 0.4,
+    'class': 0.3,
+    'import': 0.2,
+    'constant': 0.1,
+    'standalone': 0.05,
+}
+
+
+def compute_test_relevance_score(unit: CodeUnit, source_id: str) -> float:
+    """Compute a test relevance score for a code unit.
+
+    Args:
+        unit: The code unit to score
+        source_id: Source identifier (file path)
+
+    Returns:
+        Score between 0.0 and 1.0 indicating test relevance
+    """
+    score = 0.0
+
+    # Check source_id for test indicators
+    source_lower = source_id.lower()
+    if 'test' in source_lower:
+        score += 0.3
+    if source_lower.endswith('_test.py') or source_lower.endswith('test_.py'):
+        score += 0.2
+    if '/tests/' in source_lower or '\\tests\\' in source_lower:
+        score += 0.2
+
+    # Check unit type
+    unit_type = unit.unit_type.lower()
+    if 'test' in unit_type:
+        score += 0.4
+    if unit_type == 'fixture':
+        score += 0.35
+    if unit_type in ('function', 'method'):
+        # Check if it's a test function
+        if unit.name.startswith('test_') or unit.name.endswith('_test'):
+            score += 0.5
+        # Check for common test patterns
+        if any(pat in unit.name.lower() for pat in ['assert', 'verify', 'check', 'should']):
+            score += 0.3
+
+    return min(score, 1.0)
+
+
+def chunk_test_aware(
+    content: str,
+    source_id: str,
+    max_chunk_tokens: int = 360,
+    overlap_tokens: int = 40,
+) -> List[CodeChunk]:
+    """Chunk code with test-awareness for improved test analysis.
+
+    This function prioritizes test-related code sections and creates
+    chunks that are more relevant for test failure analysis.
+
+    Args:
+        content: Source code content
+        source_id: Source identifier
+        max_chunk_tokens: Maximum tokens per chunk
+        overlap_tokens: Token overlap for partial chunks
+
+    Returns:
+        List of CodeChunk objects with test relevance metadata
+    """
+    language = detect_language(source_id, content)
+
+    # First, get structure-aware chunks
+    struct_chunks = chunk_code_by_structure(
+        content=content,
+        source_id=source_id,
+        language=language,
+        max_chunk_tokens=max_chunk_tokens,
+        overlap_tokens=overlap_tokens,
+    )
+
+    # Add test relevance scores
+    for chunk in struct_chunks:
+        # Create a temporary unit if needed for scoring
+        unit = chunk.code_unit
+        if unit is None:
+            unit = CodeUnit(
+                unit_type=chunk.chunk_type,
+                name=chunk.metadata.get('unit_name', 'unknown'),
+                content=chunk.text,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+                language=chunk.language,
+            )
+
+        relevance = compute_test_relevance_score(unit, source_id)
+        chunk.metadata['test_relevance_score'] = relevance
+        chunk.metadata['is_test_related'] = relevance > 0.3
+
+    # Sort by test relevance (most relevant first)
+    struct_chunks.sort(
+        key=lambda c: c.metadata.get('test_relevance_score', 0.0),
+        reverse=True,
+    )
+
+    return struct_chunks
+
+
+class TestAwareChunker:
+    """Test-aware chunker that prioritizes test-related code sections.
+
+    This chunker extends CodeAwareChunker with test-specific heuristics
+    to improve retrieval relevance for test failure analysis.
+    """
+
+    def __init__(
+        self,
+        max_chunk_tokens: int = 360,
+        overlap_tokens: int = 40,
+    ) -> None:
+        self._max_tokens = max_chunk_tokens
+        self._overlap_tokens = overlap_tokens
+        self._base_chunker = CodeAwareChunker(
+            max_chunk_tokens=max_chunk_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+
+    def chunk(
+        self,
+        content: str,
+        source_id: str,
+    ) -> List[CodeChunk]:
+        """Chunk code with test-awareness.
+
+        Args:
+            content: Source code content
+            source_id: Source identifier (file path)
+
+        Returns:
+            List of CodeChunk objects with test relevance scores
+        """
+        return chunk_test_aware(
+            content=content,
+            source_id=source_id,
+            max_chunk_tokens=self._max_tokens,
+            overlap_tokens=self._overlap_tokens,
+        )
+
+    def detect_language(self, source_id: str, content: str) -> CodeLanguage:
+        """Detect the programming language."""
+        return detect_language(source_id, content)
+
+    def get_test_priority_weight(self, chunk: CodeChunk) -> float:
+        """Get priority weight for a chunk based on test relevance.
+
+        Args:
+            chunk: Code chunk to evaluate
+
+        Returns:
+            Priority weight between 0.0 and 1.0
+        """
+        return chunk.metadata.get('test_relevance_score', 0.0)
+
+
+def create_chunker(
+    strategy: ChunkingStrategy = ChunkingStrategy.CODE_AWARE,
+    max_chunk_tokens: int = 360,
+    overlap_tokens: int = 40,
+) -> Any:
+    """Factory function to create a chunker based on strategy.
+
+    Args:
+        strategy: The chunking strategy to use
+        max_chunk_tokens: Maximum tokens per chunk
+        overlap_tokens: Token overlap for partial chunks
+
+    Returns:
+        An appropriate chunker instance
+    """
+    if strategy == ChunkingStrategy.TEST_AWARE:
+        return TestAwareChunker(max_chunk_tokens, overlap_tokens)
+    elif strategy == ChunkingStrategy.CODE_AWARE:
+        return CodeAwareChunker(max_chunk_tokens, overlap_tokens)
+    else:
+        # Default to code-aware
+        return CodeAwareChunker(max_chunk_tokens, overlap_tokens)

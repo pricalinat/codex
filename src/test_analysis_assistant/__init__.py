@@ -8,10 +8,15 @@ from .actionable_plan import (
 )
 from .analyzer import analyze_report_text
 from .code_chunker import (
+    ChunkingStrategy,
     CodeAwareChunker,
     CodeChunk,
     CodeLanguage,
     CodeUnit,
+    TestAwareChunker,
+    chunk_test_aware,
+    compute_test_relevance_score,
+    create_chunker,
     detect_language,
 )
 from .content_detector import (
@@ -124,10 +129,15 @@ __all__ = [
     "ActionableStep",
     "generate_actionable_plan",
     "build_plan_prompt",
+    "ChunkingStrategy",
     "CodeAwareChunker",
     "CodeChunk",
     "CodeLanguage",
     "CodeUnit",
+    "TestAwareChunker",
+    "chunk_test_aware",
+    "compute_test_relevance_score",
+    "create_chunker",
     "detect_language",
     "CodeAwareIngestor",
     "create_code_aware_engine",
