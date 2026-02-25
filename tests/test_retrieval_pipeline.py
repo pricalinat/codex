@@ -271,6 +271,85 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("cross_source_consensus", evidence.confidence_factors)
         self.assertGreater(evidence.confidence_factors["cross_source_consensus"], 0.0)
 
+    def test_retrieve_evidence_reports_cross_source_conflict_signal(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth token refresh mitigation is enabled and stable for release.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Auth token refresh mitigation is disabled and unstable in production.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth token refresh mitigation stability",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("cross_source_conflict", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["cross_source_conflict"], 0.0)
+
+    def test_conflicting_evidence_reduces_calibrated_confidence(self):
+        aligned_docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth retry mitigation is enabled and stable for release readiness.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Auth retry mitigation is enabled and stable in incident diagnostics.",
+            ),
+        ]
+        conflicting_docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth retry mitigation is enabled and stable for release readiness.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Auth retry mitigation is disabled and unstable in incident diagnostics.",
+            ),
+        ]
+
+        aligned_engine = RetrievalEngine()
+        aligned_engine.ingest_documents(aligned_docs)
+        aligned = aligned_engine.retrieve_evidence(
+            "auth retry mitigation stability",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        conflicting_engine = RetrievalEngine()
+        conflicting_engine.ingest_documents(conflicting_docs)
+        conflicting = conflicting_engine.retrieve_evidence(
+            "auth retry mitigation stability",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertGreater(
+            conflicting.confidence_factors.get("cross_source_conflict", 0.0),
+            aligned.confidence_factors.get("cross_source_conflict", 0.0),
+        )
+        self.assertLess(conflicting.calibrated_confidence, aligned.calibrated_confidence)
+
     def test_retrieve_evidence_reports_source_concentration_signal(self):
         docs = [
             IngestDocument(

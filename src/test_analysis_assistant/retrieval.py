@@ -12,6 +12,42 @@ from .code_chunker import CodeAwareChunker, CodeChunk, CodeLanguage, detect_lang
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+_CONFLICT_POLARITY_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("enabled", "disabled"),
+    ("stable", "unstable"),
+    ("pass", "fail"),
+    ("success", "failure"),
+    ("present", "missing"),
+    ("allow", "deny"),
+    ("fixed", "broken"),
+    ("increase", "decrease"),
+    ("high", "low"),
+)
+_CONFLICT_TERMS = {term for pair in _CONFLICT_POLARITY_PAIRS for term in pair}
+_CONFLICT_CONTEXT_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "were",
+    "with",
+}
 
 
 class SourceType(str, Enum):
@@ -2222,6 +2258,46 @@ def _source_concentration(ranked: Sequence[RankedChunk]) -> float:
     return max(0.0, min(1.0, max_share))
 
 
+def _cross_source_conflict(ranked: Sequence[RankedChunk]) -> float:
+    if len(ranked) < 2:
+        return 0.0
+
+    comparable_pairs = 0
+    conflicting_pairs = 0
+    token_cache: Dict[str, set] = {}
+
+    for idx, left in enumerate(ranked):
+        left_key = left.chunk.chunk_id
+        left_tokens = token_cache.setdefault(left_key, set(_tokenize(left.chunk.text)))
+        for right in ranked[idx + 1:]:
+            if left.chunk.source_id == right.chunk.source_id:
+                continue
+            right_key = right.chunk.chunk_id
+            right_tokens = token_cache.setdefault(right_key, set(_tokenize(right.chunk.text)))
+            shared_context = (
+                left_tokens.intersection(right_tokens)
+                .difference(_CONFLICT_TERMS)
+                .difference(_CONFLICT_CONTEXT_STOPWORDS)
+            )
+            if not shared_context:
+                continue
+
+            comparable_pairs += 1
+            has_conflict = False
+            for positive, negative in _CONFLICT_POLARITY_PAIRS:
+                if (positive in left_tokens and negative in right_tokens) or (
+                    negative in left_tokens and positive in right_tokens
+                ):
+                    has_conflict = True
+                    break
+            if has_conflict:
+                conflicting_pairs += 1
+
+    if comparable_pairs == 0:
+        return 0.0
+    return max(0.0, min(1.0, conflicting_pairs / comparable_pairs))
+
+
 def _calibrate_retrieval_confidence(
     ranked: Sequence[RankedChunk],
     plan: QueryPlan,
@@ -2242,6 +2318,7 @@ def _calibrate_retrieval_confidence(
         ocr_stub_ratio = ocr_stub_count / len(ranked)
         low_signal_ratio = low_conf_count / len(ranked)
         cross_source_consensus = _cross_source_consensus(ranked)
+        cross_source_conflict = _cross_source_conflict(ranked)
         source_concentration = _source_concentration(ranked)
         extraction_reliability = sum(_extraction_quality(item.chunk) for item in ranked) / len(ranked)
         source_reliability = sum(_source_reliability(item.chunk) for item in ranked) / len(ranked)
@@ -2250,6 +2327,7 @@ def _calibrate_retrieval_confidence(
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
         cross_source_consensus = 0.0
+        cross_source_conflict = 0.0
         source_concentration = 0.0
         extraction_reliability = 0.0
         source_reliability = 0.0
@@ -2267,7 +2345,7 @@ def _calibrate_retrieval_confidence(
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
     route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
-    quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio)
+    quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio) + (0.16 * cross_source_conflict)
     availability_penalty = 0.08 * unavailable_pressure
     concentration_penalty = 0.04 * max(0.0, source_concentration - 0.75)
 
@@ -2289,6 +2367,7 @@ def _calibrate_retrieval_confidence(
         "low_signal_ratio": round(max(0.0, min(1.0, low_signal_ratio)), 4),
         "unavailable_pressure": round(unavailable_pressure, 4),
         "cross_source_consensus": round(max(0.0, min(1.0, cross_source_consensus)), 4),
+        "cross_source_conflict": round(max(0.0, min(1.0, cross_source_conflict)), 4),
         "source_concentration": round(max(0.0, min(1.0, source_concentration)), 4),
         "extraction_reliability": round(max(0.0, min(1.0, extraction_reliability)), 4),
         "source_reliability": round(max(0.0, min(1.0, source_reliability)), 4),

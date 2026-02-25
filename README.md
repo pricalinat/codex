@@ -61,6 +61,7 @@ It now also includes a retrieval foundation for AI-native analysis:
 - diversity-aware final ranking to improve cross-source evidence coverage
 - deterministic chunking, ranking, and confidence scoring with extraction-quality weighting
 - retrieval confidence factors include `extraction_reliability` for multimodal evidence quality calibration
+- confidence calibration now includes `cross_source_conflict` to penalize contradictory multisource evidence
 - prompt builder that emits citation-ready context blocks
 
 ### Quick Start
