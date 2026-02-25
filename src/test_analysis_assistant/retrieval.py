@@ -245,6 +245,43 @@ class RetrievalEngine:
         self._chunks.extend(chunked)
         return chunked
 
+    def ingest_prechunked(
+        self,
+        chunks: Sequence[Chunk],
+        generate_source_summaries: bool = False,
+    ) -> List[Chunk]:
+        """Ingest already-chunked content produced by external pipelines.
+
+        This enables direct indexing of chunks from `UnifiedIngestionPipeline`
+        without re-running extraction/chunking logic.
+        """
+        normalized: List[Chunk] = []
+        for chunk in chunks:
+            text = str(chunk.text or "").strip()
+            if not text:
+                continue
+            metadata = dict(chunk.metadata or {})
+            metadata.setdefault("ingestion_route", "prechunked")
+            metadata.setdefault("source_id", chunk.source_id)
+            token_count = int(chunk.token_count) if int(chunk.token_count or 0) > 0 else len(_tokenize(text))
+            normalized.append(
+                Chunk(
+                    chunk_id=chunk.chunk_id,
+                    source_id=chunk.source_id,
+                    source_type=chunk.source_type,
+                    modality=chunk.modality,
+                    text=text,
+                    token_count=token_count,
+                    metadata=metadata,
+                )
+            )
+
+        if generate_source_summaries and normalized:
+            normalized.extend(_build_source_summary_chunks(normalized))
+
+        self._chunks.extend(normalized)
+        return normalized
+
     def build_corpus_profile(self) -> CorpusCoverageProfile:
         source_type_counts: Dict[SourceType, int] = {}
         modality_counts: Dict[str, int] = {}
@@ -349,6 +386,7 @@ class RetrievalEngine:
             structural_boost = _structural_alignment(plan, chunk)
             repo_map_boost = _repository_map_alignment(plan, chunk)
             extraction_quality = _extraction_quality(chunk)
+            detection_quality = _detection_quality(chunk)
             score = (
                 lexical_score * 0.50
                 + source_boost * 0.15
@@ -357,6 +395,7 @@ class RetrievalEngine:
                 + structural_boost * 0.06
                 + repo_map_boost * 0.04
                 + extraction_quality * 0.06
+                + detection_quality * 0.03
                 + _source_reliability(chunk) * 0.03
             )
             breakdown = {
@@ -367,6 +406,7 @@ class RetrievalEngine:
                 "structural": round(structural_boost, 4),
                 "repo_map": round(repo_map_boost, 4),
                 "extraction": round(extraction_quality, 4),
+                "detection": round(detection_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
                 "authority": round(_source_authority(chunk), 4),
@@ -3013,10 +3053,42 @@ def _source_reliability(chunk: Chunk) -> float:
     if chunk.modality == "image_ocr_stub":
         reliability -= 0.22
 
+    detection_quality = _detection_quality(chunk)
     route_quality = _ingestion_route_quality(chunk)
-    reliability = (reliability * 0.84) + (route_quality * 0.16)
+    reliability = (reliability * 0.78) + (route_quality * 0.14) + (detection_quality * 0.08)
 
     return max(0.0, min(1.0, reliability))
+
+
+def _detection_quality(chunk: Chunk) -> float:
+    """Quality signal from ingestion-time content detection metadata."""
+    raw_conf = chunk.metadata.get("detection_confidence")
+    try:
+        detection_conf = float(raw_conf)
+    except (TypeError, ValueError):
+        detection_conf = 0.72 if str(chunk.metadata.get("ingestion_route", "")).strip().lower() == "pipeline_detected" else 0.64
+    detection_conf = max(0.0, min(1.0, detection_conf))
+
+    recommended_source = str(chunk.metadata.get("recommended_source_type", "")).strip().lower()
+    if not recommended_source:
+        source_alignment = 0.70
+    elif recommended_source == chunk.source_type.value:
+        source_alignment = 1.0
+    else:
+        source_alignment = 0.30
+
+    recommended_chunker = str(chunk.metadata.get("recommended_chunker", "")).strip().lower()
+    if not recommended_chunker:
+        chunker_alignment = 0.72
+    elif recommended_chunker == "code_aware":
+        chunker_alignment = 1.0 if chunk.modality == "code" else 0.35
+    elif recommended_chunker in {"basic", "test_aware", "hybrid"}:
+        chunker_alignment = 0.85 if chunk.modality in {"text", "table", "image", "image_ocr_stub", "markdown_mixed"} else 0.70
+    else:
+        chunker_alignment = 0.68
+
+    quality = (detection_conf * 0.72) + (source_alignment * 0.20) + (chunker_alignment * 0.08)
+    return max(0.0, min(1.0, quality))
 
 
 def _ingestion_route_quality(chunk: Chunk) -> float:
@@ -3025,6 +3097,7 @@ def _ingestion_route_quality(chunk: Chunk) -> float:
         "pipeline_verified": 0.98,
         "pipeline_verified_sidecar": 0.93,
         "pipeline_detected": 0.9,
+        "prechunked": 0.88,
         "repository_scan": 0.94,
         "artifact_bundle": 0.90,
         "normalized_record": 0.84,
@@ -4287,6 +4360,19 @@ class HybridRetrievalEngine(RetrievalEngine):
         self._compute_embeddings()
         return chunks
 
+    def ingest_prechunked(
+        self,
+        chunks: Sequence[Chunk],
+        generate_source_summaries: bool = False,
+    ) -> List[Chunk]:
+        """Ingest prechunked content and refresh semantic embeddings."""
+        ingested = super().ingest_prechunked(
+            chunks,
+            generate_source_summaries=generate_source_summaries,
+        )
+        self._compute_embeddings()
+        return ingested
+
     def _compute_embeddings(self) -> None:
         """Compute embeddings for all chunks."""
         if not self._chunks:
@@ -4360,6 +4446,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 structural_boost = _structural_alignment(plan, chunk)
                 repo_map_boost = _repository_map_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
+                detection_quality = _detection_quality(chunk)
                 score = (
                     final_score * 0.47
                     + source_boost * 0.15
@@ -4368,6 +4455,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + structural_boost * 0.08
                     + repo_map_boost * 0.04
                     + extraction_quality * 0.06
+                    + detection_quality * 0.03
                     + _source_reliability(chunk) * 0.04
                 )
             else:
@@ -4378,6 +4466,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 structural_boost = _structural_alignment(plan, chunk)
                 repo_map_boost = _repository_map_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
+                detection_quality = _detection_quality(chunk)
                 score = (
                     lex_score * 0.50
                     + source_boost * 0.15
@@ -4386,6 +4475,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + structural_boost * 0.06
                     + repo_map_boost * 0.04
                     + extraction_quality * 0.06
+                    + detection_quality * 0.03
                     + _source_reliability(chunk) * 0.03
                 )
 
@@ -4398,6 +4488,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 "structural": round(structural_boost, 4),
                 "repo_map": round(repo_map_boost, 4),
                 "extraction": round(extraction_quality, 4),
+                "detection": round(detection_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
                 "authority": round(_source_authority(chunk), 4),

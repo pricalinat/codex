@@ -26,6 +26,80 @@ from src.test_analysis_assistant.retrieval import (
 
 
 class TestRetrievalPipeline(unittest.TestCase):
+    def test_ingest_prechunked_indexes_pipeline_chunks_with_provenance_metadata(self):
+        engine = RetrievalEngine()
+        pipeline_chunks = [
+            Chunk(
+                chunk_id="pipeline-auth-1",
+                source_id="req:auth",
+                source_type=SourceType.REQUIREMENTS,
+                modality="text",
+                text="Authentication retries require mitigation planning and risk triage.",
+                token_count=9,
+                metadata={
+                    "ingestion_route": "pipeline_detected",
+                    "detection_confidence": 0.93,
+                    "recommended_source_type": "requirements",
+                    "recommended_chunker": "basic",
+                },
+            )
+        ]
+
+        indexed = engine.ingest_prechunked(pipeline_chunks)
+        ranked = engine.query("authentication mitigation risk triage", top_k=1, diversify=False)
+
+        self.assertEqual(1, len(indexed))
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertEqual("pipeline-auth-1", ranked[0].chunk.chunk_id)
+        self.assertEqual("pipeline_detected", ranked[0].chunk.metadata.get("ingestion_route"))
+        self.assertAlmostEqual(0.93, ranked[0].chunk.metadata.get("detection_confidence"), places=2)
+
+    def test_detection_quality_signal_prefers_high_confidence_pipeline_chunk(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="low-detect",
+                    source_id="know:auth:low",
+                    source_type=SourceType.KNOWLEDGE,
+                    modality="text",
+                    text="Authentication retry risk mitigation requires triage and owner assignment.",
+                    token_count=10,
+                    metadata={
+                        "ingestion_route": "pipeline_detected",
+                        "detection_confidence": 0.20,
+                        "recommended_source_type": "requirements",
+                        "recommended_chunker": "code_aware",
+                        "extraction_confidence": 0.9,
+                    },
+                ),
+                Chunk(
+                    chunk_id="high-detect",
+                    source_id="know:auth:high",
+                    source_type=SourceType.KNOWLEDGE,
+                    modality="text",
+                    text="Authentication retry risk mitigation requires triage and owner assignment.",
+                    token_count=10,
+                    metadata={
+                        "ingestion_route": "pipeline_detected",
+                        "detection_confidence": 0.97,
+                        "recommended_source_type": "knowledge",
+                        "recommended_chunker": "basic",
+                        "extraction_confidence": 0.9,
+                    },
+                ),
+            ]
+        )
+
+        ranked = engine.query("authentication retry risk mitigation triage", top_k=2, diversify=False)
+
+        self.assertEqual(2, len(ranked))
+        self.assertEqual("high-detect", ranked[0].chunk.chunk_id)
+        self.assertGreater(
+            ranked[0].score_breakdown.get("reliability", 0.0),
+            ranked[1].score_breakdown.get("reliability", 0.0),
+        )
+
     def test_build_query_plan_extracts_structural_targets(self):
         engine = RetrievalEngine()
 
