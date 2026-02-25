@@ -41,6 +41,34 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("image_ocr_stub", evidence.missing_modalities)
         self.assertIn(evidence.confidence_band, {"low", "medium", "high"})
 
+    def test_retrieve_evidence_reports_unavailable_corpus_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication release risk and missing test coverage details.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table risk matrix for authentication gaps",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("table", evidence.unavailable_preferred_modalities)
+        self.assertIn("image", evidence.unavailable_preferred_modalities)
+        self.assertIn("image_ocr_stub", evidence.unavailable_preferred_modalities)
+        self.assertTrue(len(evidence.unavailable_preferred_source_types) > 0)
+        self.assertEqual(
+            set(evidence.unavailable_preferred_source_types).intersection(set(evidence.covered_source_types)),
+            set(),
+        )
+
     def test_query_with_expansion_brings_goal_complementary_source(self):
         docs = [
             IngestDocument(

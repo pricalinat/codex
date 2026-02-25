@@ -181,6 +181,27 @@ Missing negative authorization tests are release blocking.
         result = analyzer.analyze(test_report, query_for_context="auth retry heatmap risk")
         self.assertTrue(any(source.startswith("incident:auth") for source in result.evidence_sources))
 
+    def test_analyze_reports_unavailable_corpus_evidence(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_login">
+                <failure type="AssertionError">Expected True, got False</failure>
+            </testcase>
+        </testsuite>"""
+        analyzer = RAGAnalyzer()
+        analyzer.initialize_corpus(
+            requirements_docs=[
+                ("req-auth", "Authentication release risk requires stricter negative test coverage."),
+            ]
+        )
+
+        result = analyzer.analyze(test_report, query_for_context="image table risk matrix for auth")
+
+        self.assertIn("unavailable_evidence", result.risk_assessment)
+        unavailable = result.risk_assessment["unavailable_evidence"]
+        self.assertIn("modalities", unavailable)
+        self.assertIn("table", unavailable["modalities"])
+        self.assertIn("image", unavailable["modalities"])
+
 
 class TestRAGSeverityAssessment(unittest.TestCase):
     def test_critical_severity_detection(self):

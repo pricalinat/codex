@@ -70,6 +70,10 @@ class RetrievalEvidence:
     covered_modalities: List[str] = field(default_factory=list)
     missing_source_types: List[SourceType] = field(default_factory=list)
     missing_modalities: List[str] = field(default_factory=list)
+    corpus_available_source_types: List[SourceType] = field(default_factory=list)
+    corpus_available_modalities: List[str] = field(default_factory=list)
+    unavailable_preferred_source_types: List[SourceType] = field(default_factory=list)
+    unavailable_preferred_modalities: List[str] = field(default_factory=list)
     aggregate_confidence: float = 0.0
     confidence_band: str = "low"
     retrieval_strategy: str = "baseline"
@@ -388,11 +392,18 @@ class RetrievalEngine:
             if use_expansion
             else self.query(query_text, top_k=top_k, diversify=diversify)
         )
+        corpus_available_sources = _dedupe([item.source_type for item in self._chunks])
+        corpus_available_modalities = _dedupe([item.modality for item in self._chunks])
         covered_sources = _dedupe([item.chunk.source_type for item in ranked])
         covered_modalities = _dedupe([item.chunk.modality for item in ranked])
         missing_sources = [stype for stype in plan.preferred_source_types if stype not in covered_sources]
         missing_modalities = [modality for modality in plan.preferred_modalities if modality not in covered_modalities]
-
+        unavailable_sources = [
+            stype for stype in plan.preferred_source_types if stype not in corpus_available_sources
+        ]
+        unavailable_modalities = [
+            modality for modality in plan.preferred_modalities if modality not in corpus_available_modalities
+        ]
         aggregate_confidence = _aggregate_confidence(ranked)
         recovery_applied = False
         recovery_queries: List[str] = []
@@ -457,6 +468,10 @@ class RetrievalEngine:
             covered_modalities=covered_modalities,
             missing_source_types=missing_sources,
             missing_modalities=missing_modalities,
+            corpus_available_source_types=corpus_available_sources,
+            corpus_available_modalities=corpus_available_modalities,
+            unavailable_preferred_source_types=unavailable_sources,
+            unavailable_preferred_modalities=unavailable_modalities,
             aggregate_confidence=aggregate_confidence,
             confidence_band=band,
             retrieval_strategy=retrieval_strategy,

@@ -321,6 +321,7 @@ class RAGAnalyzer:
         test_gaps: List[str] = []
         risk_factors: Dict[str, Any] = {"factors": [], "overall_risk": "low"}
         missing_artifacts = {"source_types": set(), "modalities": set()}
+        unavailable_artifacts = {"source_types": set(), "modalities": set()}
         retrieval_confidences: List[float] = []
 
         for query in queries:
@@ -334,6 +335,10 @@ class RAGAnalyzer:
                 missing_artifacts["source_types"].add(missing_source.value)
             for missing_modality in evidence.missing_modalities:
                 missing_artifacts["modalities"].add(missing_modality)
+            for unavailable_source in evidence.unavailable_preferred_source_types:
+                unavailable_artifacts["source_types"].add(unavailable_source.value)
+            for unavailable_modality in evidence.unavailable_preferred_modalities:
+                unavailable_artifacts["modalities"].add(unavailable_modality)
 
             # Track evidence sources
             all_evidence_sources.extend(item.chunk.source_id for item in ranked)
@@ -377,6 +382,11 @@ class RAGAnalyzer:
                 "source_types": sorted(missing_artifacts["source_types"]),
                 "modalities": sorted(missing_artifacts["modalities"]),
             }
+        if unavailable_artifacts["source_types"] or unavailable_artifacts["modalities"]:
+            risk_factors["unavailable_evidence"] = {
+                "source_types": sorted(unavailable_artifacts["source_types"]),
+                "modalities": sorted(unavailable_artifacts["modalities"]),
+            }
 
         # Generate structured test gaps and requirement traces
         structured_gaps = self._analyze_test_gaps(base_result)
@@ -400,6 +410,15 @@ class RAGAnalyzer:
                 f"source_types={[s.value for s in prompt_evidence.missing_source_types]} "
                 f"modalities={prompt_evidence.missing_modalities} "
                 f"(confidence_band={prompt_evidence.confidence_band})"
+            )
+        if (
+            prompt_evidence.unavailable_preferred_source_types
+            or prompt_evidence.unavailable_preferred_modalities
+        ):
+            augmented_prompt += (
+                "\nCorpus-unavailable evidence: "
+                f"source_types={[s.value for s in prompt_evidence.unavailable_preferred_source_types]} "
+                f"modalities={prompt_evidence.unavailable_preferred_modalities}"
             )
 
         return RAGAnalysisResult(
