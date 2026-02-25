@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .analyzer import analyze_report_text
 from .models import AnalysisResult, FailureCluster, FixSuggestion
 from .retrieval import (
+    AnalysisEvidencePack,
     ArtifactBundle,
     CodeAwareIngestor,
     DummyEmbeddingProvider,
@@ -17,7 +18,7 @@ from .retrieval import (
     RankedChunk,
     RetrievalEngine,
     SourceType,
-    build_analysis_prompt_from_evidence,
+    build_analysis_prompt_from_pack,
     create_hybrid_engine,
 )
 
@@ -400,15 +401,20 @@ class RAGAnalyzer:
         requirement_traces = self._trace_requirements(base_result)
 
         # Build augmented prompt for LLM
-        prompt_evidence = self._engine.retrieve_evidence(
-            "failure clustering root cause test gap risk prioritization",
-            top_k=10,
+        analysis_pack: AnalysisEvidencePack = self._engine.retrieve_analysis_evidence_pack(
+            query_for_context or "failure clustering root cause test gap risk prioritization",
+            top_k_per_focus=3,
             diversify=True,
+            use_expansion=True,
+            adaptive_recovery=True,
         )
-        augmented_prompt = build_analysis_prompt_from_evidence(
+        augmented_prompt = build_analysis_prompt_from_pack(
             question=query_for_context or "Analyze test failures with context from retrieved documents",
-            evidence=prompt_evidence,
+            pack=analysis_pack,
         )
+        if analysis_pack.focus_confidence:
+            risk_factors["focus_confidence"] = dict(sorted(analysis_pack.focus_confidence.items()))
+            risk_factors["focus_overall_confidence"] = analysis_pack.overall_confidence
 
         return RAGAnalysisResult(
             base_result=base_result,

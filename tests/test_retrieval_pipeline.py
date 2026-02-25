@@ -3,8 +3,10 @@ import tempfile
 from pathlib import Path
 
 from src.test_analysis_assistant.retrieval import (
+    AnalysisEvidencePack,
     ArtifactBundle,
     DummyEmbeddingProvider,
+    FocusedEvidence,
     HybridRetrievalEngine,
     IngestDocument,
     MultiSourceIngestor,
@@ -14,12 +16,69 @@ from src.test_analysis_assistant.retrieval import (
     TFIDFEmbeddingProvider,
     build_analysis_prompt,
     build_analysis_prompt_from_evidence,
+    build_analysis_prompt_from_pack,
     create_code_aware_engine,
     create_hybrid_engine,
 )
 
 
 class TestRetrievalPipeline(unittest.TestCase):
+    def test_retrieve_analysis_evidence_pack_builds_focus_and_merged_results(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-auth",
+                source_type=SourceType.REPOSITORY,
+                content="Flaky login failures cluster around token refresh traceback paths.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Root cause hypothesis points to retry storm and timeout cascade in auth service.",
+            ),
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Missing negative credential tests are release risk and require mitigation plan.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        pack = engine.retrieve_analysis_evidence_pack("authentication failures in release tests", top_k_per_focus=2)
+
+        self.assertIsInstance(pack, AnalysisEvidencePack)
+        self.assertEqual(len(pack.focus_results), 5)
+        self.assertTrue(all(isinstance(item, FocusedEvidence) for item in pack.focus_results))
+        self.assertGreater(len(pack.merged_evidence.ranked_chunks), 0)
+        self.assertGreaterEqual(pack.overall_confidence, 0.0)
+        self.assertLessEqual(pack.overall_confidence, 1.0)
+        self.assertIn("root_cause", pack.focus_confidence)
+        self.assertIn("test_gap", pack.focus_confidence)
+
+    def test_build_analysis_prompt_from_pack_includes_focus_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication test gap and release risk prioritization details.",
+            ),
+            IngestDocument(
+                source_id="sys-auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="Failure clustering and root cause notes for auth retries.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+        pack = engine.retrieve_analysis_evidence_pack("auth release risk", top_k_per_focus=2)
+
+        prompt = build_analysis_prompt_from_pack("Analyze auth failures", pack)
+
+        self.assertIn("Analysis focus coverage", prompt)
+        self.assertIn("failure_clustering", prompt)
+        self.assertIn("root_cause", prompt)
+        self.assertIn("Source bundle summary", prompt)
+
     def test_retrieve_evidence_reports_missing_modalities(self):
         docs = [
             IngestDocument(

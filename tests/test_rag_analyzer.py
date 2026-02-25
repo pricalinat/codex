@@ -207,6 +207,32 @@ Missing negative authorization tests are release blocking.
         self.assertIn("table", unavailable["modalities"])
         self.assertIn("image", unavailable["modalities"])
 
+    def test_analyze_reports_focus_confidence_and_prompt_focus_section(self):
+        test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
+            <testcase classname="test_auth" name="test_refresh">
+                <failure type="RuntimeError">token refresh failure</failure>
+            </testcase>
+        </testsuite>"""
+        analyzer = RAGAnalyzer()
+        analyzer.initialize_corpus(
+            requirements_docs=[
+                ("req-auth", "Missing auth negative tests and release mitigation steps."),
+            ],
+            system_analysis_docs=[
+                ("sys-auth", "Root cause analysis for auth retry storm and failure cluster."),
+            ],
+            knowledge_docs=[
+                ("kb-auth", "Risk prioritization guidance for release blockers."),
+            ],
+        )
+
+        result = analyzer.analyze(test_report, query_for_context="auth retry failure")
+
+        self.assertIn("focus_confidence", result.risk_assessment)
+        self.assertIn("root_cause", result.risk_assessment["focus_confidence"])
+        self.assertIn("test_gap", result.risk_assessment["focus_confidence"])
+        self.assertIn("Analysis focus coverage", result.augmented_prompt)
+
 
 class TestRAGSeverityAssessment(unittest.TestCase):
     def test_critical_severity_detection(self):

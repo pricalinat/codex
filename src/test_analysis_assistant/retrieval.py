@@ -94,6 +94,24 @@ class RetrievalEvidence:
 
 
 @dataclass
+class FocusedEvidence:
+    focus_area: str
+    query_text: str
+    evidence: RetrievalEvidence
+
+
+@dataclass
+class AnalysisEvidencePack:
+    query_text: str
+    focus_results: List[FocusedEvidence] = field(default_factory=list)
+    merged_evidence: RetrievalEvidence = field(
+        default_factory=lambda: RetrievalEvidence(query_text="", query_plan=QueryPlan(query_text="", tokens=[]))
+    )
+    focus_confidence: Dict[str, float] = field(default_factory=dict)
+    overall_confidence: float = 0.0
+
+
+@dataclass
 class SourceEvidenceBundle:
     source_id: str
     source_type: SourceType
@@ -580,6 +598,123 @@ class RetrievalEngine:
             recovery_queries=recovery_queries,
             corpus_profile=corpus_profile,
             recommended_ingestion_actions=recommended_ingestion_actions,
+        )
+
+    def retrieve_analysis_evidence_pack(
+        self,
+        query_text: str,
+        top_k_per_focus: int = 4,
+        diversify: bool = True,
+        use_expansion: bool = True,
+        adaptive_recovery: bool = True,
+    ) -> AnalysisEvidencePack:
+        focus_queries = _build_focus_queries(query_text)
+        focus_results: List[FocusedEvidence] = []
+        focus_confidence: Dict[str, float] = {}
+        merged_ranked: List[RankedChunk] = []
+        merged_recovery_applied = False
+        merged_recovery_queries: List[str] = []
+        merged_strategy = "baseline"
+
+        for focus_area, focus_query in focus_queries:
+            evidence = self.retrieve_evidence(
+                focus_query,
+                top_k=max(1, top_k_per_focus),
+                diversify=diversify,
+                use_expansion=use_expansion,
+                adaptive_recovery=adaptive_recovery,
+            )
+            focus_results.append(FocusedEvidence(focus_area=focus_area, query_text=focus_query, evidence=evidence))
+            focus_confidence[focus_area] = evidence.calibrated_confidence
+            merged_recovery_applied = merged_recovery_applied or evidence.recovery_applied
+            if evidence.recovery_queries:
+                merged_recovery_queries.extend(evidence.recovery_queries)
+            if evidence.retrieval_strategy == "adaptive_recovery":
+                merged_strategy = "adaptive_recovery"
+            if not merged_ranked:
+                merged_ranked = list(evidence.ranked_chunks)
+            else:
+                merged_ranked = _fuse_ranked_chunks(merged_ranked, evidence.ranked_chunks)
+
+        merged_query = f"{query_text} failure clustering root cause test gap risk prioritization actionable plan".strip()
+        merged_plan = self.build_query_plan(merged_query)
+        corpus_profile = self.build_corpus_profile()
+        merged_ranked = _select_coverage_aware_top(
+            merged_ranked,
+            plan=merged_plan,
+            top_k=max(top_k_per_focus * 2, 6),
+            diversify=diversify,
+        )
+        covered_sources = _dedupe([item.chunk.source_type for item in merged_ranked])
+        covered_modalities = _dedupe([item.chunk.modality for item in merged_ranked])
+        missing_sources = [stype for stype in merged_plan.preferred_source_types if stype not in covered_sources]
+        missing_modalities = [modality for modality in merged_plan.preferred_modalities if modality not in covered_modalities]
+        corpus_available_sources = _dedupe(list(corpus_profile.source_type_counts.keys()))
+        corpus_available_modalities = _dedupe(list(corpus_profile.modality_counts.keys()))
+        unavailable_sources = [stype for stype in merged_plan.preferred_source_types if stype not in corpus_available_sources]
+        unavailable_modalities = [
+            modality for modality in merged_plan.preferred_modalities if modality not in corpus_available_modalities
+        ]
+        aggregate_confidence = _aggregate_confidence(merged_ranked)
+        calibrated_confidence, confidence_factors = _calibrate_retrieval_confidence(
+            ranked=merged_ranked,
+            plan=merged_plan,
+            aggregate_confidence=aggregate_confidence,
+            missing_sources=missing_sources,
+            missing_modalities=missing_modalities,
+            unavailable_sources=unavailable_sources,
+            unavailable_modalities=unavailable_modalities,
+        )
+        if calibrated_confidence >= 0.72:
+            confidence_band = "high"
+        elif calibrated_confidence >= 0.45:
+            confidence_band = "medium"
+        else:
+            confidence_band = "low"
+
+        merged_evidence = RetrievalEvidence(
+            query_text=merged_query,
+            query_plan=merged_plan,
+            ranked_chunks=merged_ranked,
+            source_bundles=_build_source_bundles(merged_ranked, merged_plan),
+            covered_source_types=covered_sources,
+            covered_modalities=covered_modalities,
+            missing_source_types=missing_sources,
+            missing_modalities=missing_modalities,
+            corpus_available_source_types=corpus_available_sources,
+            corpus_available_modalities=corpus_available_modalities,
+            unavailable_preferred_source_types=unavailable_sources,
+            unavailable_preferred_modalities=unavailable_modalities,
+            aggregate_confidence=aggregate_confidence,
+            calibrated_confidence=calibrated_confidence,
+            confidence_band=confidence_band,
+            confidence_factors=confidence_factors,
+            retrieval_strategy=merged_strategy,
+            recovery_applied=merged_recovery_applied,
+            recovery_queries=_dedupe(merged_recovery_queries),
+            corpus_profile=corpus_profile,
+            recommended_ingestion_actions=_recommend_ingestion_actions(
+                plan=merged_plan,
+                corpus_profile=corpus_profile,
+                missing_sources=missing_sources,
+                missing_modalities=missing_modalities,
+                unavailable_sources=unavailable_sources,
+                unavailable_modalities=unavailable_modalities,
+            ),
+        )
+
+        overall_confidence = (
+            round(sum(focus_confidence.values()) / len(focus_confidence), 4)
+            if focus_confidence
+            else merged_evidence.calibrated_confidence
+        )
+
+        return AnalysisEvidencePack(
+            query_text=query_text,
+            focus_results=focus_results,
+            merged_evidence=merged_evidence,
+            focus_confidence=focus_confidence,
+            overall_confidence=overall_confidence,
         )
 
     def _expand_query_variants(self, query_text: str, max_variants: int = 4) -> List[Tuple[str, float]]:
@@ -1116,6 +1251,28 @@ def build_analysis_prompt_from_evidence(question: str, evidence: RetrievalEviden
         for action in evidence.recommended_ingestion_actions:
             lines.append(f"- {action}")
 
+    return prompt + "\n" + "\n".join(lines)
+
+
+def build_analysis_prompt_from_pack(question: str, pack: AnalysisEvidencePack) -> str:
+    prompt = build_analysis_prompt_from_evidence(question=question, evidence=pack.merged_evidence)
+    lines = ["", "Analysis focus coverage:"]
+
+    for item in pack.focus_results:
+        evidence = item.evidence
+        lines.append(
+            f"- {item.focus_area}: confidence={evidence.calibrated_confidence:.2f} "
+            f"band={evidence.confidence_band} "
+            f"sources={len(evidence.covered_source_types)} "
+            f"modalities={len(evidence.covered_modalities)}"
+        )
+        if evidence.missing_source_types or evidence.missing_modalities:
+            lines.append(
+                f"  missing source_types={[s.value for s in evidence.missing_source_types]} "
+                f"modalities={evidence.missing_modalities}"
+            )
+
+    lines.append(f"overall_focus_confidence={pack.overall_confidence:.2f}")
     return prompt + "\n" + "\n".join(lines)
 
 
@@ -2145,6 +2302,18 @@ def _build_recovery_queries(
         if len(deduped) >= max(1, max_queries):
             break
     return deduped
+
+
+def _build_focus_queries(query_text: str) -> List[Tuple[str, str]]:
+    base = query_text.strip() or "test analysis"
+    focus_hints = [
+        ("failure_clustering", "cluster recurring flaky failure patterns and shared signatures"),
+        ("root_cause", "root cause traceback hypothesis and failure origin"),
+        ("test_gap", "missing test coverage negative and edge case scenarios"),
+        ("risk_prioritization", "release risk severity prioritization p0 blocking issues"),
+        ("actionable_plan", "actionable mitigation plan next steps and owner assignments"),
+    ]
+    return [(focus, f"{base} {hint}".strip()) for focus, hint in focus_hints]
 
 
 def _recommend_ingestion_actions(
