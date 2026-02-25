@@ -17,7 +17,7 @@ from .retrieval import (
     RankedChunk,
     RetrievalEngine,
     SourceType,
-    build_analysis_prompt,
+    build_analysis_prompt_from_evidence,
     create_hybrid_engine,
 )
 
@@ -405,28 +405,10 @@ class RAGAnalyzer:
             top_k=10,
             diversify=True,
         )
-        ranked_for_prompt = prompt_evidence.ranked_chunks
-        augmented_prompt = build_analysis_prompt(
+        augmented_prompt = build_analysis_prompt_from_evidence(
             question=query_for_context or "Analyze test failures with context from retrieved documents",
-            ranked_context=ranked_for_prompt,
-            source_bundles=prompt_evidence.source_bundles,
+            evidence=prompt_evidence,
         )
-        if prompt_evidence.missing_source_types or prompt_evidence.missing_modalities:
-            augmented_prompt += (
-                "\n\nMissing retrieval evidence: "
-                f"source_types={[s.value for s in prompt_evidence.missing_source_types]} "
-                f"modalities={prompt_evidence.missing_modalities} "
-                f"(confidence_band={prompt_evidence.confidence_band})"
-            )
-        if (
-            prompt_evidence.unavailable_preferred_source_types
-            or prompt_evidence.unavailable_preferred_modalities
-        ):
-            augmented_prompt += (
-                "\nCorpus-unavailable evidence: "
-                f"source_types={[s.value for s in prompt_evidence.unavailable_preferred_source_types]} "
-                f"modalities={prompt_evidence.unavailable_preferred_modalities}"
-            )
 
         return RAGAnalysisResult(
             base_result=base_result,

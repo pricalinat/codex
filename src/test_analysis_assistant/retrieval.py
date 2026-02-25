@@ -401,10 +401,20 @@ class RetrievalEngine:
         adaptive_recovery: bool = True,
     ) -> RetrievalEvidence:
         plan = self.build_query_plan(query_text)
+        requested_top_k = max(1, top_k)
+        candidate_top_k = requested_top_k
+        if len(self._chunks) > requested_top_k:
+            candidate_top_k = min(len(self._chunks), max((requested_top_k * 3), (requested_top_k + 4)))
         ranked = (
-            self.query_with_expansion(query_text, top_k=top_k, diversify=diversify)
+            self.query_with_expansion(query_text, top_k=candidate_top_k, diversify=diversify)
             if use_expansion
-            else self.query(query_text, top_k=top_k, diversify=diversify)
+            else self.query(query_text, top_k=candidate_top_k, diversify=diversify)
+        )
+        ranked = _select_coverage_aware_top(
+            ranked,
+            plan=plan,
+            top_k=requested_top_k,
+            diversify=diversify,
         )
         corpus_available_sources = _dedupe([item.source_type for item in self._chunks])
         corpus_available_modalities = _dedupe([item.modality for item in self._chunks])
@@ -459,7 +469,7 @@ class RetrievalEngine:
                     ranked = _select_coverage_aware_top(
                         fused,
                         plan=plan,
-                        top_k=max(1, top_k),
+                        top_k=requested_top_k,
                         diversify=diversify,
                     )
                     recovery_applied = True
@@ -957,6 +967,47 @@ def build_analysis_prompt(
         ]
     )
     return "\n".join(lines)
+
+
+def build_analysis_prompt_from_evidence(question: str, evidence: RetrievalEvidence) -> str:
+    """Build an analysis prompt from full retrieval evidence metadata."""
+    prompt = build_analysis_prompt(
+        question=question,
+        ranked_context=evidence.ranked_chunks,
+        source_bundles=evidence.source_bundles,
+    )
+
+    lines = [
+        "",
+        "Retrieval confidence:",
+        (
+            f"aggregate={evidence.aggregate_confidence:.2f} "
+            f"calibrated={evidence.calibrated_confidence:.2f} "
+            f"band={evidence.confidence_band} "
+            f"strategy={evidence.retrieval_strategy}"
+        ),
+    ]
+
+    if evidence.confidence_factors:
+        factor_text = ", ".join(
+            f"{name}={value:.2f}" for name, value in sorted(evidence.confidence_factors.items())
+        )
+        lines.append(f"confidence_factors: {factor_text}")
+
+    if evidence.missing_source_types or evidence.missing_modalities:
+        lines.append(
+            "Missing retrieval evidence: "
+            f"source_types={[item.value for item in evidence.missing_source_types]} "
+            f"modalities={evidence.missing_modalities}"
+        )
+    if evidence.unavailable_preferred_source_types or evidence.unavailable_preferred_modalities:
+        lines.append(
+            "Corpus-unavailable evidence: "
+            f"source_types={[item.value for item in evidence.unavailable_preferred_source_types]} "
+            f"modalities={evidence.unavailable_preferred_modalities}"
+        )
+
+    return prompt + "\n" + "\n".join(lines)
 
 
 def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:

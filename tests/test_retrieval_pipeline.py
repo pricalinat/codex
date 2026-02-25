@@ -13,6 +13,7 @@ from src.test_analysis_assistant.retrieval import (
     SourceType,
     TFIDFEmbeddingProvider,
     build_analysis_prompt,
+    build_analysis_prompt_from_evidence,
     create_hybrid_engine,
 )
 
@@ -790,6 +791,66 @@ Missing negative authorization tests increase release risk.
         self.assertIn("Source bundle summary", prompt)
         self.assertIn("coverage=", prompt)
         self.assertIn("req-md-prompt", prompt)
+
+    def test_retrieve_evidence_prefers_intent_source_coverage_from_candidate_pool(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-auth-a",
+                source_type=SourceType.REPOSITORY,
+                content="traceback root cause hypothesis auth parser failure in decode path",
+            ),
+            IngestDocument(
+                source_id="repo-auth-b",
+                source_type=SourceType.REPOSITORY,
+                content="traceback root cause hypothesis auth handler failure in request flow",
+            ),
+            IngestDocument(
+                source_id="sys-auth-incident",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content="incident diagnostics root cause auth failure and traceback chain",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "traceback root cause hypothesis why auth failures",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertEqual(2, len(evidence.ranked_chunks))
+        source_types = {item.chunk.source_type for item in evidence.ranked_chunks}
+        self.assertIn(SourceType.SYSTEM_ANALYSIS, source_types)
+
+    def test_build_analysis_prompt_from_evidence_includes_confidence_and_missing_signals(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication release risk requires mitigation and test gap review.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "image table risk matrix for authentication gaps",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+        prompt = build_analysis_prompt_from_evidence(
+            question="Prioritize test gaps for this release.",
+            evidence=evidence,
+        )
+
+        self.assertIn("Retrieval confidence:", prompt)
+        self.assertIn("Missing retrieval evidence:", prompt)
+        self.assertIn("Prioritize test gaps for this release.", prompt)
 
     def test_build_query_plan_detects_risk_gap_intent(self):
         engine = RetrievalEngine()
