@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .bm25_ranking import BM25Provider, create_bm25_provider
 from .code_chunker import CodeAwareChunker, CodeChunk, CodeLanguage, detect_language, extract_code_units
 
 
@@ -6168,7 +6169,10 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 
 class HybridRetrievalEngine(RetrievalEngine):
-    """Enhanced retrieval engine with hybrid (lexical + semantic) search."""
+    """Enhanced retrieval engine with hybrid (lexical + semantic) search.
+
+    Supports BM25 for improved lexical scoring over basic term overlap.
+    """
 
     def __init__(
         self,
@@ -6176,12 +6180,15 @@ class HybridRetrievalEngine(RetrievalEngine):
         chunk_overlap: int = 40,
         embedding_provider: Optional[EmbeddingProvider] = None,
         lexical_weight: float = 0.5,
+        use_bm25: bool = True,
     ) -> None:
         super().__init__(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         self._embedding_provider = embedding_provider or DummyEmbeddingProvider()
         self._lexical_weight = max(0.0, min(1.0, lexical_weight))
         self._semantic_weight = 1.0 - self._lexical_weight
         self._chunk_embeddings: Dict[str, List[float]] = {}
+        self._use_bm25 = use_bm25
+        self._bm25_provider: Optional[BM25Provider] = None
 
     def ingest_documents(
         self,
@@ -6225,6 +6232,21 @@ class HybridRetrievalEngine(RetrievalEngine):
             for chunk, embedding in zip(self._chunks, embeddings):
                 self._chunk_embeddings[chunk.chunk_id] = embedding
 
+        # Build BM25 index if enabled
+        if self._use_bm25:
+            self._build_bm25_index()
+
+    def _build_bm25_index(self) -> None:
+        """Build BM25 index from chunks."""
+        if not self._chunks:
+            return
+        try:
+            texts = [chunk.text for chunk in self._chunks]
+            self._bm25_provider = create_bm25_provider()
+            self._bm25_provider.prepare_corpus(texts)
+        except Exception:
+            self._bm25_provider = None
+
     def query(
         self,
         query_text: str,
@@ -6244,13 +6266,30 @@ class HybridRetrievalEngine(RetrievalEngine):
         if not self._chunks or not plan.tokens:
             return []
 
-        # Get lexical scores
+        # Get lexical scores (using BM25 if available)
+        bm25_scores: Dict[int, float] = {}
+        if self._bm25_provider:
+            try:
+                bm25_scores = self._bm25_provider.get_scores(query_text)
+            except Exception:
+                pass  # Fall back to basic lexical scoring
+
+        # Normalize BM25 scores to 0-1 range
+        if bm25_scores:
+            max_bm25 = max(bm25_scores.values()) if bm25_scores else 1.0
+            if max_bm25 > 0:
+                bm25_scores = {k: v / max_bm25 for k, v in bm25_scores.items()}
+
         lexical_scores: Dict[str, float] = {}
-        for chunk in self._chunks:
-            chunk_tokens = set(_tokenize(chunk.text))
-            overlap = plan.tokens  # Already normalized tokens
-            lexical_score = len(set(overlap).intersection(chunk_tokens)) / max(len(plan.tokens), 1)
-            lexical_scores[chunk.chunk_id] = lexical_score
+        for idx, chunk in enumerate(self._chunks):
+            # Use BM25 score if available, otherwise fall back to basic token overlap
+            if idx in bm25_scores:
+                lexical_scores[chunk.chunk_id] = bm25_scores[idx]
+            else:
+                chunk_tokens = set(_tokenize(chunk.text))
+                overlap = plan.tokens  # Already normalized tokens
+                lexical_score = len(set(overlap).intersection(chunk_tokens)) / max(len(plan.tokens), 1)
+                lexical_scores[chunk.chunk_id] = lexical_score
 
         # Get semantic scores if hybrid mode
         semantic_scores: Dict[str, float] = {}
@@ -6322,6 +6361,7 @@ class HybridRetrievalEngine(RetrievalEngine):
             breakdown = {
                 "lexical": round(lex_score, 4),
                 "semantic": round(sem_score, 4) if use_hybrid else 0.0,
+                "bm25_used": bool(bm25_scores),  # Flag indicating BM25 was used for lexical scoring
                 "source": round(source_boost, 4),
                 "intent": round(intent_boost, 4),
                 "modality": round(modality_boost, 4),
@@ -6420,6 +6460,7 @@ def create_hybrid_engine(
     chunk_overlap: int = 40,
     embedding_provider: Optional[EmbeddingProvider] = None,
     lexical_weight: float = 0.5,
+    use_bm25: bool = True,
 ) -> HybridRetrievalEngine:
     """Factory function to create a hybrid retrieval engine.
 
@@ -6428,6 +6469,7 @@ def create_hybrid_engine(
         chunk_overlap: Token overlap between chunks
         embedding_provider: Optional custom embedding provider
         lexical_weight: Weight for lexical search (0-1), semantic gets 1-lexical_weight
+        use_bm25: Whether to use BM25 for lexical scoring (default: True)
 
     Returns:
         Configured HybridRetrievalEngine instance
@@ -6437,6 +6479,7 @@ def create_hybrid_engine(
         chunk_overlap=chunk_overlap,
         embedding_provider=embedding_provider,
         lexical_weight=lexical_weight,
+        use_bm25=use_bm25,
     )
 
 
