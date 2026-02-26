@@ -1,14 +1,8 @@
-"""Code-aware chunking for improved repository ingestion.
+"""Semantic chunking implementation for improved retrieval.
 
-This module provides code-structure-aware text chunking that respects
-function, class, and module boundaries when processing code repositories.
-It integrates with the existing retrieval pipeline to provide better
-code context for test analysis.
-
-New in this version:
-- Test-aware semantic chunking that prioritizes test-related code sections
-- Priority scoring for test functions, fixtures, assertions
-- Cross-reference detection for better test-code mapping
+This module provides semantic chunking that creates more coherent chunks
+by respecting sentence boundaries and topic shifts. It complements the
+existing code-aware and test-aware chunkers.
 """
 
 import re
@@ -17,6 +11,386 @@ from enum import Enum
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
+# Sentence boundary patterns for different content types
+_SENTENCE_ENDINGS = re.compile(r'(?<=[.!?])\s+')
+_PARAGRAPH_BREAKS = re.compile(r'\n\s*\n')
+_CODE_BLOCK_PATTERN = re.compile(r'```[\s\S]*?```|`[^`]+`')
+_MARKDOWN_HEADERS = re.compile(r'^#{1,6}\s+.+$', re.MULTILINE)
+_LIST_MARKERS = re.compile(r'^[\s]*[-*+]\s+|^[\s]*\d+\.\s+', re.MULTILINE)
+
+
+def split_into_sentences(text: str) -> List[str]:
+    """Split text into sentences while handling common edge cases.
+
+    Args:
+        text: Input text
+
+    Returns:
+        List of sentences
+    """
+    # Handle code blocks first - don't split inside them
+    code_blocks: List[str] = []
+    def replace_code(match: str) -> str:
+        idx = len(code_blocks)
+        code_blocks.append(match.group(0))
+        return f"__CODE_BLOCK_{idx}__"
+
+    text_without_code = _CODE_BLOCK_PATTERN.sub(replace_code, text)
+
+    # Split on sentence endings
+    sentences = _SENTENCE_ENDINGS.split(text_without_code)
+
+    # Restore code blocks
+    result: List[str] = []
+    for sent in sentences:
+        for idx, block in enumerate(code_blocks):
+            sent = sent.replace(f"__CODE_BLOCK_{idx}__", block)
+        if sent.strip():
+            result.append(sent)
+
+    return result
+
+
+def detect_paragraph_boundaries(text: str) -> List[int]:
+    """Detect paragraph boundary positions.
+
+    Args:
+        text: Input text
+
+    Returns:
+        List of line indices where paragraphs start
+    """
+    lines = text.split('\n')
+    boundaries = [0]  # Start with first line
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # New paragraph indicators
+        if not stripped:
+            # Empty line - next non-empty line starts new paragraph
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip():
+                    boundaries.append(j)
+                    break
+        elif _MARKDOWN_HEADERS.match(stripped):
+            # Header starts new section
+            boundaries.append(i)
+        elif _LIST_MARKERS.match(stripped) and i > 0:
+            # List continuation or new list
+            prev_stripped = lines[i - 1].strip()
+            if not prev_stripped or not _LIST_MARKERS.match(prev_stripped):
+                boundaries.append(i)
+
+    return sorted(set(boundaries))
+
+
+def group_into_chunks(
+    sentences: List[str],
+    max_tokens: int,
+    overlap_sentences: int = 1,
+) -> List[str]:
+    """Group sentences into chunks respecting token limits.
+
+    Args:
+        sentences: List of sentences to group
+        max_tokens: Maximum tokens per chunk
+        overlap_sentences: Number of sentences to overlap between chunks
+
+    Returns:
+        List of text chunks
+    """
+    if not sentences:
+        return []
+
+    # Estimate tokens (simple word-based estimate)
+    def estimate_tokens(text: str) -> int:
+        return len(text.split())
+
+    chunks: List[str] = []
+    current_chunk: List[str] = []
+    current_tokens = 0
+
+    for i, sentence in enumerate(sentences):
+        sent_tokens = estimate_tokens(sentence)
+
+        # Check if adding this sentence would exceed limit
+        if current_tokens + sent_tokens > max_tokens and current_chunk:
+            # Emit current chunk
+            chunks.append(' '.join(current_chunk))
+
+            # Start new chunk with overlap
+            overlap_start = max(0, len(current_chunk) - overlap_sentences)
+            current_chunk = current_chunk[overlap_start:]
+            current_tokens = sum(estimate_tokens(s) for s in current_chunk)
+
+        current_chunk.append(sentence)
+        current_tokens += sent_tokens
+
+    # Emit final chunk
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    return chunks
+
+
+def semantic_chunk_text(
+    content: str,
+    max_chunk_tokens: int = 360,
+    overlap_sentences: int = 1,
+    respect_paragraphs: bool = True,
+) -> List[str]:
+    """Create semantically coherent chunks from text.
+
+    This function creates chunks that:
+    1. Respect sentence boundaries
+    2. Group related sentences together
+    3. Respect paragraph breaks when possible
+    4. Allow configurable overlap for context preservation
+
+    Args:
+        content: Input text content
+        max_chunk_tokens: Maximum tokens per chunk
+        overlap_sentences: Number of sentences to overlap between chunks
+        respect_paragraphs: Whether to prioritize paragraph boundaries
+
+    Returns:
+        List of semantically coherent text chunks
+    """
+    if not content or not content.strip():
+        return []
+
+    # For code-heavy content, fall back to code-aware chunking
+    code_indicators = content.count('def ') + content.count('class ') + content.count('function ')
+    if code_indicators > 5:
+        # Likely code - use line-based chunking
+        return _chunk_by_lines(content, max_chunk_tokens)
+
+    if respect_paragraphs:
+        # Split by paragraphs first
+        paragraphs = _PARAGRAPH_BREAKS.split(content)
+        sentences: List[str] = []
+
+        for para in paragraphs:
+            if para.strip():
+                para_sentences = split_into_sentences(para)
+                sentences.extend(para_sentences)
+    else:
+        sentences = split_into_sentences(content)
+
+    # Remove very short sentences that are likely noise
+    sentences = [s for s in sentences if len(s.split()) >= 3]
+
+    return group_into_chunks(sentences, max_chunk_tokens, overlap_sentences)
+
+
+def _chunk_by_lines(content: str, max_tokens: int) -> List[str]:
+    """Fallback chunking by lines for code-heavy content."""
+    lines = content.split('\n')
+    chunks: List[str] = []
+    current: List[str] = []
+    current_tokens = 0
+
+    for line in lines:
+        line_tokens = len(line.split())
+        if current_tokens + line_tokens > max_tokens and current:
+            chunks.append('\n'.join(current))
+            current = [line]
+            current_tokens = line_tokens
+        else:
+            current.append(line)
+            current_tokens += line_tokens
+
+    if current:
+        chunks.append('\n'.join(current))
+
+    return chunks
+
+
+@dataclass
+class SemanticChunk:
+    """A semantically coherent chunk with metadata."""
+    chunk_id: str
+    text: str
+    token_count: int
+    start_index: int
+    end_index: int
+    chunk_type: str = "semantic"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class SemanticChunker:
+    """Semantic chunker that creates coherent text chunks.
+
+    This chunker analyzes text structure and creates chunks that
+    respect semantic boundaries (sentences, paragraphs, topics)
+    rather than arbitrary size limits.
+    """
+
+    def __init__(
+        self,
+        max_chunk_tokens: int = 360,
+        overlap_sentences: int = 1,
+        respect_paragraphs: bool = True,
+    ) -> None:
+        self._max_tokens = max_chunk_tokens
+        self._overlap = overlap_sentences
+        self._respect_paragraphs = respect_paragraphs
+
+    def chunk(
+        self,
+        content: str,
+        source_id: str,
+    ) -> List[SemanticChunk]:
+        """Chunk content with semantic awareness.
+
+        Args:
+            content: Text content to chunk
+            source_id: Source identifier for chunk IDs
+
+        Returns:
+            List of SemanticChunk objects
+        """
+        raw_chunks = semantic_chunk_text(
+            content,
+            max_chunk_tokens=self._max_tokens,
+            overlap_sentences=self._overlap,
+            respect_paragraphs=self._respect_paragraphs,
+        )
+
+        chunks: List[SemanticChunk] = []
+        current_idx = 0
+
+        for i, text in enumerate(raw_chunks):
+            chunks.append(SemanticChunk(
+                chunk_id=f"{source_id.split('/')[-1].split('.')[0]}_sem_{i}",
+                text=text,
+                token_count=len(text.split()),
+                start_index=current_idx,
+                end_index=current_idx + len(text),
+                metadata={
+                    "chunk_index": i,
+                    "total_chunks": len(raw_chunks),
+                }
+            ))
+            current_idx += len(text)
+
+        return chunks
+
+    def chunk_with_boundaries(
+        self,
+        content: str,
+        source_id: str,
+    ) -> List[SemanticChunk]:
+        """Chunk content while preserving explicit boundaries.
+
+        This method prioritizes preserving paragraph and header boundaries
+        over strict token limits.
+
+        Args:
+            content: Text content to chunk
+            source_id: Source identifier for chunk IDs
+
+        Returns:
+            List of SemanticChunk objects
+        """
+        # Get paragraph boundaries
+        para_boundaries = detect_paragraph_boundaries(content)
+        lines = content.split('\n')
+
+        chunks: List[SemanticChunk] = []
+        current_lines: List[str] = []
+        current_start = 0
+        current_tokens = 0
+        chunk_idx = 0
+
+        for i, line in enumerate(lines):
+            is_boundary = i in para_boundaries
+            line_tokens = len(line.split())
+
+            # Check if adding this line would exceed limit
+            if current_tokens + line_tokens > self._max_tokens and current_lines:
+                # Emit current chunk
+                chunks.append(SemanticChunk(
+                    chunk_id=f"{source_id.split('/')[-1].split('.')[0]}_bound_{chunk_idx}",
+                    text='\n'.join(current_lines),
+                    token_count=current_tokens,
+                    start_index=current_start,
+                    end_index=current_start + len('\n'.join(current_lines)),
+                    chunk_type="boundary_preserved",
+                    metadata={
+                        "chunk_index": chunk_idx,
+                        "preserved_boundaries": True,
+                    }
+                ))
+
+                # Start new chunk
+                chunk_idx += 1
+                current_lines = [line]
+                current_start += len('\n'.join(current_lines[:-1])) + 1
+                current_tokens = line_tokens
+            elif is_boundary and current_lines:
+                # Emit chunk at paragraph boundary
+                chunks.append(SemanticChunk(
+                    chunk_id=f"{source_id.split('/')[-1].split('.')[0]}_bound_{chunk_idx}",
+                    text='\n'.join(current_lines),
+                    token_count=current_tokens,
+                    start_index=current_start,
+                    end_index=current_start + len('\n'.join(current_lines)),
+                    chunk_type="boundary_preserved",
+                    metadata={
+                        "chunk_index": chunk_idx,
+                        "preserved_boundaries": True,
+                    }
+                ))
+                chunk_idx += 1
+                current_lines = [line]
+                current_start += len('\n'.join(current_lines[:-1])) + 1 if len(current_lines) > 1 else 0
+                current_tokens = line_tokens
+            else:
+                current_lines.append(line)
+                current_tokens += line_tokens
+
+        # Emit final chunk
+        if current_lines:
+            chunks.append(SemanticChunk(
+                chunk_id=f"{source_id.split('/')[-1].split('.')[0]}_bound_{chunk_idx}",
+                text='\n'.join(current_lines),
+                token_count=current_tokens,
+                start_index=current_start,
+                end_index=current_start + len('\n'.join(current_lines)),
+                chunk_type="boundary_preserved",
+                metadata={
+                    "chunk_index": chunk_idx,
+                    "preserved_boundaries": True,
+                }
+            ))
+
+        return chunks
+
+
+def create_semantic_chunker(
+    max_chunk_tokens: int = 360,
+    overlap_sentences: int = 1,
+    respect_paragraphs: bool = True,
+) -> SemanticChunker:
+    """Factory function to create a semantic chunker.
+
+    Args:
+        max_chunk_tokens: Maximum tokens per chunk
+        overlap_sentences: Number of sentences to overlap
+        respect_paragraphs: Whether to respect paragraph boundaries
+
+    Returns:
+        Configured SemanticChunker instance
+    """
+    return SemanticChunker(
+        max_chunk_tokens=max_chunk_tokens,
+        overlap_sentences=overlap_sentences,
+        respect_paragraphs=respect_paragraphs,
+    )
+
+
+# Backward compatibility - import these from the original module
 class CodeLanguage(str, Enum):
     """Supported programming languages for code-aware chunking."""
     PYTHON = "python"
@@ -748,6 +1122,11 @@ def create_chunker(
         return TestAwareChunker(max_chunk_tokens, overlap_tokens)
     elif strategy == ChunkingStrategy.CODE_AWARE:
         return CodeAwareChunker(max_chunk_tokens, overlap_tokens)
+    elif strategy == ChunkingStrategy.SEMANTIC:
+        return SemanticChunker(
+            max_chunk_tokens=max_chunk_tokens,
+            overlap_sentences=overlap_tokens // 40,  # Convert line overlap to sentence overlap
+        )
     else:
         # Default to code-aware
         return CodeAwareChunker(max_chunk_tokens, overlap_tokens)

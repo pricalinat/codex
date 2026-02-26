@@ -5,14 +5,20 @@ from src.test_analysis_assistant.code_chunker import (
     CodeAwareChunker,
     CodeLanguage,
     CodeUnit,
+    SemanticChunker,
     TestAwareChunker,
     chunk_code_by_structure,
     chunk_test_aware,
     compute_test_relevance_score,
     create_chunker,
+    create_semantic_chunker,
     detect_language,
+    detect_paragraph_boundaries,
     extract_code_units,
     extract_python_units,
+    group_into_chunks,
+    semantic_chunk_text,
+    split_into_sentences,
 )
 
 
@@ -286,6 +292,138 @@ class TestChunkingStrategy(unittest.TestCase):
         self.assertEqual(ChunkingStrategy.CODE_AWARE.value, "code_aware")
         self.assertEqual(ChunkingStrategy.TEST_AWARE.value, "test_aware")
         self.assertEqual(ChunkingStrategy.SEMANTIC.value, "semantic")
+
+
+class TestSemanticChunking(unittest.TestCase):
+    def test_split_into_sentences_basic(self):
+        """Test splitting text into sentences."""
+        text = "This is the first sentence. This is the second sentence! Is this the third?"
+        sentences = split_into_sentences(text)
+        self.assertEqual(len(sentences), 3)
+        self.assertTrue(sentences[0].startswith("This is the first"))
+        self.assertTrue(sentences[1].startswith("This is the second"))
+        self.assertTrue(sentences[2].startswith("Is this the third"))
+
+    def test_split_into_sentences_preserves_code_blocks(self):
+        """Test that code blocks are preserved in sentence splitting."""
+        text = "First sentence. Then `code with dots.` More text. Finally!"
+        sentences = split_into_sentences(text)
+        # Should not split inside code blocks
+        self.assertTrue(any("code with dots" in s for s in sentences))
+
+    def test_detect_paragraph_boundaries(self):
+        """Test paragraph boundary detection."""
+        text = """First paragraph line 1
+First paragraph line 2
+
+Second paragraph
+
+# Header paragraph
+Content after header"""
+        boundaries = detect_paragraph_boundaries(text)
+        # Should detect start and paragraph breaks
+        self.assertIn(0, boundaries)  # First line
+
+    def test_group_into_chunks(self):
+        """Test grouping sentences into chunks."""
+        sentences = [
+            "This is the first sentence with some content.",
+            "This is the second sentence continuing the thought.",
+            "This is the third sentence that wraps up the idea.",
+            "Now we start a new topic with different content.",
+            "This sentence continues the new topic.",
+            "And this is the final sentence in our test.",
+        ]
+        chunks = group_into_chunks(sentences, max_tokens=10)
+        # Should create multiple chunks
+        self.assertGreater(len(chunks), 1)
+
+    def test_semantic_chunk_text_basic(self):
+        """Test basic semantic chunking."""
+        text = """This is the first paragraph. It contains multiple sentences.
+This paragraph should be kept together when possible.
+
+This is the second paragraph with different content.
+It also has multiple sentences that belong together.
+
+Third paragraph starts here. More content follows."""
+        chunks = semantic_chunk_text(text, max_chunk_tokens=15)
+        self.assertGreater(len(chunks), 0)
+        # Each chunk should have reasonable content
+        for chunk in chunks:
+            self.assertGreater(len(chunk.split()), 2)
+
+    def test_semantic_chunk_text_handles_empty(self):
+        """Test semantic chunking with empty input."""
+        self.assertEqual(semantic_chunk_text(""), [])
+        self.assertEqual(semantic_chunk_text("   "), [])
+
+    def test_semantic_chunk_text_respects_code(self):
+        """Test that semantic chunking handles code-heavy content."""
+        # This should fall back to line-based chunking for code
+        code_content = """
+def function_one():
+    return 1
+
+def function_two():
+    return 2
+
+class TestClass:
+    def test_method(self):
+        pass
+"""
+        chunks = semantic_chunk_text(code_content, max_chunk_tokens=10)
+        self.assertGreater(len(chunks), 0)
+
+    def test_semantic_chunker_class(self):
+        """Test the SemanticChunker class."""
+        chunker = SemanticChunker(
+            max_chunk_tokens=100,
+            overlap_sentences=1,
+            respect_paragraphs=True,
+        )
+        self.assertEqual(chunker._max_tokens, 100)
+        self.assertEqual(chunker._overlap, 1)
+
+    def test_semantic_chunker_chunk_method(self):
+        """Test SemanticChunker.chunk() method."""
+        chunker = SemanticChunker(max_chunk_tokens=50)
+        text = "First sentence here. Second sentence continues. Third sentence is longer and contains more words. Fourth sentence."
+        chunks = chunker.chunk(text, "test_doc.txt")
+        self.assertGreater(len(chunks), 0)
+        # All chunks should have required fields
+        for chunk in chunks:
+            self.assertTrue(hasattr(chunk, 'chunk_id'))
+            self.assertTrue(hasattr(chunk, 'text'))
+            self.assertTrue(hasattr(chunk, 'token_count'))
+            self.assertTrue(hasattr(chunk, 'metadata'))
+
+    def test_semantic_chunker_with_boundaries(self):
+        """Test SemanticChunker with boundary preservation."""
+        chunker = SemanticChunker(max_chunk_tokens=30)
+        text = """# Header
+
+First paragraph with content.
+
+Second paragraph here."""
+        chunks = chunker.chunk_with_boundaries(text, "test.md")
+        self.assertGreater(len(chunks), 0)
+
+    def test_create_semantic_chunker(self):
+        """Test factory function for semantic chunker."""
+        chunker = create_semantic_chunker(
+            max_chunk_tokens=200,
+            overlap_sentences=2,
+            respect_paragraphs=True,
+        )
+        self.assertIsInstance(chunker, SemanticChunker)
+        self.assertEqual(chunker._max_tokens, 200)
+        self.assertEqual(chunker._overlap, 2)
+
+    def test_create_chunker_semantic_strategy(self):
+        """Test create_chunker factory with SEMANTIC strategy."""
+        chunker = create_chunker(ChunkingStrategy.SEMANTIC, max_chunk_tokens=150)
+        self.assertIsInstance(chunker, SemanticChunker)
 
 
 if __name__ == "__main__":
