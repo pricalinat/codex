@@ -255,6 +255,8 @@ class RAGAnalyzer:
         artifact_bundles: Optional[Sequence[ArtifactBundle]] = None,
         ingestion_records: Optional[Sequence[IngestionRecord]] = None,
         generate_source_summaries: bool = False,
+        prefer_pipeline_for_records: bool = True,
+        record_pipeline: Optional[UnifiedIngestionPipeline] = None,
     ) -> int:
         """Initialize the retrieval corpus with various document sources.
 
@@ -266,6 +268,9 @@ class RAGAnalyzer:
             artifact_bundles: Mixed-modality extraction/OCR payloads
             ingestion_records: Unified mixed-source records (multimodal/code/docs)
             generate_source_summaries: Whether to synthesize per-source summary chunks
+            prefer_pipeline_for_records: Route ingestion records through unified
+                pipeline first when possible, with fallback to direct ingestion
+            record_pipeline: Optional pipeline instance for record ingestion
 
         Returns:
             Total number of chunks indexed
@@ -345,6 +350,8 @@ class RAGAnalyzer:
                 total_chunks += self._ingest_record(
                     record,
                     generate_source_summaries=generate_source_summaries,
+                    prefer_pipeline=prefer_pipeline_for_records,
+                    pipeline=record_pipeline,
                 )
 
         self._initialized = total_chunks > 0
@@ -382,6 +389,8 @@ class RAGAnalyzer:
         self,
         record: IngestionRecord,
         generate_source_summaries: bool = False,
+        prefer_pipeline: bool = False,
+        pipeline: Optional[UnifiedIngestionPipeline] = None,
     ) -> int:
         if (
             record.source_type == SourceType.CODE_SNIPPET
@@ -402,6 +411,8 @@ class RAGAnalyzer:
                 ingestor.ingest_records,
                 [record],
                 generate_source_summaries=generate_source_summaries,
+                prefer_pipeline=prefer_pipeline,
+                pipeline=pipeline,
             )
             return len(chunks)
 
@@ -410,6 +421,8 @@ class RAGAnalyzer:
             fallback_ingestor.ingest_records,
             [record],
             generate_source_summaries=generate_source_summaries,
+            prefer_pipeline=prefer_pipeline,
+            pipeline=pipeline,
         )
         return len(chunks)
 
@@ -873,6 +886,7 @@ def rag_analyze(
     lexical_weight: float = 0.5,
     chunker_type: ChunkerType = ChunkerType.AUTO,
     generate_source_summaries: bool = False,
+    prefer_pipeline_for_records: bool = True,
 ) -> RAGAnalysisResult:
     """Convenience function for RAG-augmented analysis.
 
@@ -889,6 +903,8 @@ def rag_analyze(
         lexical_weight: Weight for lexical search when using hybrid mode (0-1)
         chunker_type: Chunker strategy (basic, code_aware, auto)
         generate_source_summaries: Whether to synthesize per-source summary chunks
+        prefer_pipeline_for_records: Route ingestion records through unified
+            pipeline first when possible, with fallback to direct ingestion
 
     Returns:
         RAGAnalysisResult with augmented insights
@@ -916,6 +932,7 @@ def rag_analyze(
             artifact_bundles=artifact_bundles,
             ingestion_records=ingestion_records,
             generate_source_summaries=generate_source_summaries,
+            prefer_pipeline_for_records=prefer_pipeline_for_records,
         )
 
     return analyzer.analyze(test_report_content, query_for_context=query)

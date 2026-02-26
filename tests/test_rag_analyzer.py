@@ -7,6 +7,7 @@ from src.test_analysis_assistant.rag_analyzer import (
     RetrievalInsight,
     rag_analyze,
 )
+from src.test_analysis_assistant.ingestion_pipeline import UnifiedIngestionPipeline
 from src.test_analysis_assistant.retrieval import (
     ArtifactBundle,
     Chunk,
@@ -259,6 +260,68 @@ Missing negative authorization tests are release blocking.
         self.assertGreaterEqual(indexed, 3)
         result = analyzer.analyze(test_report, query_for_context="auth retry heatmap risk matrix")
         self.assertTrue(any(source.startswith("record:auth-compound") for source in result.evidence_sources))
+
+    def test_initialize_corpus_records_use_pipeline_when_enabled(self):
+        class SpyPipeline:
+            def __init__(self):
+                self.calls = 0
+                self._delegate = UnifiedIngestionPipeline()
+
+            def process_batch(self, documents):
+                self.calls += 1
+                return self._delegate.process_batch(documents)
+
+        analyzer = RAGAnalyzer()
+        spy_pipeline = SpyPipeline()
+        indexed = analyzer.initialize_corpus(
+            ingestion_records=[
+                IngestionRecord(
+                    source_id="record:auth-multi",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "text": "Auth retry storms are release blocking.",
+                        "tables": [{"rows": [{"component": "auth", "risk": "high"}]}],
+                    },
+                )
+            ],
+            prefer_pipeline_for_records=True,
+            record_pipeline=spy_pipeline,
+        )
+
+        self.assertGreaterEqual(indexed, 2)
+        self.assertEqual(1, spy_pipeline.calls)
+        ingested = [chunk for chunk in analyzer._engine._chunks if chunk.source_id == "record:auth-multi"]
+        self.assertGreaterEqual(len(ingested), 1)
+        self.assertTrue(any(str(chunk.metadata.get("ingestion_route", "")).startswith("pipeline") for chunk in ingested))
+
+    def test_initialize_corpus_records_fallback_when_pipeline_errors(self):
+        class FailingPipeline:
+            def __init__(self):
+                self.calls = 0
+
+            def process_batch(self, documents):
+                self.calls += 1
+                raise RuntimeError("pipeline unavailable")
+
+        analyzer = RAGAnalyzer()
+        failing_pipeline = FailingPipeline()
+        indexed = analyzer.initialize_corpus(
+            ingestion_records=[
+                IngestionRecord(
+                    source_id="record:req-auth-fallback",
+                    source_type=SourceType.REQUIREMENTS,
+                    payload="Authentication release risk requires stricter negative tests.",
+                )
+            ],
+            prefer_pipeline_for_records=True,
+            record_pipeline=failing_pipeline,
+        )
+
+        self.assertGreaterEqual(indexed, 1)
+        self.assertEqual(1, failing_pipeline.calls)
+        ingested = [chunk for chunk in analyzer._engine._chunks if chunk.source_id == "record:req-auth-fallback"]
+        self.assertGreaterEqual(len(ingested), 1)
+        self.assertTrue(all(chunk.text.strip() for chunk in ingested))
 
     def test_initialize_corpus_accepts_bundled_ingestion_record_artifacts(self):
         test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
