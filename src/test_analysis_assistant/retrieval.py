@@ -1144,13 +1144,44 @@ class MultiSourceIngestor:
         prefer_pipeline: bool | str = False,
         pipeline: Optional[Any] = None,
     ) -> List[Chunk]:
+        if not records:
+            return []
         decision = self.plan_records(records, prefer_pipeline=prefer_pipeline)
+        hybrid_docs = self._build_hybrid_auto_docs(records=records, decision=decision)
+        if hybrid_docs is not None:
+            pipeline_docs = hybrid_docs["pipeline"]
+            direct_docs = hybrid_docs["direct"]
+            indexed: List[Chunk] = []
+            if pipeline_docs:
+                indexed.extend(
+                    self._ingest_docs_with_pipeline(
+                        docs=pipeline_docs,
+                        generate_source_summaries=False,
+                        pipeline=pipeline,
+                    )
+                )
+            if direct_docs:
+                indexed.extend(
+                    self._engine.ingest_documents(
+                        direct_docs,
+                        generate_source_summaries=False,
+                    )
+                )
+            if generate_source_summaries and indexed:
+                indexed.extend(
+                    self._engine.ingest_prechunked(
+                        _build_source_summary_chunks(indexed),
+                        generate_source_summaries=False,
+                    )
+                )
+            return indexed
+
         docs: List[IngestDocument] = []
         for record in records:
             docs.extend(_normalize_ingestion_record_to_docs(record))
         if not docs:
             return []
-        docs = self._apply_plan_metadata(docs, decision=decision)
+        docs = self._apply_plan_metadata(docs, decision=decision, strategy_scope="batch")
         if decision.use_pipeline:
             return self._ingest_docs_with_pipeline(
                 docs=docs,
@@ -1166,6 +1197,7 @@ class MultiSourceIngestor:
         self,
         docs: Sequence[IngestDocument],
         decision: IngestionPlanDecision,
+        strategy_scope: str = "batch",
     ) -> List[IngestDocument]:
         annotated: List[IngestDocument] = []
         for doc in docs:
@@ -1173,6 +1205,7 @@ class MultiSourceIngestor:
             metadata.setdefault("ingestion_strategy", decision.strategy)
             metadata.setdefault("ingestion_strategy_score", round(float(decision.score), 4))
             metadata.setdefault("ingestion_strategy_confidence", round(float(decision.confidence), 4))
+            metadata.setdefault("ingestion_strategy_scope", strategy_scope)
             if decision.rationale:
                 metadata.setdefault("ingestion_strategy_reason", decision.rationale)
             if decision.signal_summary:
@@ -1187,6 +1220,39 @@ class MultiSourceIngestor:
                 )
             )
         return annotated
+
+    def _build_hybrid_auto_docs(
+        self,
+        records: Sequence[IngestionRecord],
+        decision: IngestionPlanDecision,
+    ) -> Optional[Dict[str, List[IngestDocument]]]:
+        if len(records) <= 1:
+            return None
+        if decision.strategy not in {"pipeline_auto", "direct_auto"}:
+            return None
+
+        pipeline_docs: List[IngestDocument] = []
+        direct_docs: List[IngestDocument] = []
+        saw_pipeline = False
+        saw_direct = False
+
+        for record in records:
+            record_decision = self.plan_records([record], prefer_pipeline="auto")
+            record_docs = self._apply_plan_metadata(
+                _normalize_ingestion_record_to_docs(record),
+                decision=record_decision,
+                strategy_scope="per_record_auto",
+            )
+            if record_decision.use_pipeline:
+                saw_pipeline = True
+                pipeline_docs.extend(record_docs)
+            else:
+                saw_direct = True
+                direct_docs.extend(record_docs)
+
+        if not (saw_pipeline and saw_direct):
+            return None
+        return {"pipeline": pipeline_docs, "direct": direct_docs}
 
     def _ingest_docs_with_pipeline(
         self,

@@ -2535,6 +2535,67 @@ Missing negative authorization tests are release blocking.
         self.assertGreaterEqual(len(chunks), 1)
         self.assertTrue(all(chunk.metadata.get("ingestion_strategy") == "direct_auto" for chunk in chunks))
 
+    def test_ingest_records_auto_uses_hybrid_per_record_routing_for_mixed_batches(self):
+        class TrackingPipeline:
+            def __init__(self):
+                self.calls = 0
+                self.seen_source_ids = []
+
+            def process_batch(self, documents):
+                self.calls += 1
+                self.seen_source_ids = [doc.source_id for doc in documents]
+
+                class Result:
+                    success = True
+                    errors = []
+                    chunks = [
+                        Chunk(
+                            chunk_id=f"pipe:{doc.source_id}",
+                            source_id=doc.source_id,
+                            source_type=doc.source_type,
+                            modality="text",
+                            text=str(doc.content),
+                            token_count=8,
+                            metadata={"ingestion_route": "pipeline_detected"},
+                        )
+                        for doc in documents
+                    ]
+
+                return Result()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        pipeline = TrackingPipeline()
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:auto-complex",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "summary": "Auth retry storms impact release confidence.",
+                        "tables": [{"rows": [{"component": "auth", "risk": "high"}]}],
+                        "images": [{"image_path": "screens/auth-heatmap.png", "alt_text": "auth retries"}],
+                    },
+                ),
+                IngestionRecord(
+                    source_id="record:auto-simple",
+                    source_type=SourceType.KNOWLEDGE,
+                    payload="Simple text fallback for auth retry observations.",
+                ),
+            ],
+            prefer_pipeline="auto",
+            pipeline=pipeline,
+        )
+
+        self.assertEqual(1, pipeline.calls)
+        self.assertEqual(["record:auto-complex"], pipeline.seen_source_ids)
+        by_source = {chunk.source_id: chunk for chunk in chunks}
+        self.assertIn("record:auto-complex", by_source)
+        self.assertIn("record:auto-simple", by_source)
+        self.assertEqual("pipeline_auto", by_source["record:auto-complex"].metadata.get("ingestion_strategy"))
+        self.assertEqual("direct_auto", by_source["record:auto-simple"].metadata.get("ingestion_strategy"))
+
     def test_ingestion_strategy_signal_penalizes_pipeline_mismatch_routes(self):
         engine = RetrievalEngine()
         engine.ingest_prechunked(
