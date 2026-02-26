@@ -127,6 +127,14 @@ from .root_cause import (
     RootCauseHypothesis,
     generate_root_cause_hypotheses,
 )
+from .query_expansion import (
+    AdaptiveQueryStrategy,
+    ExpansionResult,
+    FallbackQuery,
+    QueryFallbackGenerator,
+    SemanticExpander,
+    create_adaptive_strategy,
+)
 from .store import (
     AdaptiveConfidenceCalibrator,
     CorpusStats,
@@ -189,6 +197,13 @@ __all__ = [
     # New store exports
     "PersistentVectorStore",
     "AdaptiveConfidenceCalibrator",
+    # Query expansion exports
+    "AdaptiveQueryStrategy",
+    "ExpansionResult",
+    "FallbackQuery",
+    "QueryFallbackGenerator",
+    "SemanticExpander",
+    "create_adaptive_strategy",
     "CorpusStats",
     "StoredChunk",
     "create_persistent_engine",
