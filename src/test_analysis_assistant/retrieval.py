@@ -1094,10 +1094,55 @@ class MultiSourceIngestor:
                 pipeline_result = pipeline_runner.process_batch(docs)
                 pipeline_chunks = list(getattr(pipeline_result, "chunks", []) or [])
                 if pipeline_chunks:
-                    return self._engine.ingest_prechunked(
-                        pipeline_chunks,
-                        generate_source_summaries=generate_source_summaries,
+                    indexed: List[Chunk] = []
+                    indexed.extend(
+                        self._engine.ingest_prechunked(
+                            pipeline_chunks,
+                            generate_source_summaries=False,
+                        )
                     )
+
+                    pipeline_source_ids = {
+                        str(chunk.source_id).strip()
+                        for chunk in pipeline_chunks
+                        if str(chunk.source_id).strip()
+                    }
+                    missing_docs: List[IngestDocument] = []
+                    for doc in docs:
+                        if str(doc.source_id).strip() in pipeline_source_ids:
+                            continue
+                        fallback_metadata = dict(doc.metadata or {})
+                        prior_route = str(fallback_metadata.get("ingestion_route", "")).strip()
+                        if prior_route:
+                            fallback_metadata.setdefault("pipeline_prior_ingestion_route", prior_route)
+                        fallback_metadata["ingestion_route"] = "pipeline_fallback_direct"
+                        fallback_metadata["pipeline_backfilled"] = True
+                        missing_docs.append(
+                            IngestDocument(
+                                source_id=doc.source_id,
+                                source_type=doc.source_type,
+                                content=doc.content,
+                                modality=doc.modality,
+                                metadata=fallback_metadata,
+                            )
+                        )
+
+                    if missing_docs:
+                        indexed.extend(
+                            self._engine.ingest_documents(
+                                missing_docs,
+                                generate_source_summaries=False,
+                            )
+                        )
+
+                    if generate_source_summaries and indexed:
+                        indexed.extend(
+                            self._engine.ingest_prechunked(
+                                _build_source_summary_chunks(indexed),
+                                generate_source_summaries=False,
+                            )
+                        )
+                    return indexed
             except Exception:
                 # Degrade gracefully to direct ingestion for robustness.
                 pass

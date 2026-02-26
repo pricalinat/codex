@@ -2483,6 +2483,55 @@ Missing negative authorization tests are release blocking.
         self.assertTrue(any(chunk.metadata.get("ingestion_route") == "normalized_record" for chunk in chunks))
         self.assertTrue(all("detection_category" not in chunk.metadata for chunk in chunks))
 
+    def test_ingest_records_prefer_pipeline_backfills_documents_missing_from_partial_pipeline_output(self):
+        class PartialPipeline:
+            def process_batch(self, documents):
+                class Result:
+                    success = True
+                    errors = []
+                    chunks = [
+                        Chunk(
+                            chunk_id="pipeline-req-auth",
+                            source_id="record:req-auth",
+                            source_type=SourceType.REQUIREMENTS,
+                            modality="text",
+                            text="Auth retries are release blocking and need mitigation.",
+                            token_count=9,
+                            metadata={"ingestion_route": "pipeline_detected"},
+                        )
+                    ]
+
+                return Result()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:req-auth",
+                    source_type=SourceType.REQUIREMENTS,
+                    payload="Auth retries are release blocking and need mitigation.",
+                ),
+                IngestionRecord(
+                    source_id="record:kb-auth",
+                    source_type=SourceType.KNOWLEDGE,
+                    payload="Fallback corpus includes owner assignment plan for auth retry incidents.",
+                ),
+            ],
+            prefer_pipeline=True,
+            pipeline=PartialPipeline(),
+        )
+
+        source_ids = {chunk.source_id for chunk in chunks}
+        self.assertIn("record:req-auth", source_ids)
+        self.assertIn("record:kb-auth", source_ids)
+        self.assertTrue(any(chunk.metadata.get("ingestion_route") == "pipeline_detected" for chunk in chunks))
+        self.assertTrue(any(chunk.metadata.get("ingestion_route") == "pipeline_fallback_direct" for chunk in chunks))
+
+        ranked = engine.query("owner assignment plan auth retry incidents", top_k=2, diversify=False)
+        self.assertTrue(any(item.chunk.source_id == "record:kb-auth" for item in ranked))
+
     def test_sidecar_ocr_improves_ingestion_route_quality_vs_stub(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
