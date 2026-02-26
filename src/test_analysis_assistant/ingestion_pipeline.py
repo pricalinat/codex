@@ -617,6 +617,8 @@ class UnifiedIngestionPipeline:
 
         chunks: List[Chunk] = []
         payload = document.content
+        bundle_parent_id = f"{document.source_id}::compound"
+        component_ids: List[str] = []
 
         text_parts: List[str] = []
         for key in ("text", "summary", "body"):
@@ -631,7 +633,14 @@ class UnifiedIngestionPipeline:
                 modality="text",
                 metadata=dict(document.metadata),
             )
-            chunks.extend(self._process_text_content(text_doc, config))
+            text_chunks = self._process_text_content(text_doc, config)
+            for text_idx, text_chunk in enumerate(text_chunks):
+                unit_id = f"text_{text_idx}"
+                text_chunk.metadata["unit_kind"] = "text"
+                text_chunk.metadata["parent_source_id"] = bundle_parent_id
+                text_chunk.metadata["compound_component_id"] = unit_id
+                component_ids.append(unit_id)
+            chunks.extend(text_chunks)
 
         table_payloads: List[Any] = []
         if payload.get("table") is not None:
@@ -646,6 +655,8 @@ class UnifiedIngestionPipeline:
             table_text = self._table_payload_to_text(table_payload)
             if not table_text.strip():
                 continue
+            component_id = f"table_{table_idx}"
+            component_ids.append(component_id)
             chunks.append(
                 Chunk(
                     chunk_id=self._generate_chunk_id(document.source_id, f"compound_table_{table_idx}"),
@@ -660,6 +671,8 @@ class UnifiedIngestionPipeline:
                         "line_count": table_text.count("\n") + 1,
                         "table_index": table_idx,
                         "unit_kind": "table",
+                        "parent_source_id": bundle_parent_id,
+                        "compound_component_id": component_id,
                     },
                 )
             )
@@ -684,11 +697,62 @@ class UnifiedIngestionPipeline:
                     "image_index": image_idx,
                 },
             )
-            chunks.extend(self._process_image_content(image_doc, config))
+            image_chunks = self._process_image_content(image_doc, config)
+            for chunk_idx, image_chunk in enumerate(image_chunks):
+                unit_id = f"image_{image_idx}_{chunk_idx}"
+                image_chunk.metadata["parent_source_id"] = bundle_parent_id
+                image_chunk.metadata["compound_component_id"] = unit_id
+                component_ids.append(unit_id)
+            chunks.extend(image_chunks)
 
         if chunks:
+            manifest_chunk = self._build_compound_manifest_chunk(
+                document=document,
+                config=config,
+                parent_source_id=bundle_parent_id,
+                component_ids=component_ids,
+            )
+            if manifest_chunk is not None:
+                chunks.append(manifest_chunk)
             return chunks
         return self._process_text_content(document, config)
+
+    def _build_compound_manifest_chunk(
+        self,
+        document: IngestDocument,
+        config: SourceConfig,
+        parent_source_id: str,
+        component_ids: Sequence[str],
+    ) -> Optional[Chunk]:
+        """Create a compact manifest chunk that links all compound components."""
+        if not component_ids:
+            return None
+
+        manifest_lines = [
+            f"Compound source {document.source_id} includes {len(component_ids)} components.",
+            "Component inventory:",
+        ]
+        manifest_lines.extend(f"- {component_id}" for component_id in component_ids)
+        manifest_text = "\n".join(manifest_lines)
+
+        return Chunk(
+            chunk_id=self._generate_chunk_id(document.source_id, "compound_manifest"),
+            source_id=parent_source_id,
+            source_type=document.source_type,
+            modality="text",
+            text=manifest_text[: config.chunk_size],
+            token_count=self._estimate_tokens(manifest_text),
+            metadata={
+                **document.metadata,
+                "parent_source_id": document.source_id,
+                "manifest_type": "compound_parent_manifest",
+                "unit_kind": "manifest",
+                "component_ids": list(component_ids),
+                "content_length": len(manifest_text),
+                "line_count": manifest_text.count("\n") + 1,
+                "extraction_confidence": 0.9,
+            },
+        )
 
     def _table_payload_to_text(self, payload: Any) -> str:
         """Render structured table payloads into retrieval-friendly text."""

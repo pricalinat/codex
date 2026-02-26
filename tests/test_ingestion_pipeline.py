@@ -236,6 +236,35 @@ def login(user, password):
         assert "image" in modalities
         assert any(chunk.metadata.get("processing_handler") == "compound" for chunk in result.chunks)
 
+    def test_compound_processing_emits_parent_manifest_and_lineage_metadata(self):
+        """Compound chunks should include parent linkage for multimodal retrieval graphing."""
+        pipeline = UnifiedIngestionPipeline()
+        doc = IngestDocument(
+            source_id="incident-auth-lineage",
+            source_type=SourceType.SYSTEM_ANALYSIS,
+            modality="compound",
+            content={
+                "text": "Authentication retries increase risk.",
+                "tables": [{"rows": [{"service": "gateway", "risk": "high"}]}],
+                "images": [{"alt_text": "retry spike heatmap"}],
+            },
+        )
+
+        result = pipeline.process_document(doc)
+
+        assert result.success is True
+        manifest_chunks = [chunk for chunk in result.chunks if chunk.metadata.get("manifest_type") == "compound_parent_manifest"]
+        assert len(manifest_chunks) == 1
+        manifest = manifest_chunks[0]
+        assert manifest.source_id == "incident-auth-lineage::compound"
+        assert manifest.metadata.get("parent_source_id") == "incident-auth-lineage"
+        assert manifest.metadata.get("processing_handler") == "compound"
+
+        child_chunks = [chunk for chunk in result.chunks if chunk.source_id == "incident-auth-lineage"]
+        assert child_chunks
+        assert all(chunk.metadata.get("parent_source_id") == "incident-auth-lineage::compound" for chunk in child_chunks)
+        assert all(chunk.metadata.get("compound_component_id") for chunk in child_chunks)
+
     def test_process_batch(self):
         """Test processing multiple documents."""
         pipeline = UnifiedIngestionPipeline()

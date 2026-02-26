@@ -2581,6 +2581,55 @@ Missing negative authorization tests are release blocking.
             ranked[1].score_breakdown.get("ingestion_route", 0.0),
         )
 
+    def test_pipeline_compound_lineage_improves_retrieval_traceability_scores(self):
+        pipeline = UnifiedIngestionPipeline()
+        pipeline_result = pipeline.process_document(
+            IngestDocument(
+                source_id="incident:compound-lineage",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="compound",
+                content={
+                    "text": "Auth retry mitigation requires owner assignment and release triage.",
+                    "tables": [{"rows": [{"owner": "auth-team", "risk": "high"}]}],
+                    "images": [{"alt_text": "auth retry heatmap for release gate"}],
+                },
+            )
+        )
+        compound_text_chunk = next(
+            chunk
+            for chunk in pipeline_result.chunks
+            if chunk.source_id == "incident:compound-lineage" and chunk.modality == "text"
+        )
+
+        baseline_chunk = Chunk(
+            chunk_id="baseline-no-lineage",
+            source_id="incident:baseline",
+            source_type=SourceType.SYSTEM_ANALYSIS,
+            modality="text",
+            text=compound_text_chunk.text,
+            token_count=compound_text_chunk.token_count,
+            metadata={
+                "ingestion_route": "pipeline_detected",
+                "extraction_confidence": compound_text_chunk.metadata.get("extraction_confidence", 0.9),
+            },
+        )
+
+        engine = RetrievalEngine()
+        engine.ingest_prechunked([baseline_chunk] + pipeline_result.chunks)
+        ranked = engine.query(
+            "auth retry mitigation owner assignment release triage",
+            top_k=6,
+            diversify=False,
+        )
+        by_chunk = {item.chunk.chunk_id: item for item in ranked}
+
+        self.assertIn("baseline-no-lineage", by_chunk)
+        self.assertIn(compound_text_chunk.chunk_id, by_chunk)
+        self.assertGreater(
+            by_chunk[compound_text_chunk.chunk_id].score_breakdown.get("lineage", 0.0),
+            by_chunk["baseline-no-lineage"].score_breakdown.get("lineage", 0.0),
+        )
+
     def test_ingest_records_prefer_pipeline_falls_back_when_pipeline_returns_no_chunks(self):
         class EmptyPipeline:
             def process_batch(self, documents):
