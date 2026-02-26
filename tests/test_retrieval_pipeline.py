@@ -1898,6 +1898,92 @@ Missing negative authorization tests are release blocking.
         self.assertIn("src/auth/token.py", primary.metadata.get("referenced_paths", []))
         self.assertIn("docs/requirements/auth.md", primary.metadata.get("referenced_paths", []))
 
+    def test_ingest_records_expands_sources_payload_into_parent_and_children(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:sources-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "title": "Auth release investigation",
+                        "sources": [
+                            {
+                                "source_id": "req:auth-negative",
+                                "source_type": "requirements",
+                                "modality": "text",
+                                "content": "Requirements require negative credential coverage for auth.",
+                                "confidence": 0.98,
+                            },
+                            {
+                                "id": "auth-heatmap",
+                                "modality": "image",
+                                "content": {"image_path": "screens/auth-heatmap.png", "alt_text": "auth retry spikes"},
+                                "metadata": {"component": "auth-gateway"},
+                            },
+                        ],
+                    },
+                    metadata={"origin_path": "docs/incidents/auth-sources.json"},
+                )
+            ]
+        )
+
+        self.assertGreaterEqual(len(chunks), 3)
+        parent_chunks = [chunk for chunk in chunks if chunk.source_id == "record:sources-auth"]
+        child_chunks = [chunk for chunk in chunks if chunk.source_id != "record:sources-auth"]
+
+        self.assertEqual(1, len(parent_chunks))
+        self.assertEqual("record_sources_parent", parent_chunks[0].metadata.get("ingestion_route"))
+        self.assertEqual(2, parent_chunks[0].metadata.get("source_count"))
+        self.assertIn("auth-heatmap", parent_chunks[0].metadata.get("source_item_ids", []))
+        self.assertTrue(any(chunk.source_id == "req:auth-negative" for chunk in child_chunks))
+        self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in child_chunks))
+        self.assertTrue(all(chunk.metadata.get("parent_source_id") == "record:sources-auth" for chunk in child_chunks))
+        self.assertTrue(all(chunk.metadata.get("ingestion_route") == "record_sources" for chunk in child_chunks))
+
+    def test_sources_payload_confidence_is_propagated_to_child_rank(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:sources-confidence",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "sources": [
+                            {
+                                "id": "high",
+                                "modality": "text",
+                                "content": "Auth retry mitigation plan requires coverage and owner alignment.",
+                                "confidence": 0.95,
+                            },
+                            {
+                                "id": "low",
+                                "modality": "text",
+                                "content": "Auth retry mitigation plan requires coverage and owner alignment.",
+                                "confidence": 0.20,
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry mitigation coverage owner alignment",
+            top_k=2,
+            diversify=False,
+        )
+
+        self.assertEqual(2, len(ranked))
+        self.assertEqual("record:sources-confidence::source:high", ranked[0].chunk.source_id)
+        self.assertGreater(
+            ranked[0].score_breakdown.get("extraction", 0.0),
+            ranked[1].score_breakdown.get("extraction", 0.0),
+        )
+
     def test_artifact_bundle_item_references_flow_into_graph_scoring(self):
         engine = RetrievalEngine()
         ingestor = MultiSourceIngestor(engine)

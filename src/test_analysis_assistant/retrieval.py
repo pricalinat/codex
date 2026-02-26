@@ -1816,10 +1816,195 @@ def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:
 
 
 def _normalize_ingestion_record_to_docs(record: IngestionRecord) -> List[IngestDocument]:
+    source_docs = _expand_record_sources(record)
+    if source_docs:
+        return source_docs
     bundled_docs = _expand_record_artifacts(record)
     if bundled_docs:
         return bundled_docs
     return [_normalize_ingestion_record(record)]
+
+
+def _expand_record_sources(record: IngestionRecord) -> List[IngestDocument]:
+    payload = record.payload
+    if not isinstance(payload, dict):
+        return []
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or not sources:
+        return []
+
+    docs: List[IngestDocument] = []
+    parent_source_id = record.source_id
+    parent_metadata = dict(record.metadata)
+    parent_doc = _build_record_sources_parent_document(
+        record=record,
+        sources=sources,
+        parent_metadata=parent_metadata,
+    )
+    if parent_doc is not None:
+        docs.append(parent_doc)
+
+    for source_idx, source_item in enumerate(sources):
+        source_payload: Any = source_item
+        source_modality = "auto"
+        source_type = record.source_type
+        source_item_id = str(source_idx)
+        child_source_id = f"{parent_source_id}::source:{source_item_id}"
+
+        if isinstance(source_item, dict):
+            source_payload = _extract_artifact_payload(source_item)
+            source_modality = str(source_item.get("modality", "auto") or "auto").strip().lower()
+            source_type_value = source_item.get("source_type")
+            if isinstance(source_type_value, SourceType):
+                source_type = source_type_value
+            elif isinstance(source_type_value, str):
+                try:
+                    source_type = SourceType(source_type_value.strip().lower())
+                except ValueError:
+                    source_type = record.source_type
+            source_item_id = _normalize_artifact_id(
+                source_item.get("id") or source_item.get("name") or source_idx
+            )
+            explicit_source_id = source_item.get("source_id")
+            if isinstance(explicit_source_id, str) and explicit_source_id.strip():
+                child_source_id = explicit_source_id.strip()
+            else:
+                child_source_id = f"{parent_source_id}::source:{source_item_id}"
+
+        source_metadata = dict(parent_metadata)
+        source_metadata.update(
+            {
+                "parent_source_id": parent_source_id,
+                "source_item_index": source_idx,
+                "source_item_id": source_item_id,
+            }
+        )
+
+        if isinstance(source_item, dict) and isinstance(source_item.get("metadata"), dict):
+            source_metadata.update(source_item["metadata"])
+        if isinstance(source_item, dict):
+            source_metadata.update(_lift_artifact_reference_fields(source_item))
+            confidence = _coerce_optional_confidence(source_item.get("extraction_confidence"))
+            if confidence is None:
+                confidence = _coerce_optional_confidence(source_item.get("confidence"))
+            if confidence is not None:
+                source_metadata["extraction_confidence"] = confidence
+
+        normalized = _normalize_ingestion_record(
+            IngestionRecord(
+                source_id=child_source_id,
+                source_type=source_type,
+                payload=source_payload,
+                modality=source_modality,
+                metadata=source_metadata,
+            )
+        )
+        prior_route = str(normalized.metadata.get("ingestion_route", "")).strip()
+        if prior_route:
+            normalized.metadata["source_item_ingestion_route"] = prior_route
+        normalized.metadata["ingestion_route"] = "record_sources"
+        docs.append(normalized)
+
+    return docs
+
+
+def _build_record_sources_parent_document(
+    record: IngestionRecord,
+    sources: Sequence[Any],
+    parent_metadata: Dict[str, Any],
+) -> Optional[IngestDocument]:
+    if not sources:
+        return None
+
+    payload = record.payload if isinstance(record.payload, dict) else {}
+    context_lines: List[str] = []
+    for key in ("title", "summary", "text", "body", "description", "context"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            context_lines.append(f"{key}: {value.strip()}")
+
+    source_lines: List[str] = []
+    source_item_ids: List[str] = []
+    source_modalities: List[str] = []
+    source_types: List[str] = []
+    for source_idx, source_item in enumerate(sources):
+        source_item_id = str(source_idx)
+        source_modality = "auto"
+        source_type = record.source_type
+        confidence_hint = ""
+        source_payload: Any = source_item
+
+        if isinstance(source_item, dict):
+            source_payload = _extract_artifact_payload(source_item)
+            source_item_id = _normalize_artifact_id(source_item.get("id") or source_item.get("name") or source_idx)
+            source_modality = str(source_item.get("modality", "auto") or "auto").strip().lower()
+            source_type_value = source_item.get("source_type")
+            if isinstance(source_type_value, SourceType):
+                source_type = source_type_value
+            elif isinstance(source_type_value, str):
+                try:
+                    source_type = SourceType(source_type_value.strip().lower())
+                except ValueError:
+                    source_type = record.source_type
+            confidence = _coerce_optional_confidence(source_item.get("extraction_confidence"))
+            if confidence is None:
+                confidence = _coerce_optional_confidence(source_item.get("confidence"))
+            if confidence is not None:
+                confidence_hint = f" extraction_confidence={confidence:.2f}"
+
+        if source_modality == "auto":
+            inferred_modality, _ = _infer_record_modality_and_payload(source_payload)
+            source_modality = inferred_modality
+
+        source_item_ids.append(source_item_id)
+        source_modalities.append(source_modality)
+        source_types.append(source_type.value)
+        source_lines.append(
+            f"- source_item_id={source_item_id} modality={source_modality} source_type={source_type.value}{confidence_hint}"
+        )
+
+    lines = [
+        (
+            f"Source envelope {record.source_id} contains "
+            f"{len(sources)} source items."
+        )
+    ]
+    if context_lines:
+        lines.append("Envelope context:")
+        lines.extend(context_lines)
+    lines.append("Source inventory:")
+    lines.extend(source_lines)
+    manifest_text = "\n".join(lines).strip()
+    if not manifest_text:
+        return None
+
+    metadata = dict(parent_metadata)
+    metadata.update(
+        {
+            "ingestion_route": "record_sources_parent",
+            "manifest_type": "record_sources_parent",
+            "format": "multisource_record_parent",
+            "source_count": len(sources),
+            "source_item_ids": source_item_ids,
+            "source_modalities": _dedupe(source_modalities),
+            "source_types": _dedupe(source_types),
+            "extraction_confidence": 0.91,
+        }
+    )
+    metadata.update(
+        _extract_record_reference_metadata(
+            payload=payload,
+            metadata=metadata,
+        )
+    )
+
+    return IngestDocument(
+        source_id=record.source_id,
+        source_type=record.source_type,
+        content=manifest_text,
+        modality="text",
+        metadata=metadata,
+    )
 
 
 def _expand_record_artifacts(record: IngestionRecord) -> List[IngestDocument]:
@@ -2125,6 +2310,14 @@ def _normalize_artifact_id(raw_value: Any) -> str:
     cleaned = re.sub(r"[^a-z0-9._-]+", "-", value)
     cleaned = cleaned.strip("-")
     return cleaned or "0"
+
+
+def _coerce_optional_confidence(raw_value: Any) -> Optional[float]:
+    try:
+        numeric = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, numeric))
 
 
 def _infer_record_modality_and_payload(payload: Any) -> Tuple[str, Any]:
@@ -3607,6 +3800,8 @@ def _ingestion_route_quality(chunk: Chunk, plan: Optional[QueryPlan] = None) -> 
         "repository_scan": 0.94,
         "record_bundle": 0.91,
         "record_bundle_parent": 0.89,
+        "record_sources": 0.91,
+        "record_sources_parent": 0.89,
         "file_reference_record": 0.9,
         "artifact_bundle": 0.90,
         "normalized_record": 0.84,
