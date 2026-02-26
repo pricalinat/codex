@@ -196,6 +196,112 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("src/auth/token.py", incident.chunk.metadata.get("referenced_paths", []))
         self.assertGreater(incident.score_breakdown.get("citation_graph", 0.0), 0.0)
 
+    def test_cross_source_bridge_score_rewards_multisource_traceability(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="req-auth",
+                    source_id="req-auth",
+                    source_type=SourceType.REQUIREMENTS,
+                    modality="text",
+                    text="Auth requirements define retry constraints and release checks.",
+                    token_count=9,
+                    metadata={},
+                ),
+                Chunk(
+                    chunk_id="repo-auth-token",
+                    source_id="repo:src/auth/token.py",
+                    source_type=SourceType.REPOSITORY,
+                    modality="code",
+                    text="def refresh_token(token): return token.strip()",
+                    token_count=7,
+                    metadata={"path": "src/auth/token.py"},
+                ),
+                Chunk(
+                    chunk_id="plain-analysis",
+                    source_id="incident:auth-plain",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text="Auth retry root cause trace and release triage guidance.",
+                    token_count=10,
+                    metadata={},
+                ),
+                Chunk(
+                    chunk_id="bridge-analysis",
+                    source_id="incident:auth-bridge",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text="Auth retry root cause trace and release triage guidance.",
+                    token_count=10,
+                    metadata={
+                        "referenced_source_ids": ["req-auth"],
+                        "referenced_paths": ["src/auth/token.py"],
+                    },
+                ),
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry root cause trace release triage",
+            top_k=4,
+            diversify=False,
+        )
+        by_chunk = {item.chunk.chunk_id: item for item in ranked}
+        self.assertIn("bridge-analysis", by_chunk)
+        self.assertIn("plain-analysis", by_chunk)
+        self.assertIn("cross_source_bridge", by_chunk["bridge-analysis"].score_breakdown)
+        self.assertGreater(by_chunk["bridge-analysis"].score_breakdown["cross_source_bridge"], 0.0)
+        self.assertEqual(0.0, by_chunk["plain-analysis"].score_breakdown.get("cross_source_bridge", 0.0))
+
+    def test_retrieve_evidence_reports_cross_source_bridge_confidence_factor(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="req-auth",
+                    source_id="req-auth",
+                    source_type=SourceType.REQUIREMENTS,
+                    modality="text",
+                    text="Auth requirements define retry constraints and release checks.",
+                    token_count=9,
+                    metadata={},
+                ),
+                Chunk(
+                    chunk_id="repo-auth-token",
+                    source_id="repo:src/auth/token.py",
+                    source_type=SourceType.REPOSITORY,
+                    modality="code",
+                    text="def refresh_token(token): return token.strip()",
+                    token_count=7,
+                    metadata={"path": "src/auth/token.py"},
+                ),
+                Chunk(
+                    chunk_id="bridge-analysis",
+                    source_id="incident:auth-bridge",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text=(
+                        "Auth retry incident references source:req-auth and "
+                        "path:src/auth/token.py for root-cause trace."
+                    ),
+                    token_count=14,
+                    metadata={"ingestion_route": "pipeline_detected"},
+                ),
+            ]
+        )
+
+        evidence = engine.retrieve_evidence(
+            "auth retry root cause trace release triage",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("cross_source_bridge_support", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["cross_source_bridge_support"], 0.0)
+
     def test_source_bundle_resolves_path_only_references_to_linked_sources(self):
         engine = RetrievalEngine()
         engine.ingest_documents(

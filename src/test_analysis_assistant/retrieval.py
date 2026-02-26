@@ -4169,6 +4169,10 @@ def _calibrate_retrieval_confidence(
             max(0.0, min(1.0, float(item.score_breakdown.get("artifact_parent", 0.0))))
             for item in ranked
         ) / len(ranked)
+        cross_source_bridge_support = sum(
+            max(0.0, min(1.0, float(item.score_breakdown.get("cross_source_bridge", 0.0))))
+            for item in ranked
+        ) / len(ranked)
         citation_graph_support = sum(
             max(0.0, min(1.0, float(item.score_breakdown.get("citation_graph", 0.0))))
             for item in ranked
@@ -4194,6 +4198,7 @@ def _calibrate_retrieval_confidence(
         ingestion_route_quality = 0.0
         artifact_graph_support = 0.0
         artifact_parent_support = 0.0
+        cross_source_bridge_support = 0.0
         citation_graph_support = 0.0
         provenance_chain_support = 0.0
         repository_map_support = 0.0
@@ -4217,6 +4222,7 @@ def _calibrate_retrieval_confidence(
         1.0
         + (0.008 * artifact_graph_support)
         + (0.012 * artifact_parent_support)
+        + (0.014 * cross_source_bridge_support)
         + (0.012 * citation_graph_support)
         + (0.014 * provenance_chain_support)
         + (0.010 * repository_map_support)
@@ -4257,6 +4263,7 @@ def _calibrate_retrieval_confidence(
         "ingestion_route_quality": round(max(0.0, min(1.0, ingestion_route_quality)), 4),
         "artifact_graph_support": round(max(0.0, min(1.0, artifact_graph_support)), 4),
         "artifact_parent_support": round(max(0.0, min(1.0, artifact_parent_support)), 4),
+        "cross_source_bridge_support": round(max(0.0, min(1.0, cross_source_bridge_support)), 4),
         "citation_graph_support": round(max(0.0, min(1.0, citation_graph_support)), 4),
         "provenance_chain_support": round(max(0.0, min(1.0, provenance_chain_support)), 4),
         "repository_map_support": round(max(0.0, min(1.0, repository_map_support)), 4),
@@ -4651,6 +4658,7 @@ def _apply_artifact_graph_bonus(
         if not related and parent_support <= 0.0:
             item.score_breakdown["artifact_graph"] = 0.0
             item.score_breakdown["artifact_parent"] = 0.0
+            item.score_breakdown["cross_source_bridge"] = 0.0
             item.score_breakdown["citation_graph"] = 0.0
             item.score_breakdown["provenance_chain"] = 0.0
             continue
@@ -4661,6 +4669,13 @@ def _apply_artifact_graph_bonus(
         lexical_hits = sum(1 for chunk in related_chunks if query_terms.intersection(set(_tokenize(chunk.text))))
         citation_support = _citation_graph_support(item.chunk, related_chunks)
         provenance_support = _provenance_chain_support(item.chunk, related_chunks)
+        bridge_support = _cross_source_bridge_support(
+            chunk=item.chunk,
+            related_chunks=related_chunks,
+            plan=plan,
+            query_terms=query_terms,
+            citation_support=citation_support,
+        )
 
         modality_support = (
             len(related_modalities.intersection(set(modality_targets))) / len(modality_targets)
@@ -4676,19 +4691,61 @@ def _apply_artifact_graph_bonus(
 
         aggregate = min(
             1.0,
-            (modality_support * 0.29)
-            + (source_support * 0.12)
-            + (lexical_bridge * 0.18)
-            + (citation_support * 0.14)
-            + (parent_support * 0.12)
-            + (provenance_support * 0.15),
+            (modality_support * 0.24)
+            + (source_support * 0.10)
+            + (lexical_bridge * 0.16)
+            + (citation_support * 0.12)
+            + (parent_support * 0.10)
+            + (provenance_support * 0.12)
+            + (bridge_support * 0.16),
         )
         bonus = min(max_bonus, aggregate * max_bonus)
         item.score += bonus
         item.score_breakdown["artifact_graph"] = round(aggregate, 4)
         item.score_breakdown["artifact_parent"] = round(parent_support, 4)
+        item.score_breakdown["cross_source_bridge"] = round(bridge_support, 4)
         item.score_breakdown["citation_graph"] = round(citation_support, 4)
         item.score_breakdown["provenance_chain"] = round(provenance_support, 4)
+
+
+def _cross_source_bridge_support(
+    chunk: Chunk,
+    related_chunks: Sequence[Chunk],
+    plan: QueryPlan,
+    query_terms: set,
+    citation_support: float,
+) -> float:
+    if not related_chunks:
+        return 0.0
+
+    related_source_types = {related.source_type for related in related_chunks if related.source_id != chunk.source_id}
+    source_span = len({chunk.source_type}.union(related_source_types))
+    source_span_score = min(1.0, max(0.0, (source_span - 1) / 3.0))
+
+    target_sources = set(plan.preferred_source_types)
+    source_target_coverage = (
+        len(related_source_types.intersection(target_sources)) / len(target_sources)
+        if target_sources
+        else 0.0
+    )
+
+    related_modalities = {related.modality for related in related_chunks}
+    modality_span = len({chunk.modality}.union(related_modalities))
+    modality_span_score = min(1.0, max(0.0, (modality_span - 1) / 2.0))
+
+    lexical_bridge = (
+        sum(1 for related in related_chunks if query_terms.intersection(set(_tokenize(related.text))))
+        / max(1, len(related_chunks))
+    )
+
+    return min(
+        1.0,
+        (source_span_score * 0.36)
+        + (source_target_coverage * 0.30)
+        + (max(0.0, min(1.0, citation_support)) * 0.18)
+        + (lexical_bridge * 0.10)
+        + (modality_span_score * 0.06),
+    )
 
 
 def _citation_graph_support(chunk: Chunk, related_chunks: Sequence[Chunk]) -> float:
