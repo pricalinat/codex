@@ -2163,6 +2163,28 @@ def _resolve_record_file_reference(
         if isinstance(payload.get("alt_text"), str) and payload["alt_text"].strip():
             image_payload["alt_text"] = payload["alt_text"].strip()
         return "image", image_payload, metadata
+    if ext == ".pdf":
+        doc_text, text_confidence, text_source = _resolve_pdf_record_text(referenced_path)
+        metadata.update(
+            {
+                "format": "file_reference_binary_document",
+                "text_extraction_confidence": text_confidence,
+                "document_text_source": text_source,
+            }
+        )
+        return (
+            "compound",
+            {
+                "text": doc_text,
+                "images": [
+                    {
+                        "image_path": referenced_path.as_posix(),
+                        "alt_text": f"document artifact {referenced_path.name}",
+                    }
+                ],
+            },
+            metadata,
+        )
 
     try:
         text = referenced_path.read_text(encoding="utf-8")
@@ -2194,6 +2216,35 @@ def _looks_like_markdown(text: str) -> bool:
     table = any(line.startswith("|") and line.endswith("|") for line in lines)
     image = any("![" in line and "](" in line for line in lines)
     return heading or table or image
+
+
+def _resolve_pdf_record_text(path: Path) -> Tuple[str, float, str]:
+    """Resolve text from PDF record payloads with production/degraded fallback.
+
+    Strategy:
+    1) Attempt parser-based extraction when available (pdfminer via PDFProcessor).
+    2) Fall back to sidecar `.txt` / `.ocr.txt` text.
+    3) Emit explicit extraction stub text if neither is available.
+    """
+    try:
+        from .multimodal import PDFProcessor
+
+        processor = PDFProcessor()
+        if processor.is_available:
+            extracted = str(processor.extract_text_from_path(path.as_posix()) or "").strip()
+            if extracted:
+                return extracted, 0.82, "pdfminer"
+    except Exception:
+        # Degrade to sidecar/stub path to keep ingestion robust.
+        pass
+
+    sidecar_or_stub_text, fallback_confidence, fallback_source = _resolve_repository_document_text(
+        path,
+        path.name,
+    )
+    if fallback_source == "sidecar":
+        return sidecar_or_stub_text, max(fallback_confidence, 0.78), "sidecar"
+    return sidecar_or_stub_text, min(fallback_confidence, 0.34), "stub"
 
 
 def _extract_compound_units(

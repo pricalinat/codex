@@ -1956,6 +1956,71 @@ Missing negative authorization tests are release blocking.
             self.assertEqual("pipeline_verified_sidecar", image_chunk.metadata.get("ingestion_route"))
             self.assertTrue(image_chunk.metadata.get("ocr_sidecar_path", "").endswith(".ocr.txt"))
 
+    def test_ingest_records_pdf_file_reference_uses_sidecar_text_when_present(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "incident-report.pdf"
+            pdf_path.write_bytes(b"%PDF-1.7\n%fake")
+            (root / "incident-report.pdf.txt").write_text(
+                "Authentication retry storm timeline and failure risk matrix.",
+                encoding="utf-8",
+            )
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_records(
+                [
+                    IngestionRecord(
+                        source_id="record:pdf-sidecar",
+                        source_type=SourceType.SYSTEM_ANALYSIS,
+                        payload={"file_path": str(pdf_path)},
+                    )
+                ]
+            )
+
+            self.assertGreaterEqual(len(chunks), 2)
+            text_chunks = [chunk for chunk in chunks if chunk.modality == "text"]
+            self.assertGreaterEqual(len(text_chunks), 1)
+            self.assertTrue(any("retry storm timeline" in chunk.text for chunk in text_chunks))
+            self.assertTrue(
+                all(chunk.metadata.get("document_text_source") == "sidecar" for chunk in chunks)
+            )
+            self.assertTrue(
+                all(chunk.metadata.get("origin_path") == pdf_path.as_posix() for chunk in chunks)
+            )
+
+    def test_ingest_records_pdf_file_reference_degrades_to_stub_without_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pdf_path = root / "missing-extraction.pdf"
+            pdf_path.write_bytes(b"%PDF-1.7\n%fake")
+
+            engine = RetrievalEngine()
+            ingestor = MultiSourceIngestor(engine)
+            chunks = ingestor.ingest_records(
+                [
+                    IngestionRecord(
+                        source_id="record:pdf-stub",
+                        source_type=SourceType.SYSTEM_ANALYSIS,
+                        payload={"file_path": str(pdf_path)},
+                    )
+                ]
+            )
+
+            self.assertGreaterEqual(len(chunks), 1)
+            text_chunks = [chunk for chunk in chunks if chunk.modality == "text"]
+            self.assertGreaterEqual(len(text_chunks), 1)
+            self.assertTrue(any("[DOC_STUB]" in chunk.text for chunk in text_chunks))
+            self.assertTrue(
+                all(chunk.metadata.get("document_text_source") == "stub" for chunk in chunks)
+            )
+            self.assertTrue(
+                all(
+                    float(chunk.metadata.get("text_extraction_confidence", 1.0)) <= 0.34
+                    for chunk in text_chunks
+                )
+            )
+
     def test_ingest_records_prefer_pipeline_indexes_detected_prechunked_metadata(self):
         engine = RetrievalEngine()
         ingestor = MultiSourceIngestor(engine)
