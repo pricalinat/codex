@@ -323,6 +323,37 @@ Missing negative authorization tests are release blocking.
         self.assertGreaterEqual(len(ingested), 1)
         self.assertTrue(all(chunk.text.strip() for chunk in ingested))
 
+    def test_initialize_corpus_artifact_bundles_use_pipeline_when_enabled(self):
+        class SpyPipeline:
+            def __init__(self):
+                self.calls = 0
+                self._delegate = UnifiedIngestionPipeline()
+
+            def process_batch(self, documents):
+                self.calls += 1
+                return self._delegate.process_batch(documents)
+
+        analyzer = RAGAnalyzer()
+        spy_pipeline = SpyPipeline()
+        indexed = analyzer.initialize_corpus(
+            artifact_bundles=[
+                ArtifactBundle(
+                    source_id="incident:auth-pipeline",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    text="Auth retry spikes are release-blocking.",
+                    tables=[{"rows": [{"component": "auth", "risk": "high"}]}],
+                )
+            ],
+            prefer_pipeline_for_artifacts=True,
+            artifact_pipeline=spy_pipeline,
+        )
+
+        self.assertGreaterEqual(indexed, 2)
+        self.assertEqual(1, spy_pipeline.calls)
+        ingested = [chunk for chunk in analyzer._engine._chunks if chunk.source_id == "incident:auth-pipeline"]
+        self.assertGreaterEqual(len(ingested), 1)
+        self.assertTrue(any(chunk.metadata.get("ingestion_route") == "pipeline_detected" for chunk in ingested))
+
     def test_initialize_corpus_accepts_bundled_ingestion_record_artifacts(self):
         test_report = """<testsuite name="pytest" errors="0" failures="1" tests="2">
             <testcase classname="test_auth" name="test_refresh">

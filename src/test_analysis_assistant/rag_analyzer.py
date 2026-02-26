@@ -255,6 +255,8 @@ class RAGAnalyzer:
         artifact_bundles: Optional[Sequence[ArtifactBundle]] = None,
         ingestion_records: Optional[Sequence[IngestionRecord]] = None,
         generate_source_summaries: bool = False,
+        prefer_pipeline_for_artifacts: bool = True,
+        artifact_pipeline: Optional[UnifiedIngestionPipeline] = None,
         prefer_pipeline_for_records: bool = True,
         record_pipeline: Optional[UnifiedIngestionPipeline] = None,
     ) -> int:
@@ -268,6 +270,9 @@ class RAGAnalyzer:
             artifact_bundles: Mixed-modality extraction/OCR payloads
             ingestion_records: Unified mixed-source records (multimodal/code/docs)
             generate_source_summaries: Whether to synthesize per-source summary chunks
+            prefer_pipeline_for_artifacts: Route artifact bundles through unified
+                pipeline first when possible, with fallback to direct ingestion
+            artifact_pipeline: Optional pipeline instance for artifact bundles
             prefer_pipeline_for_records: Route ingestion records through unified
                 pipeline first when possible, with fallback to direct ingestion
             record_pipeline: Optional pipeline instance for record ingestion
@@ -328,6 +333,8 @@ class RAGAnalyzer:
                         ingestor.ingest_artifact_bundle,
                         bundle,
                         generate_source_summaries=generate_source_summaries,
+                        prefer_pipeline=prefer_pipeline_for_artifacts,
+                        pipeline=artifact_pipeline,
                     )
                 else:
                     chunks = self._call_ingestion_method(

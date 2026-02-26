@@ -2,6 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
+from src.test_analysis_assistant.ingestion_pipeline import UnifiedIngestionPipeline
 from src.test_analysis_assistant.retrieval import (
     AnalysisEvidencePack,
     ArtifactBundle,
@@ -1622,6 +1623,63 @@ Missing negative authorization tests are release blocking.
         self.assertEqual(1, len(ranked))
         self.assertEqual("analysis:auth-visual", ranked[0].chunk.source_id)
         self.assertEqual("image_ocr_stub", ranked[0].chunk.modality)
+
+    def test_ingest_artifact_bundle_uses_pipeline_when_enabled(self):
+        class SpyPipeline:
+            def __init__(self):
+                self.calls = 0
+                self._delegate = UnifiedIngestionPipeline()
+
+            def process_batch(self, documents):
+                self.calls += 1
+                return self._delegate.process_batch(documents)
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        spy_pipeline = SpyPipeline()
+
+        chunks = ingestor.ingest_artifact_bundle(
+            ArtifactBundle(
+                source_id="analysis:auth-pipeline",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                text="Auth retries spike on release candidates.",
+                tables=[{"rows": [{"component": "auth", "risk": "high"}]}],
+            ),
+            prefer_pipeline=True,
+            pipeline=spy_pipeline,
+        )
+
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertEqual(1, spy_pipeline.calls)
+        self.assertTrue(any(chunk.metadata.get("ingestion_route") == "pipeline_detected" for chunk in chunks))
+
+    def test_ingest_artifact_bundle_pipeline_fallback_on_error(self):
+        class FailingPipeline:
+            def __init__(self):
+                self.calls = 0
+
+            def process_batch(self, documents):
+                self.calls += 1
+                raise RuntimeError("pipeline unavailable")
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        failing_pipeline = FailingPipeline()
+
+        chunks = ingestor.ingest_artifact_bundle(
+            ArtifactBundle(
+                source_id="analysis:auth-fallback",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                text="Auth retries spike on release candidates.",
+                images=[{"image_path": "screens/auth-heatmap.png", "alt_text": "auth retry heatmap"}],
+            ),
+            prefer_pipeline=True,
+            pipeline=failing_pipeline,
+        )
+
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertEqual(1, failing_pipeline.calls)
+        self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in chunks))
 
     def test_ingest_records_normalizes_multimodal_payloads(self):
         engine = RetrievalEngine()

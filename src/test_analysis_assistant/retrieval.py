@@ -1208,6 +1208,8 @@ class MultiSourceIngestor:
         self,
         bundle: ArtifactBundle,
         generate_source_summaries: bool = False,
+        prefer_pipeline: bool = False,
+        pipeline: Optional[Any] = None,
     ) -> List[Chunk]:
         """Ingest one mixed-modality artifact bundle.
 
@@ -1228,12 +1230,25 @@ class MultiSourceIngestor:
         metadata = dict(bundle.metadata)
         metadata.setdefault("format", "artifact_bundle")
 
-        return self.ingest_raw(
-            source_id=bundle.source_id,
-            source_type=bundle.source_type,
-            content=content,
-            modality="compound",
-            metadata=metadata,
+        docs = [
+            IngestDocument(
+                source_id=bundle.source_id,
+                source_type=bundle.source_type,
+                content=content,
+                modality="compound",
+                metadata=metadata,
+            )
+        ]
+
+        if prefer_pipeline:
+            return self._ingest_docs_with_pipeline(
+                docs=docs,
+                generate_source_summaries=generate_source_summaries,
+                pipeline=pipeline,
+            )
+
+        return self._engine.ingest_documents(
+            docs,
             generate_source_summaries=generate_source_summaries,
         )
 
