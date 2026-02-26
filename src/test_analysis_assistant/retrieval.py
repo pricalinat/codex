@@ -428,6 +428,7 @@ class RetrievalEngine:
             repo_map_boost = _repository_map_alignment(plan, chunk)
             extraction_quality = _extraction_quality(chunk)
             detection_quality = _detection_quality(chunk)
+            route_quality = _ingestion_route_quality(chunk, plan=plan)
             score = (
                 lexical_score * 0.50
                 + source_boost * 0.15
@@ -437,7 +438,8 @@ class RetrievalEngine:
                 + repo_map_boost * 0.04
                 + extraction_quality * 0.06
                 + detection_quality * 0.03
-                + _source_reliability(chunk) * 0.03
+                + _source_reliability(chunk) * 0.02
+                + route_quality * 0.04
             )
             breakdown = {
                 "lexical": round(lexical_score, 4),
@@ -448,6 +450,7 @@ class RetrievalEngine:
                 "repo_map": round(repo_map_boost, 4),
                 "extraction": round(extraction_quality, 4),
                 "detection": round(detection_quality, 4),
+                "ingestion_route": round(route_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
                 "authority": round(_source_authority(chunk), 4),
@@ -500,7 +503,7 @@ class RetrievalEngine:
             scored.extend(fallback)
 
         limit = max(1, top_k)
-        top = _select_diverse_top(scored, limit) if diversify else scored[:limit]
+        top = _select_diverse_top(scored, limit, plan=plan) if diversify else scored[:limit]
 
         if not top:
             return []
@@ -604,7 +607,12 @@ class RetrievalEngine:
             )
         )
 
-        selected = _select_diverse_top(fused, max(1, top_k)) if diversify else fused[: max(1, top_k)]
+        expansion_plan = self.build_query_plan(query_text)
+        selected = (
+            _select_diverse_top(fused, max(1, top_k), plan=expansion_plan)
+            if diversify
+            else fused[: max(1, top_k)]
+        )
         if not selected:
             return []
 
@@ -3311,7 +3319,7 @@ def _detection_quality(chunk: Chunk) -> float:
     return max(0.0, min(1.0, quality))
 
 
-def _ingestion_route_quality(chunk: Chunk) -> float:
+def _ingestion_route_quality(chunk: Chunk, plan: Optional[QueryPlan] = None) -> float:
     route = str(chunk.metadata.get("ingestion_route", "")).strip().lower()
     route_scores = {
         "pipeline_verified": 0.98,
@@ -3319,6 +3327,8 @@ def _ingestion_route_quality(chunk: Chunk) -> float:
         "pipeline_detected": 0.9,
         "prechunked": 0.88,
         "repository_scan": 0.94,
+        "record_bundle": 0.91,
+        "file_reference_record": 0.9,
         "artifact_bundle": 0.90,
         "normalized_record": 0.84,
         "explicit_record": 0.82,
@@ -3326,10 +3336,22 @@ def _ingestion_route_quality(chunk: Chunk) -> float:
         "ocr_stub": 0.40,
     }
     if route:
-        return max(0.0, min(1.0, route_scores.get(route, 0.76)))
-    if chunk.modality == "image_ocr_stub":
-        return 0.35
-    return 0.88
+        quality = max(0.0, min(1.0, route_scores.get(route, 0.76)))
+    elif chunk.modality == "image_ocr_stub":
+        quality = 0.35
+    else:
+        quality = 0.88
+
+    # If the query explicitly asks for image evidence, avoid over-penalizing
+    # OCR stubs when they may be the only available path.
+    if plan is not None and chunk.modality == "image_ocr_stub":
+        wants_image = bool(
+            {"image", "image_ocr_stub"}.intersection(set(plan.required_modalities + plan.preferred_modalities))
+        )
+        if wants_image:
+            quality = max(quality, 0.52)
+
+    return quality
 
 
 def _chunk_completeness(chunk: Chunk, avg_chunk_size: int = 360) -> float:
@@ -4591,7 +4613,11 @@ def _dedupe(items: Sequence[Any]) -> List[Any]:
     return ordered
 
 
-def _select_diverse_top(candidates: Sequence[RankedChunk], top_k: int) -> List[RankedChunk]:
+def _select_diverse_top(
+    candidates: Sequence[RankedChunk],
+    top_k: int,
+    plan: Optional[QueryPlan] = None,
+) -> List[RankedChunk]:
     if top_k <= 0 or not candidates:
         return []
     if len(candidates) <= top_k:
@@ -4601,6 +4627,25 @@ def _select_diverse_top(candidates: Sequence[RankedChunk], top_k: int) -> List[R
     remaining = list(candidates[1:])
     lambda_score = 0.82
     novelty_penalty = 0.18
+    preferred_non_text_modalities: set = set()
+    preferred_source_types: set = set()
+    required_routes: set = set()
+
+    if plan is not None:
+        preferred_non_text_modalities = {
+            modality
+            for modality in _dedupe(plan.required_modalities + plan.preferred_modalities)
+            if modality != "text"
+        }
+        preferred_source_types = set(_dedupe(plan.required_source_types + plan.preferred_source_types[:3]))
+        required_routes = {route.lower() for route in plan.required_ingestion_routes}
+
+    covered_modalities = {item.chunk.modality for item in selected}
+    covered_source_types = {item.chunk.source_type for item in selected}
+    covered_routes = {
+        str(item.chunk.metadata.get("ingestion_route", "")).strip().lower()
+        for item in selected
+    }
 
     while remaining and len(selected) < top_k:
         best_idx = 0
@@ -4608,10 +4653,34 @@ def _select_diverse_top(candidates: Sequence[RankedChunk], top_k: int) -> List[R
         for idx, candidate in enumerate(remaining):
             max_similarity = max(_chunk_similarity(candidate.chunk, item.chunk) for item in selected)
             mmr_value = (lambda_score * candidate.score) - (novelty_penalty * max_similarity)
+            coverage_bonus = 0.0
+            route_name = str(candidate.chunk.metadata.get("ingestion_route", "")).strip().lower()
+
+            if preferred_non_text_modalities:
+                missing_modalities = preferred_non_text_modalities.difference(covered_modalities)
+                if candidate.chunk.modality in missing_modalities:
+                    coverage_bonus += 0.24
+                elif missing_modalities:
+                    coverage_bonus -= 0.03
+
+            if preferred_source_types and candidate.chunk.source_type in preferred_source_types:
+                if candidate.chunk.source_type not in covered_source_types:
+                    coverage_bonus += 0.08
+
+            if required_routes and route_name:
+                if route_name in required_routes and route_name not in covered_routes:
+                    coverage_bonus += 0.10
+
+            route_bonus = 0.03 * _ingestion_route_quality(candidate.chunk, plan=plan)
+            mmr_value += coverage_bonus + route_bonus
             if mmr_value > best_value:
                 best_value = mmr_value
                 best_idx = idx
-        selected.append(remaining.pop(best_idx))
+        picked = remaining.pop(best_idx)
+        selected.append(picked)
+        covered_modalities.add(picked.chunk.modality)
+        covered_source_types.add(picked.chunk.source_type)
+        covered_routes.add(str(picked.chunk.metadata.get("ingestion_route", "")).strip().lower())
 
     return selected
 
@@ -4921,6 +4990,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 repo_map_boost = _repository_map_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
                 detection_quality = _detection_quality(chunk)
+                route_quality = _ingestion_route_quality(chunk, plan=plan)
                 score = (
                     final_score * 0.47
                     + source_boost * 0.15
@@ -4930,7 +5000,8 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + repo_map_boost * 0.04
                     + extraction_quality * 0.06
                     + detection_quality * 0.03
-                    + _source_reliability(chunk) * 0.04
+                    + _source_reliability(chunk) * 0.03
+                    + route_quality * 0.04
                 )
             else:
                 # Lexical-only (original behavior)
@@ -4941,6 +5012,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 repo_map_boost = _repository_map_alignment(plan, chunk)
                 extraction_quality = _extraction_quality(chunk)
                 detection_quality = _detection_quality(chunk)
+                route_quality = _ingestion_route_quality(chunk, plan=plan)
                 score = (
                     lex_score * 0.50
                     + source_boost * 0.15
@@ -4950,7 +5022,8 @@ class HybridRetrievalEngine(RetrievalEngine):
                     + repo_map_boost * 0.04
                     + extraction_quality * 0.06
                     + detection_quality * 0.03
-                    + _source_reliability(chunk) * 0.03
+                    + _source_reliability(chunk) * 0.02
+                    + route_quality * 0.04
                 )
 
             breakdown = {
@@ -4963,6 +5036,7 @@ class HybridRetrievalEngine(RetrievalEngine):
                 "repo_map": round(repo_map_boost, 4),
                 "extraction": round(extraction_quality, 4),
                 "detection": round(detection_quality, 4),
+                "ingestion_route": round(route_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
                 "authority": round(_source_authority(chunk), 4),
@@ -5011,7 +5085,7 @@ class HybridRetrievalEngine(RetrievalEngine):
             scored.extend(fallback)
 
         limit = max(1, top_k)
-        top = _select_diverse_top(scored, limit) if diversify else scored[:limit]
+        top = _select_diverse_top(scored, limit, plan=plan) if diversify else scored[:limit]
 
         if not top:
             return []

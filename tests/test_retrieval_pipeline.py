@@ -100,6 +100,51 @@ class TestRetrievalPipeline(unittest.TestCase):
             ranked[1].score_breakdown.get("reliability", 0.0),
         )
 
+    def test_ingestion_route_quality_prefers_verified_pipeline_evidence(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="stub-route",
+                    source_id="a-stub",
+                    source_type=SourceType.KNOWLEDGE,
+                    modality="image_ocr_stub",
+                    text="Auth retry heatmap evidence for release risk triage.",
+                    token_count=8,
+                    metadata={
+                        "ingestion_route": "pipeline_ocr_stub",
+                        "extraction_confidence": 0.9,
+                    },
+                ),
+                Chunk(
+                    chunk_id="verified-route",
+                    source_id="z-verified",
+                    source_type=SourceType.KNOWLEDGE,
+                    modality="image",
+                    text="Auth retry heatmap evidence for release risk triage.",
+                    token_count=8,
+                    metadata={
+                        "ingestion_route": "pipeline_verified",
+                        "extraction_confidence": 0.9,
+                    },
+                ),
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry heatmap release risk triage",
+            top_k=2,
+            diversify=False,
+        )
+
+        self.assertEqual(2, len(ranked))
+        self.assertEqual("verified-route", ranked[0].chunk.chunk_id)
+        self.assertIn("ingestion_route", ranked[0].score_breakdown)
+        self.assertGreater(
+            ranked[0].score_breakdown["ingestion_route"],
+            ranked[1].score_breakdown["ingestion_route"],
+        )
+
     def test_ingest_prechunked_extracts_reference_signals_for_citation_graph_scoring(self):
         engine = RetrievalEngine()
         engine.ingest_prechunked(
@@ -226,6 +271,37 @@ class TestRetrievalPipeline(unittest.TestCase):
 
         self.assertGreaterEqual(len(ranked), 1)
         self.assertTrue(all(item.chunk.modality in {"image", "image_ocr_stub"} for item in ranked))
+
+    def test_query_diversify_prefers_requested_table_modality_coverage(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-auth-a",
+                source_type=SourceType.REPOSITORY,
+                content="Auth release risk triage mitigation for recurring failures.",
+            ),
+            IngestDocument(
+                source_id="req-auth-b",
+                source_type=SourceType.REQUIREMENTS,
+                content="Auth release risk matrix triage and mitigation checklist.",
+            ),
+            IngestDocument(
+                source_id="sys-auth-table",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                modality="table",
+                content={"rows": [{"service": "auth", "priority": "p0"}]},
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "auth release risk matrix table triage",
+            top_k=2,
+            diversify=True,
+        )
+
+        self.assertEqual(2, len(ranked))
+        self.assertIn("table", {item.chunk.modality for item in ranked})
 
     def test_retrieve_evidence_prioritizes_structural_targets(self):
         docs = [
