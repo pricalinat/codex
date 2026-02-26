@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .analyzer import analyze_report_text
+from .hybrid_analyzer import HybridAnalyzer, hybrid_analyze, HybridInsight
+from .llm_integration import LLMProvider
 from .rag_analyzer import RAGAnalyzer, rag_analyze
 
 
@@ -86,6 +88,55 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to knowledge document(s).",
     )
 
+    # Hybrid-analyze command - RAG + LLM analysis
+    hybrid = subparsers.add_parser("hybrid-analyze", help="Analyze with RAG + LLM augmentation.")
+    hybrid.add_argument("--input", required=True, help="Path to junit xml or pytest text report.")
+    hybrid.add_argument(
+        "--repo",
+        help="Path to repository for context ingestion.",
+    )
+    hybrid.add_argument(
+        "--requirements",
+        action="append",
+        dest="requirements",
+        help="Path to requirements markdown file(s). Can be specified multiple times.",
+    )
+    hybrid.add_argument(
+        "--requirements-text",
+        help="Inline requirements text (markdown format).",
+    )
+    hybrid.add_argument(
+        "--knowledge",
+        action="append",
+        dest="knowledge",
+        help="Path to knowledge document(s). Can be specified multiple times.",
+    )
+    hybrid.add_argument(
+        "--query",
+        help="Additional query for retrieval context.",
+    )
+    hybrid.add_argument(
+        "--format",
+        choices=["json", "pretty"],
+        default="json",
+        help="Output format: compact json or human-readable json.",
+    )
+    hybrid.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Disable LLM enhancement, use RAG-only mode.",
+    )
+    hybrid.add_argument(
+        "--llm-provider",
+        choices=["openai", "anthropic", "local", "mock"],
+        default="mock",
+        help="LLM provider to use (default: mock for testing).",
+    )
+    hybrid.add_argument(
+        "--llm-model",
+        help="Model name to use with the LLM provider.",
+    )
+
     return parser
 
 
@@ -110,6 +161,8 @@ def main() -> int:
         return _handle_basic_analyze(args)
     elif args.command == "rag-analyze":
         return _handle_rag_analyze(args)
+    elif args.command == "hybrid-analyze":
+        return _handle_hybrid_analyze(args)
     elif args.command == "ingest":
         return _handle_ingest(args)
     else:
@@ -178,6 +231,57 @@ def _handle_rag_analyze(args) -> int:
 
     indent = 2 if args.format == "pretty" else None
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=indent))
+    return 0
+
+
+def _handle_hybrid_analyze(args) -> int:
+    """Handle hybrid (RAG + LLM) analysis command."""
+    report_path = Path(args.input)
+    if not report_path.exists():
+        print(f"error: input file not found: {report_path}")
+        return 1
+
+    try:
+        content = report_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: reading report: {exc}")
+        return 1
+
+    # Load documents
+    requirements_docs = []
+    if args.requirements:
+        requirements_docs.extend(_load_docs_from_paths(args.requirements))
+    if args.requirements_text:
+        requirements_docs.append(("inline:requirements", args.requirements_text))
+
+    knowledge_docs = []
+    if args.knowledge:
+        knowledge_docs.extend(_load_docs_from_paths(args.knowledge))
+
+    # Determine LLM settings
+    use_llm = not args.no_llm
+    llm_provider = LLMProvider(args.llm_provider)
+    model = args.llm_model or "gpt-4o-mini"
+
+    # Run hybrid analysis
+    try:
+        result = hybrid_analyze(
+            test_report_content=content,
+            repo_path=args.repo,
+            requirements_docs=requirements_docs if requirements_docs else None,
+            knowledge_docs=knowledge_docs if knowledge_docs else None,
+            query_for_context=args.query,
+            use_llm=use_llm,
+            llm_provider=llm_provider,
+            model=model,
+        )
+    except Exception as exc:
+        print(f"error: hybrid analysis failed: {exc}")
+        return 1
+
+    indent = 2 if args.format == "pretty" else None
+    output = result.to_dict()
+    print(json.dumps(output, ensure_ascii=False, indent=indent))
     return 0
 
 

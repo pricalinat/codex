@@ -36,6 +36,12 @@ from .confidence_analysis import (
     UncertaintyType,
     analyze_confidence,
 )
+from .hybrid_analyzer import (
+    HybridAnalyzer,
+    HybridAnalysisResult,
+    HybridInsight,
+    hybrid_analyze,
+)
 from .ingestion_pipeline import (
     IngestionHandler,
     IngestionProgress,
@@ -45,6 +51,14 @@ from .ingestion_pipeline import (
     SourceConfig,
     UnifiedIngestionPipeline,
     create_unified_pipeline,
+)
+from .llm_integration import (
+    LLMAnalyzer,
+    LLMConfig,
+    LLMProvider,
+    LLMResponse,
+    create_analyzer,
+    create_llm_client,
 )
 from .models import AnalysisResult, FailureRecord, FixSuggestion
 from .prompt_strategy import (
@@ -240,4 +254,16 @@ __all__ = [
     "SourceConfig",
     "UnifiedIngestionPipeline",
     "create_unified_pipeline",
+    # Hybrid analyzer exports
+    "HybridAnalyzer",
+    "HybridAnalysisResult",
+    "HybridInsight",
+    "hybrid_analyze",
+    # LLM integration exports
+    "LLMAnalyzer",
+    "LLMConfig",
+    "LLMProvider",
+    "LLMResponse",
+    "create_analyzer",
+    "create_llm_client",
 ]
