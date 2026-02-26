@@ -108,6 +108,7 @@ class QueryPlan:
 class CorpusCoverageProfile:
     source_type_counts: Dict[SourceType, int] = field(default_factory=dict)
     modality_counts: Dict[str, int] = field(default_factory=dict)
+    ingestion_route_counts: Dict[str, int] = field(default_factory=dict)
     source_type_modalities: Dict[SourceType, List[str]] = field(default_factory=dict)
     source_type_avg_extraction: Dict[SourceType, float] = field(default_factory=dict)
 
@@ -120,12 +121,16 @@ class RetrievalEvidence:
     source_bundles: List["SourceEvidenceBundle"] = field(default_factory=list)
     covered_source_types: List[SourceType] = field(default_factory=list)
     covered_modalities: List[str] = field(default_factory=list)
+    covered_ingestion_routes: List[str] = field(default_factory=list)
     missing_source_types: List[SourceType] = field(default_factory=list)
     missing_modalities: List[str] = field(default_factory=list)
+    missing_ingestion_routes: List[str] = field(default_factory=list)
     corpus_available_source_types: List[SourceType] = field(default_factory=list)
     corpus_available_modalities: List[str] = field(default_factory=list)
+    corpus_available_ingestion_routes: List[str] = field(default_factory=list)
     unavailable_preferred_source_types: List[SourceType] = field(default_factory=list)
     unavailable_preferred_modalities: List[str] = field(default_factory=list)
+    unavailable_preferred_ingestion_routes: List[str] = field(default_factory=list)
     aggregate_confidence: float = 0.0
     calibrated_confidence: float = 0.0
     confidence_band: str = "low"
@@ -327,6 +332,7 @@ class RetrievalEngine:
     def build_corpus_profile(self) -> CorpusCoverageProfile:
         source_type_counts: Dict[SourceType, int] = {}
         modality_counts: Dict[str, int] = {}
+        ingestion_route_counts: Dict[str, int] = {}
         source_modalities: Dict[SourceType, set] = {}
         extraction_totals: Dict[SourceType, float] = {}
         extraction_counts: Dict[SourceType, int] = {}
@@ -334,6 +340,9 @@ class RetrievalEngine:
         for chunk in self._chunks:
             source_type_counts[chunk.source_type] = source_type_counts.get(chunk.source_type, 0) + 1
             modality_counts[chunk.modality] = modality_counts.get(chunk.modality, 0) + 1
+            route = str(chunk.metadata.get("ingestion_route", "")).strip().lower().replace("-", "_")
+            if route:
+                ingestion_route_counts[route] = ingestion_route_counts.get(route, 0) + 1
             source_modalities.setdefault(chunk.source_type, set()).add(chunk.modality)
 
             extraction = float(chunk.metadata.get("extraction_confidence", 1.0))
@@ -348,6 +357,7 @@ class RetrievalEngine:
         return CorpusCoverageProfile(
             source_type_counts=source_type_counts,
             modality_counts=modality_counts,
+            ingestion_route_counts=ingestion_route_counts,
             source_type_modalities={k: sorted(v) for k, v in source_modalities.items()},
             source_type_avg_extraction=source_type_avg_extraction,
         )
@@ -701,16 +711,29 @@ class RetrievalEngine:
         )
         corpus_available_sources = _dedupe(list(corpus_profile.source_type_counts.keys()))
         corpus_available_modalities = _dedupe(list(corpus_profile.modality_counts.keys()))
+        corpus_available_routes = _dedupe(sorted(corpus_profile.ingestion_route_counts.keys()))
         covered_sources = _dedupe([item.chunk.source_type for item in ranked])
         covered_modalities = _dedupe([item.chunk.modality for item in ranked])
+        covered_routes = _dedupe(
+            [
+                str(item.chunk.metadata.get("ingestion_route", "")).strip().lower().replace("-", "_")
+                for item in ranked
+                if str(item.chunk.metadata.get("ingestion_route", "")).strip()
+            ]
+        )
+        required_routes = _dedupe(
+            [str(route).strip().lower().replace("-", "_") for route in plan.required_ingestion_routes if str(route).strip()]
+        )
         missing_sources = [stype for stype in plan.preferred_source_types if stype not in covered_sources]
         missing_modalities = [modality for modality in plan.preferred_modalities if modality not in covered_modalities]
+        missing_routes = [route for route in required_routes if route not in covered_routes]
         unavailable_sources = [
             stype for stype in plan.preferred_source_types if stype not in corpus_available_sources
         ]
         unavailable_modalities = [
             modality for modality in plan.preferred_modalities if modality not in corpus_available_modalities
         ]
+        unavailable_routes = [route for route in required_routes if route not in corpus_available_routes]
         aggregate_confidence = _aggregate_confidence(ranked)
         calibrated_confidence, confidence_factors = _calibrate_retrieval_confidence(
             ranked=ranked,
@@ -718,8 +741,10 @@ class RetrievalEngine:
             aggregate_confidence=aggregate_confidence,
             missing_sources=missing_sources,
             missing_modalities=missing_modalities,
+            missing_routes=missing_routes,
             unavailable_sources=unavailable_sources,
             unavailable_modalities=unavailable_modalities,
+            unavailable_routes=unavailable_routes,
         )
 
         if adaptive_recovery and _should_apply_recovery(
@@ -757,20 +782,30 @@ class RetrievalEngine:
                     aggregate_confidence = _aggregate_confidence(ranked)
                     covered_sources = _dedupe([item.chunk.source_type for item in ranked])
                     covered_modalities = _dedupe([item.chunk.modality for item in ranked])
+                    covered_routes = _dedupe(
+                        [
+                            str(item.chunk.metadata.get("ingestion_route", "")).strip().lower().replace("-", "_")
+                            for item in ranked
+                            if str(item.chunk.metadata.get("ingestion_route", "")).strip()
+                        ]
+                    )
                     missing_sources = [
                         stype for stype in plan.preferred_source_types if stype not in covered_sources
                     ]
                     missing_modalities = [
                         modality for modality in plan.preferred_modalities if modality not in covered_modalities
                     ]
+                    missing_routes = [route for route in required_routes if route not in covered_routes]
                     calibrated_confidence, confidence_factors = _calibrate_retrieval_confidence(
                         ranked=ranked,
                         plan=plan,
                         aggregate_confidence=aggregate_confidence,
                         missing_sources=missing_sources,
                         missing_modalities=missing_modalities,
+                        missing_routes=missing_routes,
                         unavailable_sources=unavailable_sources,
                         unavailable_modalities=unavailable_modalities,
+                        unavailable_routes=unavailable_routes,
                     )
 
         source_bundles = _build_source_bundles(ranked, plan)
@@ -785,8 +820,10 @@ class RetrievalEngine:
             corpus_profile=corpus_profile,
             missing_sources=missing_sources,
             missing_modalities=missing_modalities,
+            missing_routes=missing_routes,
             unavailable_sources=unavailable_sources,
             unavailable_modalities=unavailable_modalities,
+            unavailable_routes=unavailable_routes,
         )
 
         return RetrievalEvidence(
@@ -796,12 +833,16 @@ class RetrievalEngine:
             source_bundles=source_bundles,
             covered_source_types=covered_sources,
             covered_modalities=covered_modalities,
+            covered_ingestion_routes=covered_routes,
             missing_source_types=missing_sources,
             missing_modalities=missing_modalities,
+            missing_ingestion_routes=missing_routes,
             corpus_available_source_types=corpus_available_sources,
             corpus_available_modalities=corpus_available_modalities,
+            corpus_available_ingestion_routes=corpus_available_routes,
             unavailable_preferred_source_types=unavailable_sources,
             unavailable_preferred_modalities=unavailable_modalities,
+            unavailable_preferred_ingestion_routes=unavailable_routes,
             aggregate_confidence=aggregate_confidence,
             calibrated_confidence=calibrated_confidence,
             confidence_band=band,
@@ -873,14 +914,31 @@ class RetrievalEngine:
         )
         covered_sources = _dedupe([item.chunk.source_type for item in merged_ranked])
         covered_modalities = _dedupe([item.chunk.modality for item in merged_ranked])
+        covered_routes = _dedupe(
+            [
+                str(item.chunk.metadata.get("ingestion_route", "")).strip().lower().replace("-", "_")
+                for item in merged_ranked
+                if str(item.chunk.metadata.get("ingestion_route", "")).strip()
+            ]
+        )
+        required_routes = _dedupe(
+            [
+                str(route).strip().lower().replace("-", "_")
+                for route in merged_plan.required_ingestion_routes
+                if str(route).strip()
+            ]
+        )
         missing_sources = [stype for stype in merged_plan.preferred_source_types if stype not in covered_sources]
         missing_modalities = [modality for modality in merged_plan.preferred_modalities if modality not in covered_modalities]
+        missing_routes = [route for route in required_routes if route not in covered_routes]
         corpus_available_sources = _dedupe(list(corpus_profile.source_type_counts.keys()))
         corpus_available_modalities = _dedupe(list(corpus_profile.modality_counts.keys()))
+        corpus_available_routes = _dedupe(sorted(corpus_profile.ingestion_route_counts.keys()))
         unavailable_sources = [stype for stype in merged_plan.preferred_source_types if stype not in corpus_available_sources]
         unavailable_modalities = [
             modality for modality in merged_plan.preferred_modalities if modality not in corpus_available_modalities
         ]
+        unavailable_routes = [route for route in required_routes if route not in corpus_available_routes]
         aggregate_confidence = _aggregate_confidence(merged_ranked)
         calibrated_confidence, confidence_factors = _calibrate_retrieval_confidence(
             ranked=merged_ranked,
@@ -888,8 +946,10 @@ class RetrievalEngine:
             aggregate_confidence=aggregate_confidence,
             missing_sources=missing_sources,
             missing_modalities=missing_modalities,
+            missing_routes=missing_routes,
             unavailable_sources=unavailable_sources,
             unavailable_modalities=unavailable_modalities,
+            unavailable_routes=unavailable_routes,
         )
         if calibrated_confidence >= 0.72:
             confidence_band = "high"
@@ -905,12 +965,16 @@ class RetrievalEngine:
             source_bundles=_build_source_bundles(merged_ranked, merged_plan),
             covered_source_types=covered_sources,
             covered_modalities=covered_modalities,
+            covered_ingestion_routes=covered_routes,
             missing_source_types=missing_sources,
             missing_modalities=missing_modalities,
+            missing_ingestion_routes=missing_routes,
             corpus_available_source_types=corpus_available_sources,
             corpus_available_modalities=corpus_available_modalities,
+            corpus_available_ingestion_routes=corpus_available_routes,
             unavailable_preferred_source_types=unavailable_sources,
             unavailable_preferred_modalities=unavailable_modalities,
+            unavailable_preferred_ingestion_routes=unavailable_routes,
             aggregate_confidence=aggregate_confidence,
             calibrated_confidence=calibrated_confidence,
             confidence_band=confidence_band,
@@ -924,8 +988,10 @@ class RetrievalEngine:
                 corpus_profile=corpus_profile,
                 missing_sources=missing_sources,
                 missing_modalities=missing_modalities,
+                missing_routes=missing_routes,
                 unavailable_sources=unavailable_sources,
                 unavailable_modalities=unavailable_modalities,
+                unavailable_routes=unavailable_routes,
             ),
         )
 
@@ -4418,13 +4484,17 @@ def _calibrate_retrieval_confidence(
     aggregate_confidence: float,
     missing_sources: Sequence[SourceType],
     missing_modalities: Sequence[str],
+    missing_routes: Sequence[str],
     unavailable_sources: Sequence[SourceType],
     unavailable_modalities: Sequence[str],
+    unavailable_routes: Sequence[str],
 ) -> Tuple[float, Dict[str, float]]:
     preferred_sources = len(plan.preferred_source_types)
     preferred_modalities = len(plan.preferred_modalities)
     source_coverage = 1.0 - (len(missing_sources) / preferred_sources) if preferred_sources else 1.0
     modality_coverage = 1.0 - (len(missing_modalities) / preferred_modalities) if preferred_modalities else 1.0
+    required_routes = len(plan.required_ingestion_routes)
+    route_constraint_coverage = 1.0 - (len(missing_routes) / required_routes) if required_routes else 1.0
     structural_coverage = _structural_coverage(plan, ranked)
 
     if ranked:
@@ -4487,6 +4557,8 @@ def _calibrate_retrieval_confidence(
         unavailable_pressure += (len(unavailable_sources) / preferred_sources) * 0.6
     if preferred_modalities:
         unavailable_pressure += (len(unavailable_modalities) / preferred_modalities) * 0.4
+    if required_routes:
+        unavailable_pressure += (len(unavailable_routes) / required_routes) * 0.2
     unavailable_pressure = max(0.0, min(1.0, unavailable_pressure))
 
     coverage_multiplier = (0.56 + (0.24 * source_coverage) + (0.20 * modality_coverage))
@@ -4497,6 +4569,7 @@ def _calibrate_retrieval_confidence(
     extraction_multiplier = 0.92 + (0.08 * extraction_reliability)
     reliability_multiplier = 0.90 + (0.10 * source_reliability)
     route_multiplier = 0.92 + (0.08 * ingestion_route_quality)
+    route_constraint_multiplier = 0.90 + (0.10 * route_constraint_coverage)
     graph_multiplier = (
         1.0
         + (0.008 * artifact_graph_support)
@@ -4520,6 +4593,7 @@ def _calibrate_retrieval_confidence(
         * extraction_multiplier
         * reliability_multiplier
         * route_multiplier
+        * route_constraint_multiplier
         * graph_multiplier
     )
     calibrated = calibrated * max(0.55, 1.0 - quality_penalty - availability_penalty - concentration_penalty)
@@ -4528,6 +4602,7 @@ def _calibrate_retrieval_confidence(
     factors = {
         "source_coverage": round(max(0.0, min(1.0, source_coverage)), 4),
         "modality_coverage": round(max(0.0, min(1.0, modality_coverage)), 4),
+        "route_constraint_coverage": round(max(0.0, min(1.0, route_constraint_coverage)), 4),
         "structural_coverage": round(max(0.0, min(1.0, structural_coverage)), 4),
         "ocr_stub_ratio": round(max(0.0, min(1.0, ocr_stub_ratio)), 4),
         "low_signal_ratio": round(max(0.0, min(1.0, low_signal_ratio)), 4),
@@ -4742,11 +4817,26 @@ def _recommend_ingestion_actions(
     corpus_profile: CorpusCoverageProfile,
     missing_sources: Sequence[SourceType],
     missing_modalities: Sequence[str],
+    missing_routes: Sequence[str],
     unavailable_sources: Sequence[SourceType],
     unavailable_modalities: Sequence[str],
+    unavailable_routes: Sequence[str],
     max_actions: int = 5,
 ) -> List[str]:
     actions: List[str] = []
+
+    if unavailable_routes:
+        actions.append(
+            "Ingest artifacts through required route(s): "
+            + ", ".join(unavailable_routes[:3])
+            + " (configure pipeline/source adapters to emit matching ingestion_route metadata)."
+        )
+    elif missing_routes:
+        actions.append(
+            "Tune retrieval/routing to surface required route evidence already present in corpus: "
+            + ", ".join(missing_routes[:3])
+            + "."
+        )
 
     if "table" in unavailable_modalities:
         actions.append(

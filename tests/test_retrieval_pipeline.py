@@ -3757,6 +3757,55 @@ class TestHybridRetrievalEngine(unittest.TestCase):
         self.assertIn("Recommended ingestion actions", prompt)
         self.assertIn("ocr", prompt.lower())
 
+    def test_retrieve_evidence_reports_missing_required_ingestion_route_coverage(self):
+        engine = RetrievalEngine()
+        engine.ingest_documents(
+            [
+                IngestDocument(
+                    source_id="repo-auth",
+                    source_type=SourceType.REPOSITORY,
+                    content="Auth retry failures happen in token refresh path.",
+                    metadata={"ingestion_route": "repository_scan"},
+                )
+            ]
+        )
+
+        evidence = engine.retrieve_evidence(
+            "route:pipeline_verified auth retry failure",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("pipeline_verified", evidence.missing_ingestion_routes)
+        self.assertIn("route_constraint_coverage", evidence.confidence_factors)
+        self.assertLess(evidence.confidence_factors["route_constraint_coverage"], 1.0)
+
+    def test_retrieve_evidence_recommends_actions_for_missing_required_ingestion_routes(self):
+        engine = RetrievalEngine()
+        engine.ingest_documents(
+            [
+                IngestDocument(
+                    source_id="repo-auth",
+                    source_type=SourceType.REPOSITORY,
+                    content="Auth retry failures happen in token refresh path.",
+                    metadata={"ingestion_route": "repository_scan"},
+                )
+            ]
+        )
+
+        evidence = engine.retrieve_evidence(
+            "route:pipeline_verified auth retry failure",
+            top_k=3,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        action_text = "\n".join(evidence.recommended_ingestion_actions).lower()
+        self.assertIn("pipeline_verified", action_text)
+
 
 class TestQueryExpansion(unittest.TestCase):
     """Tests for query expansion functionality."""
