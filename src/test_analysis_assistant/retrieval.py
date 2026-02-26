@@ -201,6 +201,18 @@ class IngestionRecord:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class IngestionPlanDecision:
+    """Execution decision for multi-source ingestion routing."""
+
+    use_pipeline: bool
+    strategy: str
+    score: float
+    confidence: float
+    rationale: str
+    signal_summary: Dict[str, Any] = field(default_factory=dict)
+
+
 class RetrievalEngine:
     def __init__(self, chunk_size: int = 360, chunk_overlap: int = 40) -> None:
         self._chunk_size = max(80, chunk_size)
@@ -1027,6 +1039,14 @@ class MultiSourceIngestor:
     def __init__(self, engine: RetrievalEngine) -> None:
         self._engine = engine
 
+    def plan_records(
+        self,
+        records: Sequence[IngestionRecord],
+        prefer_pipeline: bool | str = False,
+    ) -> IngestionPlanDecision:
+        """Build an ingestion decision before normalization/chunking."""
+        return _plan_record_ingestion_decision(records=records, prefer_pipeline=prefer_pipeline)
+
     def ingest_raw(
         self,
         source_id: str,
@@ -1052,15 +1072,17 @@ class MultiSourceIngestor:
         self,
         records: Sequence[IngestionRecord],
         generate_source_summaries: bool = False,
-        prefer_pipeline: bool = False,
+        prefer_pipeline: bool | str = False,
         pipeline: Optional[Any] = None,
     ) -> List[Chunk]:
+        decision = self.plan_records(records, prefer_pipeline=prefer_pipeline)
         docs: List[IngestDocument] = []
         for record in records:
             docs.extend(_normalize_ingestion_record_to_docs(record))
         if not docs:
             return []
-        if prefer_pipeline:
+        docs = self._apply_plan_metadata(docs, decision=decision)
+        if decision.use_pipeline:
             return self._ingest_docs_with_pipeline(
                 docs=docs,
                 generate_source_summaries=generate_source_summaries,
@@ -1070,6 +1092,32 @@ class MultiSourceIngestor:
             docs,
             generate_source_summaries=generate_source_summaries,
         )
+
+    def _apply_plan_metadata(
+        self,
+        docs: Sequence[IngestDocument],
+        decision: IngestionPlanDecision,
+    ) -> List[IngestDocument]:
+        annotated: List[IngestDocument] = []
+        for doc in docs:
+            metadata = dict(doc.metadata or {})
+            metadata.setdefault("ingestion_strategy", decision.strategy)
+            metadata.setdefault("ingestion_strategy_score", round(float(decision.score), 4))
+            metadata.setdefault("ingestion_strategy_confidence", round(float(decision.confidence), 4))
+            if decision.rationale:
+                metadata.setdefault("ingestion_strategy_reason", decision.rationale)
+            if decision.signal_summary:
+                metadata.setdefault("ingestion_strategy_signals", dict(decision.signal_summary))
+            annotated.append(
+                IngestDocument(
+                    source_id=doc.source_id,
+                    source_type=doc.source_type,
+                    content=doc.content,
+                    modality=doc.modality,
+                    metadata=metadata,
+                )
+            )
+        return annotated
 
     def _ingest_docs_with_pipeline(
         self,
@@ -1094,6 +1142,28 @@ class MultiSourceIngestor:
                 pipeline_result = pipeline_runner.process_batch(docs)
                 pipeline_chunks = list(getattr(pipeline_result, "chunks", []) or [])
                 if pipeline_chunks:
+                    doc_metadata_by_source_id: Dict[str, Dict[str, Any]] = {}
+                    for doc in docs:
+                        source_key = str(doc.source_id).strip()
+                        if source_key and source_key not in doc_metadata_by_source_id:
+                            doc_metadata_by_source_id[source_key] = dict(doc.metadata or {})
+                    for chunk in pipeline_chunks:
+                        source_key = str(chunk.source_id).strip()
+                        inherited = doc_metadata_by_source_id.get(source_key, {})
+                        if not inherited:
+                            continue
+                        chunk_metadata = dict(chunk.metadata or {})
+                        for key in (
+                            "ingestion_strategy",
+                            "ingestion_strategy_score",
+                            "ingestion_strategy_confidence",
+                            "ingestion_strategy_reason",
+                            "ingestion_strategy_signals",
+                        ):
+                            if key in inherited:
+                                chunk_metadata.setdefault(key, inherited[key])
+                        chunk.metadata = chunk_metadata
+
                     indexed: List[Chunk] = []
                     indexed.extend(
                         self._engine.ingest_prechunked(
@@ -1806,6 +1876,145 @@ def _create_default_unified_pipeline() -> Any:
     from .ingestion_pipeline import create_unified_pipeline
 
     return create_unified_pipeline()
+
+
+def _plan_record_ingestion_decision(
+    records: Sequence[IngestionRecord],
+    prefer_pipeline: bool | str = False,
+) -> IngestionPlanDecision:
+    if isinstance(prefer_pipeline, bool):
+        if prefer_pipeline:
+            return IngestionPlanDecision(
+                use_pipeline=True,
+                strategy="pipeline_forced",
+                score=1.0,
+                confidence=1.0,
+                rationale="forced by caller",
+                signal_summary={"record_count": len(records)},
+            )
+        return IngestionPlanDecision(
+            use_pipeline=False,
+            strategy="direct_forced",
+            score=0.0,
+            confidence=1.0,
+            rationale="forced by caller",
+            signal_summary={"record_count": len(records)},
+        )
+
+    mode = str(prefer_pipeline or "").strip().lower()
+    if mode in {"pipeline", "true", "1", "yes"}:
+        return IngestionPlanDecision(
+            use_pipeline=True,
+            strategy="pipeline_forced",
+            score=1.0,
+            confidence=1.0,
+            rationale=f"forced by caller mode={mode}",
+            signal_summary={"record_count": len(records)},
+        )
+    if mode in {"direct", "false", "0", "no"}:
+        return IngestionPlanDecision(
+            use_pipeline=False,
+            strategy="direct_forced",
+            score=0.0,
+            confidence=1.0,
+            rationale=f"forced by caller mode={mode}",
+            signal_summary={"record_count": len(records)},
+        )
+
+    score, rationale, signal_summary = _score_pipeline_need_for_records(records)
+    threshold = 0.55
+    use_pipeline = score >= threshold
+    confidence = 0.58 + (abs(score - threshold) * 0.7)
+    confidence = round(max(0.5, min(0.97, confidence)), 4)
+    return IngestionPlanDecision(
+        use_pipeline=use_pipeline,
+        strategy="pipeline_auto" if use_pipeline else "direct_auto",
+        score=round(score, 4),
+        confidence=confidence,
+        rationale=rationale,
+        signal_summary=signal_summary,
+    )
+
+
+def _score_pipeline_need_for_records(
+    records: Sequence[IngestionRecord],
+) -> Tuple[float, str, Dict[str, Any]]:
+    if not records:
+        return 0.0, "no records provided", {"record_count": 0}
+
+    modalities: set = set()
+    source_types: set = set()
+    nested_container_count = 0
+    multimodal_marker_count = 0
+    complex_modality_count = 0
+    file_reference_count = 0
+    byte_estimate = 0
+
+    for record in records:
+        source_types.add(record.source_type.value)
+        modality, _ = _infer_record_modality_and_payload(record.payload)
+        modalities.add(modality)
+        if modality in {"compound", "table", "image", "markdown_mixed"}:
+            complex_modality_count += 1
+        byte_estimate += len(str(record.payload or ""))
+
+        payload = record.payload
+        if isinstance(payload, dict):
+            artifacts = payload.get("artifacts")
+            sources = payload.get("sources")
+            if isinstance(artifacts, list) and artifacts:
+                nested_container_count += 1
+            if isinstance(sources, list) and sources:
+                nested_container_count += 1
+            if _payload_has_multimodal_markers(payload):
+                multimodal_marker_count += 1
+
+        if _resolve_record_file_reference(payload, record.source_type) is not None:
+            file_reference_count += 1
+
+    score = 0.0
+    score += min(0.32, multimodal_marker_count * 0.24)
+    score += min(0.42, complex_modality_count * 0.32)
+    score += min(0.34, nested_container_count * 0.26)
+    score += min(0.20, file_reference_count * 0.12)
+    if len(modalities) >= 2:
+        score += 0.12
+    if len(source_types) >= 2:
+        score += 0.08
+    if byte_estimate >= 6000:
+        score += 0.06
+    score = max(0.0, min(1.0, score))
+
+    signal_summary: Dict[str, Any] = {
+        "record_count": len(records),
+        "modalities": sorted(modalities),
+        "source_types": sorted(source_types),
+        "nested_container_count": nested_container_count,
+        "multimodal_marker_count": multimodal_marker_count,
+        "complex_modality_count": complex_modality_count,
+        "file_reference_count": file_reference_count,
+        "byte_estimate": byte_estimate,
+    }
+    rationale_parts = [
+        f"score={score:.2f}",
+        f"modalities={len(modalities)}",
+        f"nested={nested_container_count}",
+        f"multimodal={multimodal_marker_count}",
+        f"complex_modality={complex_modality_count}",
+        f"file_refs={file_reference_count}",
+    ]
+    return score, " ".join(rationale_parts), signal_summary
+
+
+def _payload_has_multimodal_markers(payload: Dict[str, Any]) -> bool:
+    text_keys = ("text", "summary", "body", "description")
+    table_keys = ("table", "tables", "rows", "matrix")
+    image_keys = ("image", "images", "image_path", "ocr_text")
+    text_present = any(str(payload.get(key, "")).strip() for key in text_keys)
+    table_present = any(payload.get(key) is not None for key in table_keys)
+    image_present = any(payload.get(key) is not None for key in image_keys)
+    signal_count = int(text_present) + int(table_present) + int(image_present)
+    return signal_count >= 2
 
 
 def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:
@@ -3852,6 +4061,7 @@ def _ingestion_route_quality(chunk: Chunk, plan: Optional[QueryPlan] = None) -> 
         "artifact_bundle": 0.90,
         "normalized_record": 0.84,
         "explicit_record": 0.82,
+        "pipeline_fallback_direct": 0.79,
         "pipeline_ocr_stub": 0.40,
         "ocr_stub": 0.40,
     }
@@ -3871,7 +4081,30 @@ def _ingestion_route_quality(chunk: Chunk, plan: Optional[QueryPlan] = None) -> 
         if wants_image:
             quality = max(quality, 0.52)
 
-    return quality
+    strategy = str(chunk.metadata.get("ingestion_strategy", "")).strip().lower()
+    strategy_confidence = _coerce_optional_confidence(chunk.metadata.get("ingestion_strategy_confidence"))
+    if strategy and strategy_confidence is None:
+        strategy_confidence = 0.6
+    strategy_confidence = float(strategy_confidence or 0.0)
+
+    if strategy.startswith("pipeline"):
+        if route.startswith("pipeline") or route in {"repository_scan", "prechunked"}:
+            quality += 0.04 * strategy_confidence
+        elif route in {"normalized_record", "explicit_record", "pipeline_fallback_direct"}:
+            quality -= 0.08 * strategy_confidence
+    elif strategy.startswith("direct"):
+        if route in {
+            "normalized_record",
+            "explicit_record",
+            "record_bundle",
+            "record_bundle_parent",
+            "record_sources",
+            "record_sources_parent",
+            "file_reference_record",
+        }:
+            quality += 0.03 * strategy_confidence
+
+    return max(0.0, min(1.0, quality))
 
 
 def _chunk_completeness(chunk: Chunk, avg_chunk_size: int = 360) -> float:

@@ -2454,6 +2454,133 @@ Missing negative authorization tests are release blocking.
         self.assertGreaterEqual(len(ranked), 1)
         self.assertIn("detection", ranked[0].score_breakdown)
 
+    def test_ingest_records_auto_prefers_pipeline_for_multimodal_inputs(self):
+        class TrackingPipeline:
+            def __init__(self):
+                self.calls = 0
+
+            def process_batch(self, documents):
+                self.calls += 1
+                class Result:
+                    success = True
+                    errors = []
+                    chunks = [
+                        Chunk(
+                            chunk_id="pipeline-auto-1",
+                            source_id="record:auto-multi",
+                            source_type=SourceType.SYSTEM_ANALYSIS,
+                            modality="text",
+                            text="Auth retry incident summary with multimodal evidence.",
+                            token_count=8,
+                            metadata={"ingestion_route": "pipeline_detected"},
+                        )
+                    ]
+                return Result()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        pipeline = TrackingPipeline()
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:auto-multi",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "summary": "Auth retry storms impact release confidence.",
+                        "tables": [{"rows": [{"component": "auth", "risk": "high"}]}],
+                        "images": [{"image_path": "screens/auth-heatmap.png", "alt_text": "auth retries"}],
+                    },
+                )
+            ],
+            prefer_pipeline="auto",
+            pipeline=pipeline,
+        )
+
+        self.assertEqual(1, pipeline.calls)
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertTrue(all(chunk.metadata.get("ingestion_strategy") == "pipeline_auto" for chunk in chunks))
+        self.assertTrue(all(float(chunk.metadata.get("ingestion_strategy_confidence", 0.0)) >= 0.5 for chunk in chunks))
+
+    def test_ingest_records_auto_stays_direct_for_simple_text(self):
+        class TrackingPipeline:
+            def __init__(self):
+                self.calls = 0
+
+            def process_batch(self, documents):
+                self.calls += 1
+                class Result:
+                    success = True
+                    errors = []
+                    chunks = []
+                return Result()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        pipeline = TrackingPipeline()
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:auto-simple",
+                    source_type=SourceType.KNOWLEDGE,
+                    payload="Simple text fallback for auth retry observations.",
+                )
+            ],
+            prefer_pipeline="auto",
+            pipeline=pipeline,
+        )
+
+        self.assertEqual(0, pipeline.calls)
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertTrue(all(chunk.metadata.get("ingestion_strategy") == "direct_auto" for chunk in chunks))
+
+    def test_ingestion_strategy_signal_penalizes_pipeline_mismatch_routes(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="route-match-direct",
+                    source_id="record:direct",
+                    source_type=SourceType.KNOWLEDGE,
+                    modality="text",
+                    text="Auth retry incident mitigation evidence with owner assignment.",
+                    token_count=9,
+                    metadata={
+                        "ingestion_route": "normalized_record",
+                        "ingestion_strategy": "direct_auto",
+                        "ingestion_strategy_confidence": 0.95,
+                    },
+                ),
+                Chunk(
+                    chunk_id="route-mismatch-pipeline",
+                    source_id="record:pipeline",
+                    source_type=SourceType.KNOWLEDGE,
+                    modality="text",
+                    text="Auth retry incident mitigation evidence with owner assignment.",
+                    token_count=9,
+                    metadata={
+                        "ingestion_route": "normalized_record",
+                        "ingestion_strategy": "pipeline_auto",
+                        "ingestion_strategy_confidence": 0.95,
+                    },
+                ),
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry mitigation owner assignment evidence",
+            top_k=2,
+            diversify=False,
+        )
+
+        self.assertEqual(2, len(ranked))
+        self.assertEqual("route-match-direct", ranked[0].chunk.chunk_id)
+        self.assertGreater(
+            ranked[0].score_breakdown.get("ingestion_route", 0.0),
+            ranked[1].score_breakdown.get("ingestion_route", 0.0),
+        )
+
     def test_ingest_records_prefer_pipeline_falls_back_when_pipeline_returns_no_chunks(self):
         class EmptyPipeline:
             def process_batch(self, documents):
