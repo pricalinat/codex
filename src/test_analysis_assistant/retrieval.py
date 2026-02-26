@@ -451,6 +451,7 @@ class RetrievalEngine:
             extraction_quality = _extraction_quality(chunk)
             detection_quality = _detection_quality(chunk)
             route_quality = _ingestion_route_quality(chunk, plan=plan)
+            lineage_quality = _lineage_signal(chunk)
             score = (
                 lexical_score * 0.50
                 + source_boost * 0.15
@@ -462,6 +463,7 @@ class RetrievalEngine:
                 + detection_quality * 0.03
                 + _source_reliability(chunk) * 0.02
                 + route_quality * 0.04
+                + lineage_quality * 0.03
             )
             breakdown = {
                 "lexical": round(lexical_score, 4),
@@ -473,6 +475,7 @@ class RetrievalEngine:
                 "extraction": round(extraction_quality, 4),
                 "detection": round(detection_quality, 4),
                 "ingestion_route": round(route_quality, 4),
+                "lineage": round(lineage_quality, 4),
                 "reliability": round(_source_reliability(chunk), 4),
                 "position": round(_position_score(chunk), 4),
                 "authority": round(_source_authority(chunk), 4),
@@ -4062,6 +4065,7 @@ def _source_authority(chunk: Chunk) -> float:
 def _source_reliability(chunk: Chunk) -> float:
     """Reliability signal for ingestion provenance and extraction path quality."""
     reliability = (_source_authority(chunk) * 0.60) + (_extraction_quality(chunk) * 0.40)
+    lineage_signal = _lineage_signal(chunk)
 
     if chunk.metadata.get("origin_path") or chunk.metadata.get("path"):
         reliability += 0.04
@@ -4075,9 +4079,52 @@ def _source_reliability(chunk: Chunk) -> float:
 
     detection_quality = _detection_quality(chunk)
     route_quality = _ingestion_route_quality(chunk)
-    reliability = (reliability * 0.78) + (route_quality * 0.14) + (detection_quality * 0.08)
+    reliability = (
+        (reliability * 0.74)
+        + (route_quality * 0.14)
+        + (detection_quality * 0.08)
+        + (lineage_signal * 0.04)
+    )
 
     return max(0.0, min(1.0, reliability))
+
+
+def _lineage_signal(chunk: Chunk) -> float:
+    """Estimate traceability richness from ingestion and reference metadata."""
+    metadata = chunk.metadata or {}
+    score = 0.0
+
+    referenced_sources = _coerce_str_list(metadata.get("referenced_source_ids"))
+    referenced_paths = _coerce_str_list(metadata.get("referenced_paths"))
+    if referenced_sources:
+        score += min(0.32, 0.16 + (len(referenced_sources) * 0.08))
+    if referenced_paths:
+        score += min(0.22, 0.12 + (len(referenced_paths) * 0.05))
+
+    if str(metadata.get("linked_source_id", "")).strip():
+        score += 0.10
+    if str(metadata.get("parent_source_id", "")).strip() or _extract_bundle_parent_source(str(chunk.source_id).strip()):
+        score += 0.10
+    if str(metadata.get("artifact_id", "")).strip():
+        score += 0.08
+
+    if str(metadata.get("origin_path", "")).strip() or str(metadata.get("path", "")).strip():
+        score += 0.07
+    if str(metadata.get("manifest_type", "")).strip():
+        score += 0.05
+
+    route = str(metadata.get("ingestion_route", "")).strip().lower()
+    if route.startswith("pipeline_verified"):
+        score += 0.10
+    elif route in {"pipeline_detected", "repository_scan", "record_sources"}:
+        score += 0.06
+    elif route in {"pipeline_ocr_stub", "ocr_stub"}:
+        score -= 0.10
+
+    if chunk.modality == "image_ocr_stub":
+        score -= 0.10
+
+    return max(0.0, min(1.0, score))
 
 
 def _detection_quality(chunk: Chunk) -> float:
@@ -4534,6 +4581,10 @@ def _calibrate_retrieval_confidence(
             max(0.0, min(1.0, float(item.score_breakdown.get("repo_map", 0.0))))
             for item in ranked
         ) / len(ranked)
+        lineage_signal_support = sum(
+            max(0.0, min(1.0, float(item.score_breakdown.get("lineage", 0.0))))
+            for item in ranked
+        ) / len(ranked)
     else:
         ocr_stub_ratio = 0.0
         low_signal_ratio = 1.0
@@ -4551,6 +4602,7 @@ def _calibrate_retrieval_confidence(
         citation_graph_support = 0.0
         provenance_chain_support = 0.0
         repository_map_support = 0.0
+        lineage_signal_support = 0.0
 
     unavailable_pressure = 0.0
     if preferred_sources:
@@ -4578,6 +4630,7 @@ def _calibrate_retrieval_confidence(
         + (0.012 * citation_graph_support)
         + (0.014 * provenance_chain_support)
         + (0.010 * repository_map_support)
+        + (0.010 * lineage_signal_support)
     )
     quality_penalty = (0.18 * ocr_stub_ratio) + (0.12 * low_signal_ratio) + (0.16 * cross_source_conflict)
     availability_penalty = 0.08 * unavailable_pressure
@@ -4621,6 +4674,7 @@ def _calibrate_retrieval_confidence(
         "citation_graph_support": round(max(0.0, min(1.0, citation_graph_support)), 4),
         "provenance_chain_support": round(max(0.0, min(1.0, provenance_chain_support)), 4),
         "repository_map_support": round(max(0.0, min(1.0, repository_map_support)), 4),
+        "lineage_signal_support": round(max(0.0, min(1.0, lineage_signal_support)), 4),
     }
     return round(calibrated, 4), factors
 

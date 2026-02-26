@@ -4081,6 +4081,105 @@ class TestComprehensiveConfidenceScoring(unittest.TestCase):
         self.assertGreater(confidence_rank_0, confidence_rank_5)
 
 
+class TestLineageAwareRanking(unittest.TestCase):
+    """Tests for lineage-aware retrieval prior and confidence factors."""
+
+    def test_query_prefers_lineage_rich_chunk_when_lexical_scores_tie(self):
+        engine = RetrievalEngine()
+        shared_text = "Auth retry timeout root cause triage evidence for release risk."
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="plain-lineage",
+                    source_id="incident:plain",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text=shared_text,
+                    token_count=10,
+                    metadata={
+                        "ingestion_route": "pipeline_detected",
+                        "extraction_confidence": 0.9,
+                    },
+                ),
+                Chunk(
+                    chunk_id="rich-lineage",
+                    source_id="incident:rich",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text=shared_text,
+                    token_count=10,
+                    metadata={
+                        "ingestion_route": "pipeline_detected",
+                        "extraction_confidence": 0.9,
+                        "artifact_id": "auth-incident-77",
+                        "parent_source_id": "incident:auth-parent",
+                        "referenced_source_ids": ["req:auth-retries"],
+                        "referenced_paths": ["src/auth/retry.py"],
+                    },
+                ),
+            ]
+        )
+
+        ranked = engine.query(
+            "auth retry timeout root cause triage evidence release risk",
+            top_k=2,
+            diversify=False,
+        )
+
+        self.assertEqual(2, len(ranked))
+        self.assertEqual("rich-lineage", ranked[0].chunk.chunk_id)
+        self.assertIn("lineage", ranked[0].score_breakdown)
+        self.assertGreater(
+            ranked[0].score_breakdown.get("lineage", 0.0),
+            ranked[1].score_breakdown.get("lineage", 0.0),
+        )
+
+    def test_retrieve_evidence_reports_lineage_signal_factor(self):
+        engine = RetrievalEngine()
+        engine.ingest_prechunked(
+            [
+                Chunk(
+                    chunk_id="plain-lineage",
+                    source_id="incident:plain",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text="Auth retry timeout root cause triage evidence.",
+                    token_count=8,
+                    metadata={
+                        "ingestion_route": "pipeline_detected",
+                        "extraction_confidence": 0.9,
+                    },
+                ),
+                Chunk(
+                    chunk_id="rich-lineage",
+                    source_id="incident:rich",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    text="Auth retry timeout root cause triage evidence.",
+                    token_count=8,
+                    metadata={
+                        "ingestion_route": "pipeline_detected",
+                        "extraction_confidence": 0.9,
+                        "artifact_id": "auth-incident-77",
+                        "parent_source_id": "incident:auth-parent",
+                        "referenced_source_ids": ["req:auth-retries"],
+                    },
+                ),
+            ]
+        )
+
+        evidence = engine.retrieve_evidence(
+            "auth retry timeout root cause triage evidence",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertIn("lineage_signal_support", evidence.confidence_factors)
+        self.assertGreater(evidence.confidence_factors["lineage_signal_support"], 0.0)
+
+
 class TestRetrievalQualityConstraints(unittest.TestCase):
     """Tests for query-level ingestion quality constraints and fallback."""
 
