@@ -666,6 +666,12 @@ class RetrievalEngine:
             plan=plan,
             top_k=requested_top_k,
         )
+        ranked = _rescue_traceability_links(
+            selected=ranked,
+            candidates=coverage_candidates,
+            plan=plan,
+            top_k=requested_top_k,
+        )
         corpus_available_sources = _dedupe(list(corpus_profile.source_type_counts.keys()))
         corpus_available_modalities = _dedupe(list(corpus_profile.modality_counts.keys()))
         covered_sources = _dedupe([item.chunk.source_type for item in ranked])
@@ -819,11 +825,18 @@ class RetrievalEngine:
         merged_query = f"{query_text} failure clustering root cause test gap risk prioritization actionable plan".strip()
         merged_plan = self.build_query_plan(merged_query)
         corpus_profile = self.build_corpus_profile()
+        merged_candidates = list(merged_ranked)
         merged_ranked = _select_coverage_aware_top(
             merged_ranked,
             plan=merged_plan,
             top_k=max(top_k_per_focus * 2, 6),
             diversify=diversify,
+        )
+        merged_ranked = _rescue_traceability_links(
+            selected=merged_ranked,
+            candidates=merged_candidates,
+            plan=merged_plan,
+            top_k=max(top_k_per_focus * 2, 6),
         )
         covered_sources = _dedupe([item.chunk.source_type for item in merged_ranked])
         covered_modalities = _dedupe([item.chunk.modality for item in merged_ranked])
@@ -4438,6 +4451,133 @@ def _rescue_requested_non_text_modalities(
         )
     )
     return rescued
+
+
+def _rescue_traceability_links(
+    selected: Sequence[RankedChunk],
+    candidates: Sequence[RankedChunk],
+    plan: QueryPlan,
+    top_k: int,
+) -> List[RankedChunk]:
+    if top_k <= 1 or not selected or not candidates:
+        return list(selected)
+
+    rescued = list(selected)[: max(1, top_k)]
+    selected_ids = {item.chunk.chunk_id for item in rescued}
+    candidate_pool = [candidate for candidate in candidates if candidate.chunk.chunk_id not in selected_ids]
+    if not candidate_pool:
+        return rescued
+
+    requested_non_text = {mod for mod in plan.preferred_modalities if mod != "text"}
+    max_replacements = max(1, min(2, len(rescued) - 1))
+    replacements = 0
+
+    while candidate_pool and replacements < max_replacements:
+        missing_sources, missing_paths = _collect_unresolved_traceability_refs(rescued)
+        if not missing_sources and not missing_paths:
+            break
+
+        best_idx = -1
+        best_value = float("-inf")
+        for idx, candidate in enumerate(candidate_pool):
+            source_id = _normalize_reference_token(str(candidate.chunk.source_id).strip())
+            source_parent = _normalize_reference_token(_extract_bundle_parent_source(str(candidate.chunk.source_id)))
+            source_match = bool({source_id, source_parent}.intersection(missing_sources))
+            candidate_paths = _chunk_known_paths(candidate.chunk)
+            path_match = bool(candidate_paths.intersection(missing_paths))
+            if not source_match and not path_match:
+                continue
+
+            value = candidate.score
+            if source_match:
+                value += 0.26
+            if path_match:
+                value += 0.20
+            if requested_non_text and candidate.chunk.modality in requested_non_text:
+                value += 0.06
+            if candidate.matched_terms:
+                value += min(0.06, len(candidate.matched_terms) * 0.02)
+            if value > best_value:
+                best_value = value
+                best_idx = idx
+
+        if best_idx < 0:
+            break
+
+        picked = candidate_pool.pop(best_idx)
+        replace_idx = _choose_traceability_replacement_index(rescued, plan)
+        rescued[replace_idx] = picked
+        replacements += 1
+
+    rescued.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            -len(candidate.matched_terms),
+            candidate.chunk.source_id,
+            candidate.chunk.chunk_id,
+        )
+    )
+    return rescued[: max(1, top_k)]
+
+
+def _collect_unresolved_traceability_refs(ranked: Sequence[RankedChunk]) -> Tuple[set, set]:
+    known_sources: set = set()
+    known_paths: set = set()
+    referenced_sources: set = set()
+    referenced_paths: set = set()
+
+    for item in ranked:
+        source_id = _normalize_reference_token(str(item.chunk.source_id).strip())
+        if source_id:
+            known_sources.add(source_id)
+        parent_source = _normalize_reference_token(_extract_bundle_parent_source(str(item.chunk.source_id)))
+        if parent_source:
+            known_sources.add(parent_source)
+        known_paths.update(_chunk_known_paths(item.chunk))
+        referenced_sources.update(_chunk_referenced_sources(item.chunk))
+        for raw in _coerce_str_list(item.chunk.metadata.get("referenced_paths")):
+            normalized = _normalize_reference_path(raw)
+            if normalized:
+                referenced_paths.add(normalized)
+
+    return referenced_sources.difference(known_sources), referenced_paths.difference(known_paths)
+
+
+def _chunk_known_paths(chunk: Chunk) -> set:
+    known_paths: set = set()
+    for raw in (chunk.metadata.get("path"), chunk.metadata.get("origin_path")):
+        normalized = _normalize_reference_path(str(raw or ""))
+        if normalized:
+            known_paths.add(normalized)
+    return known_paths
+
+
+def _choose_traceability_replacement_index(selected: Sequence[RankedChunk], plan: QueryPlan) -> int:
+    if len(selected) <= 1:
+        return 0
+
+    requested_non_text = {mod for mod in plan.preferred_modalities if mod != "text"}
+    protected_modalities = {
+        item.chunk.modality
+        for item in selected
+        if item.chunk.modality in requested_non_text
+    }
+
+    sorted_by_score = sorted(enumerate(selected), key=lambda pair: pair[1].score)
+    for idx, item in sorted_by_score:
+        if idx == 0:
+            continue
+        if item.chunk.modality in protected_modalities:
+            same_modality_count = sum(1 for other in selected if other.chunk.modality == item.chunk.modality)
+            if same_modality_count <= 1:
+                continue
+        if _chunk_referenced_sources(item.chunk):
+            continue
+        if _coerce_str_list(item.chunk.metadata.get("referenced_paths")):
+            continue
+        return idx
+
+    return len(selected) - 1
 
 
 def _dedupe(items: Sequence[Any]) -> List[Any]:

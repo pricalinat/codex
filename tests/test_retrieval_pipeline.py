@@ -2220,6 +2220,82 @@ Missing negative authorization tests increase release risk.
         self.assertIn("req-auth", sys_bundle.linked_sources)
         self.assertGreater(sys_bundle.traceability_score, 0.0)
 
+    def test_retrieve_evidence_rescues_referenced_source_chunk_for_traceability(self):
+        docs = [
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content="Authentication requirements define expected retry guardrails.",
+            ),
+            IngestDocument(
+                source_id="sys-incident",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "Root cause incident for auth retries references source:req-auth and "
+                    "explains traceback cascade."
+                ),
+            ),
+            IngestDocument(
+                source_id="kb-noise",
+                source_type=SourceType.KNOWLEDGE,
+                content="Auth retries incident traceback triage notes and mitigation summary.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth retries incident traceback root cause",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertEqual(2, len(evidence.ranked_chunks))
+        source_ids = {item.chunk.source_id for item in evidence.ranked_chunks}
+        self.assertIn("sys-incident", source_ids)
+        self.assertIn("req-auth", source_ids)
+
+    def test_retrieve_evidence_rescues_referenced_path_chunk_for_traceability(self):
+        docs = [
+            IngestDocument(
+                source_id="repo:src/auth/token.py",
+                source_type=SourceType.REPOSITORY,
+                modality="code",
+                content="def refresh_token(token): return token",
+                metadata={"path": "src/auth/token.py"},
+            ),
+            IngestDocument(
+                source_id="sys-path-incident",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "Incident root cause references path:src/auth/token.py and "
+                    "documents auth retry storm traceback."
+                ),
+            ),
+            IngestDocument(
+                source_id="kb-auth",
+                source_type=SourceType.KNOWLEDGE,
+                content="Auth retry storm traceback incident overview and mitigation notes.",
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth retry storm traceback root cause",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        self.assertEqual(2, len(evidence.ranked_chunks))
+        source_ids = {item.chunk.source_id for item in evidence.ranked_chunks}
+        self.assertIn("sys-path-incident", source_ids)
+        self.assertIn("repo:src/auth/token.py", source_ids)
+
     def test_retrieve_evidence_prefers_intent_source_coverage_from_candidate_pool(self):
         docs = [
             IngestDocument(
