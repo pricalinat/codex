@@ -1670,15 +1670,51 @@ Missing negative authorization tests are release blocking.
             ]
         )
 
-        self.assertGreaterEqual(len(chunks), 3)
+        self.assertGreaterEqual(len(chunks), 4)
+        parent_chunks = [chunk for chunk in chunks if chunk.source_id == "record:bundle-auth"]
+        child_chunks = [chunk for chunk in chunks if chunk.source_id != "record:bundle-auth"]
+        self.assertEqual(1, len(parent_chunks))
+        self.assertEqual("record_bundle_parent", parent_chunks[0].metadata.get("ingestion_route"))
+        self.assertEqual("record_artifact_bundle_parent", parent_chunks[0].metadata.get("manifest_type"))
+        self.assertEqual(3, parent_chunks[0].metadata.get("artifact_count"))
+        self.assertIn("risk-table", parent_chunks[0].metadata.get("artifact_ids", []))
         self.assertTrue(any(chunk.modality == "text" for chunk in chunks))
         self.assertTrue(any(chunk.modality == "table" for chunk in chunks))
         self.assertTrue(any(chunk.modality == "image_ocr_stub" for chunk in chunks))
-        self.assertTrue(all(chunk.metadata.get("parent_source_id") == "record:bundle-auth" for chunk in chunks))
-        self.assertTrue(all(chunk.metadata.get("ingestion_route") == "record_bundle" for chunk in chunks))
+        self.assertTrue(all(chunk.metadata.get("parent_source_id") == "record:bundle-auth" for chunk in child_chunks))
+        self.assertTrue(all(chunk.metadata.get("ingestion_route") == "record_bundle" for chunk in child_chunks))
         self.assertTrue(
             any(chunk.source_id == "record:bundle-auth::artifact:summary" for chunk in chunks)
         )
+
+    def test_ingest_records_indexes_bundle_parent_manifest_for_navigation_queries(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+        ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:bundle-auth",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    payload={
+                        "artifacts": [
+                            {"artifact_id": "summary", "content": "Auth release failure analysis summary."},
+                            {"artifact_id": "risk-table", "modality": "table", "content": {"rows": [{"component": "auth"}]}},
+                            {"artifact_id": "heatmap", "modality": "image", "content": {"image_path": "screens/auth.png"}},
+                        ]
+                    },
+                )
+            ]
+        )
+
+        ranked = engine.query(
+            "artifact inventory for bundle risk-table heatmap",
+            top_k=2,
+            diversify=False,
+        )
+
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertEqual("record:bundle-auth", ranked[0].chunk.source_id)
+        self.assertEqual("record_bundle_parent", ranked[0].chunk.metadata.get("ingestion_route"))
 
     def test_ingest_records_extracts_reference_metadata_from_structured_payload(self):
         engine = RetrievalEngine()

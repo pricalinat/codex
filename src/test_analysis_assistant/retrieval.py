@@ -1760,6 +1760,13 @@ def _expand_record_artifacts(record: IngestionRecord) -> List[IngestDocument]:
     docs: List[IngestDocument] = []
     parent_source_id = record.source_id
     parent_metadata = dict(record.metadata)
+    parent_doc = _build_record_bundle_parent_document(
+        record=record,
+        artifacts=artifacts,
+        parent_metadata=parent_metadata,
+    )
+    if parent_doc is not None:
+        docs.append(parent_doc)
 
     for artifact_idx, artifact in enumerate(artifacts):
         artifact_payload: Any = artifact
@@ -1818,6 +1825,98 @@ def _expand_record_artifacts(record: IngestionRecord) -> List[IngestDocument]:
         docs.append(normalized)
 
     return docs
+
+
+def _build_record_bundle_parent_document(
+    record: IngestionRecord,
+    artifacts: Sequence[Any],
+    parent_metadata: Dict[str, Any],
+) -> Optional[IngestDocument]:
+    if not artifacts:
+        return None
+
+    payload = record.payload if isinstance(record.payload, dict) else {}
+    context_lines: List[str] = []
+    for key in ("title", "summary", "text", "body", "description", "context"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            context_lines.append(f"{key}: {value.strip()}")
+
+    artifact_lines: List[str] = []
+    artifact_ids: List[str] = []
+    artifact_modalities: List[str] = []
+    for artifact_idx, artifact in enumerate(artifacts):
+        artifact_id = str(artifact_idx)
+        artifact_modality = "auto"
+        artifact_source_type = record.source_type
+        artifact_payload: Any = artifact
+
+        if isinstance(artifact, dict):
+            artifact_payload = _extract_artifact_payload(artifact)
+            artifact_id = _normalize_artifact_id(
+                artifact.get("artifact_id") or artifact.get("id") or artifact.get("name") or artifact_idx
+            )
+            artifact_modality = str(artifact.get("modality", "auto") or "auto").strip().lower()
+            source_type_value = artifact.get("source_type")
+            if isinstance(source_type_value, SourceType):
+                artifact_source_type = source_type_value
+            elif isinstance(source_type_value, str):
+                try:
+                    artifact_source_type = SourceType(source_type_value.strip().lower())
+                except ValueError:
+                    artifact_source_type = record.source_type
+
+        if artifact_modality == "auto":
+            inferred_modality, _ = _infer_record_modality_and_payload(artifact_payload)
+            artifact_modality = inferred_modality
+
+        artifact_ids.append(artifact_id)
+        artifact_modalities.append(artifact_modality)
+        artifact_lines.append(
+            f"- artifact_id={artifact_id} modality={artifact_modality} source_type={artifact_source_type.value}"
+        )
+
+    lines = [
+        (
+            f"Artifact bundle source {record.source_id} contains "
+            f"{len(artifacts)} artifacts."
+        )
+    ]
+    if context_lines:
+        lines.append("Bundle context:")
+        lines.extend(context_lines)
+    lines.append("Artifact inventory:")
+    lines.extend(artifact_lines)
+    manifest_text = "\n".join(lines).strip()
+    if not manifest_text:
+        return None
+
+    metadata = dict(parent_metadata)
+    metadata.update(
+        {
+            "ingestion_route": "record_bundle_parent",
+            "manifest_type": "record_artifact_bundle_parent",
+            "format": "artifact_bundle_parent",
+            "artifact_count": len(artifacts),
+            "artifact_ids": artifact_ids,
+            "artifact_modalities": _dedupe(artifact_modalities),
+            "extraction_confidence": 0.9,
+        }
+    )
+    metadata.update(
+        _extract_record_reference_metadata(
+            payload=payload,
+            metadata=metadata,
+        )
+    )
+
+    return IngestDocument(
+        source_id=record.source_id,
+        source_type=record.source_type,
+        content=manifest_text,
+        modality="text",
+        metadata=metadata,
+    )
 
 
 def _extract_artifact_payload(artifact: Dict[str, Any]) -> Any:
@@ -3383,6 +3482,7 @@ def _ingestion_route_quality(chunk: Chunk, plan: Optional[QueryPlan] = None) -> 
         "prechunked": 0.88,
         "repository_scan": 0.94,
         "record_bundle": 0.91,
+        "record_bundle_parent": 0.89,
         "file_reference_record": 0.9,
         "artifact_bundle": 0.90,
         "normalized_record": 0.84,

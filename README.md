@@ -56,6 +56,7 @@ It now also includes a retrieval foundation for AI-native analysis:
 - `MultiSourceIngestor` helper for repository crawling and markdown requirements ingestion (table/image extraction stubs)
 - `ArtifactBundle` ingestion API for OCR/extraction pipeline outputs (single payload with text/tables/images + provenance metadata)
 - `IngestionRecord.payload["artifacts"]` fan-out ingestion for mixed-source bundles (per-artifact source ids + parent provenance metadata)
+- artifact-bundle parent manifest indexing (`record_bundle_parent`) to preserve bundle-level context and artifact inventory for navigation-style retrieval
 - payload-driven extraction confidence overrides per unit (`text`/`table`/`image`) for degraded-but-usable OCR/extraction stubs
 - image OCR sidecar fallback for file-based ingestion (`<image>.ocr.txt` / `<image>.txt`) to upgrade stub-only paths without external OCR deps
 - intent-aware query planning for test-gap/risk/root-cause workflows
