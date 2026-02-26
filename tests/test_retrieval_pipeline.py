@@ -822,6 +822,46 @@ class TestRetrievalPipeline(unittest.TestCase):
             self.assertEqual(evidence.retrieval_strategy, "adaptive_recovery")
             self.assertGreaterEqual(len(evidence.recovery_queries), 1)
 
+    def test_retrieve_evidence_rescues_missing_preferred_source_type(self):
+        docs = [
+            IngestDocument(
+                source_id="repo-auth-1",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Auth retry storm root cause traceback and mitigation details in auth module. "
+                    "Failure clustering shows repeated token refresh crashes."
+                ),
+            ),
+            IngestDocument(
+                source_id="repo-auth-2",
+                source_type=SourceType.REPOSITORY,
+                content=(
+                    "Auth retry storm root cause traceback and mitigation details in auth module. "
+                    "Failure clustering includes cascading refresh failures."
+                ),
+            ),
+            IngestDocument(
+                source_id="req-auth",
+                source_type=SourceType.REQUIREMENTS,
+                content=(
+                    "Requirements specify authentication retry failure handling and mitigation acceptance criteria."
+                ),
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        evidence = engine.retrieve_evidence(
+            "auth retry storm root cause traceback mitigation",
+            top_k=2,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        selected_source_types = {item.chunk.source_type for item in evidence.ranked_chunks}
+        self.assertIn(SourceType.REQUIREMENTS, selected_source_types)
+
     def test_query_exposes_corroboration_score_component(self):
         docs = [
             IngestDocument(

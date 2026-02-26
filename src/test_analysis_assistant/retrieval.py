@@ -674,6 +674,12 @@ class RetrievalEngine:
             plan=plan,
             top_k=requested_top_k,
         )
+        ranked = _rescue_preferred_source_types(
+            selected=ranked,
+            candidates=coverage_candidates,
+            plan=plan,
+            top_k=requested_top_k,
+        )
         ranked = _rescue_traceability_links(
             selected=ranked,
             candidates=coverage_candidates,
@@ -839,6 +845,12 @@ class RetrievalEngine:
             plan=merged_plan,
             top_k=max(top_k_per_focus * 2, 6),
             diversify=diversify,
+        )
+        merged_ranked = _rescue_preferred_source_types(
+            selected=merged_ranked,
+            candidates=merged_candidates,
+            plan=merged_plan,
+            top_k=max(top_k_per_focus * 2, 6),
         )
         merged_ranked = _rescue_traceability_links(
             selected=merged_ranked,
@@ -4807,6 +4819,113 @@ def _rescue_traceability_links(
         )
     )
     return rescued[: max(1, top_k)]
+
+
+def _rescue_preferred_source_types(
+    selected: Sequence[RankedChunk],
+    candidates: Sequence[RankedChunk],
+    plan: QueryPlan,
+    top_k: int,
+) -> List[RankedChunk]:
+    if top_k <= 1 or not selected or not candidates:
+        return list(selected)
+
+    available_source_types = {candidate.chunk.source_type for candidate in candidates}
+    if plan.required_source_types:
+        target_source_types = [stype for stype in plan.required_source_types if stype in available_source_types]
+    else:
+        preferred_available = [stype for stype in plan.preferred_source_types if stype in available_source_types]
+        target_budget = min(len(preferred_available), max(1, min(top_k, 3)))
+        target_source_types = preferred_available[:target_budget]
+    if not target_source_types:
+        return list(selected)
+
+    rescued = list(selected)[: max(1, top_k)]
+    selected_ids = {item.chunk.chunk_id for item in rescued}
+    selected_types = {item.chunk.source_type for item in rescued}
+    missing_types = [stype for stype in target_source_types if stype not in selected_types]
+    if not missing_types:
+        return rescued
+
+    candidate_pool = [candidate for candidate in candidates if candidate.chunk.chunk_id not in selected_ids]
+    if not candidate_pool:
+        return rescued
+
+    requested_non_text = {mod for mod in plan.preferred_modalities if mod != "text"}
+    protected_sources = set(plan.required_source_types)
+    max_replacements = max(1, min(2, len(rescued) - 1, len(missing_types)))
+    replacements = 0
+
+    while candidate_pool and missing_types and replacements < max_replacements:
+        source_target = missing_types[0]
+        best_idx = -1
+        best_value = float("-inf")
+        for idx, candidate in enumerate(candidate_pool):
+            if candidate.chunk.source_type != source_target:
+                continue
+            value = candidate.score
+            if requested_non_text and candidate.chunk.modality in requested_non_text:
+                value += 0.06
+            if candidate.matched_terms:
+                value += min(0.06, len(candidate.matched_terms) * 0.02)
+            if value > best_value:
+                best_value = value
+                best_idx = idx
+
+        if best_idx < 0:
+            missing_types.pop(0)
+            continue
+
+        picked = candidate_pool.pop(best_idx)
+        replace_idx = _choose_source_coverage_replacement_index(
+            selected=rescued,
+            protected_sources=protected_sources,
+            protected_modalities=requested_non_text,
+        )
+        if replace_idx is None:
+            break
+        rescued[replace_idx] = picked
+        replacements += 1
+
+        selected_types = {item.chunk.source_type for item in rescued}
+        missing_types = [stype for stype in target_source_types if stype not in selected_types]
+
+    rescued.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            -len(candidate.matched_terms),
+            candidate.chunk.source_id,
+            candidate.chunk.chunk_id,
+        )
+    )
+    return rescued[: max(1, top_k)]
+
+
+def _choose_source_coverage_replacement_index(
+    selected: Sequence[RankedChunk],
+    protected_sources: set,
+    protected_modalities: set,
+) -> Optional[int]:
+    if len(selected) <= 1:
+        return 0
+
+    sorted_by_score = sorted(enumerate(selected), key=lambda pair: pair[1].score)
+    for idx, item in sorted_by_score:
+        if idx == 0:
+            continue
+        source_count = sum(1 for candidate in selected if candidate.chunk.source_type == item.chunk.source_type)
+        if item.chunk.source_type in protected_sources and source_count <= 1:
+            continue
+        modality_count = sum(1 for candidate in selected if candidate.chunk.modality == item.chunk.modality)
+        if item.chunk.modality in protected_modalities and modality_count <= 1:
+            continue
+        if _chunk_referenced_sources(item.chunk):
+            continue
+        if _coerce_str_list(item.chunk.metadata.get("referenced_paths")):
+            continue
+        return idx
+
+    return None
 
 
 def _collect_unresolved_traceability_refs(ranked: Sequence[RankedChunk]) -> Tuple[set, set]:
