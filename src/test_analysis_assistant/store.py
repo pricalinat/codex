@@ -8,7 +8,7 @@ import json
 import math
 import os
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -84,7 +84,7 @@ class PersistentVectorStore:
         self._chunks: Dict[str, StoredChunk] = {}
         self._source_index: Dict[str, List[str]] = {}  # source_id -> chunk_ids
         self._embedding_dim: Optional[int] = None
-        self._created_at = datetime.utcnow().isoformat()
+        self._created_at = datetime.now(UTC).isoformat()
         self._last_updated = self._created_at
 
     @property
@@ -114,7 +114,7 @@ class PersistentVectorStore:
             token_count=chunk.token_count,
             metadata=chunk.metadata,
             embedding=embedding if self._enable_embeddings else None,
-            created_at=datetime.utcnow().isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
             retrieval_count=0,
         )
 
@@ -133,7 +133,7 @@ class PersistentVectorStore:
         if embedding:
             self._embedding_dim = len(embedding)
 
-        self._last_updated = datetime.utcnow().isoformat()
+        self._last_updated = datetime.now(UTC).isoformat()
 
     def add_chunks(
         self,
@@ -204,7 +204,7 @@ class PersistentVectorStore:
             if overlap > 0:
                 # Update retrieval stats
                 chunk.retrieval_count += 1
-                chunk.last_retrieved = datetime.utcnow().isoformat()
+                chunk.last_retrieved = datetime.now(UTC).isoformat()
                 scored.append((chunk, overlap / len(query_tokens)))
 
         scored.sort(key=lambda x: -x[1])
@@ -218,7 +218,7 @@ class PersistentVectorStore:
         """
         if chunk_id in self._chunks:
             self._chunks[chunk_id].retrieval_count += 1
-            self._chunks[chunk_id].last_retrieved = datetime.utcnow().isoformat()
+            self._chunks[chunk_id].last_retrieved = datetime.now(UTC).isoformat()
 
     def get_stats(self) -> CorpusStats:
         """Get statistics about the corpus.
@@ -288,8 +288,8 @@ class PersistentVectorStore:
         with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
 
-        self._created_at = data.get("created_at", datetime.utcnow().isoformat())
-        self._last_updated = data.get("last_updated", datetime.utcnow().isoformat())
+        self._created_at = data.get("created_at", datetime.now(UTC).isoformat())
+        self._last_updated = data.get("last_updated", datetime.now(UTC).isoformat())
         self._embedding_dim = data.get("embedding_dim")
 
         self._chunks.clear()
@@ -310,7 +310,7 @@ class PersistentVectorStore:
         self._chunks.clear()
         self._source_index.clear()
         self._embedding_dim = None
-        self._last_updated = datetime.utcnow().isoformat()
+        self._last_updated = datetime.now(UTC).isoformat()
 
     def get_chunks(self) -> List[StoredChunk]:
         """Get all stored chunks.

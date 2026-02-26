@@ -569,3 +569,230 @@ class AnalysisPromptStrategy:
 
 # Default strategy instance
 default_strategy = AnalysisPromptStrategy()
+
+
+@dataclass
+class ConsistencyResult:
+    """Result from self-consistency checking."""
+    consensus_answer: Any
+    consistency_score: float  # 0-1, higher is more consistent
+    answer_votes: Dict[str, int]  # counts per unique answer
+    reasoning_paths: List[str]  # different reasoning paths taken
+    confidence: float  # confidence based on consistency
+    disagreeing_indices: List[int]  # indices of inconsistent answers
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "consensus_answer": self.consensus_answer,
+            "consistency_score": round(self.consistency_score, 3),
+            "answer_votes": self.answer_votes,
+            "reasoning_paths": self.reasoning_paths,
+            "confidence": round(self.confidence, 3),
+            "disagreeing_indices": self.disagreeing_indices,
+        }
+
+
+class SelfConsistencyChecker:
+    """Self-consistency checking for improved LLM reliability.
+
+    This implements the self-consistency technique from Wang et al. (2022):
+    - Generate multiple diverse reasoning paths
+    - Aggregate answers by voting
+    - Select the most consistent answer
+
+    This significantly improves reliability especially for complex reasoning tasks.
+    """
+
+    def __init__(
+        self,
+        num_paths: int = 3,
+        temperature: float = 0.5,
+        normalize_answers: bool = True,
+    ) -> None:
+        """Initialize the self-consistency checker.
+
+        Args:
+            num_paths: Number of diverse reasoning paths to generate
+            temperature: Temperature for generating diverse paths (higher = more diverse)
+            normalize_answers: Whether to normalize answers before voting
+        """
+        self._num_paths = num_paths
+        self._temperature = temperature
+        self._normalize_answers = normalize_answers
+
+    @property
+    def num_paths(self) -> int:
+        """Get number of reasoning paths."""
+        return self._num_paths
+
+    def check(
+        self,
+        answers: List[Any],
+        reasoning_paths: Optional[List[str]] = None,
+    ) -> ConsistencyResult:
+        """Check consistency across multiple answers.
+
+        Args:
+            answers: List of answers from different reasoning paths
+            reasoning_paths: Optional reasoning paths for each answer
+
+        Returns:
+            ConsistencyResult with consensus and confidence metrics
+        """
+        if not answers:
+            return ConsistencyResult(
+                consensus_answer=None,
+                consistency_score=0.0,
+                answer_votes={},
+                reasoning_paths=[],
+                confidence=0.0,
+                disagreeing_indices=[],
+            )
+
+        # Normalize answers for comparison
+        normalized = self._normalize(answers)
+
+        # Count votes for each unique answer
+        answer_votes: Dict[str, int] = {}
+        answer_mapping: Dict[int, str] = {}  # index -> normalized
+
+        for i, norm_ans in enumerate(normalized):
+            if norm_ans in answer_votes:
+                answer_votes[norm_ans] += 1
+            else:
+                answer_votes[norm_ans] = 1
+            answer_mapping[i] = norm_ans
+
+        # Find consensus answer (most voted)
+        if answer_votes:
+            consensus = max(answer_votes, key=answer_votes.get)
+            consensus_votes = answer_votes[consensus]
+        else:
+            consensus = str(answers[0])
+            consensus_votes = 1
+
+        # Calculate consistency score
+        total = len(answers)
+        consistency_score = consensus_votes / total if total > 0 else 0.0
+
+        # Identify disagreeing indices
+        disagreeing = [
+            i for i, norm in enumerate(normalized)
+            if norm != consensus
+        ]
+
+        # Confidence is consistency weighted by agreement strength
+        confidence = self._calculate_confidence(
+            consistency_score, consensus_votes, total
+        )
+
+        return ConsistencyResult(
+            consensus_answer=consensus,
+            consistency_score=consistency_score,
+            answer_votes=answer_votes,
+            reasoning_paths=reasoning_paths or [],
+            confidence=confidence,
+            disagreeing_indices=disagreeing,
+        )
+
+    def _normalize(self, answers: List[Any]) -> List[str]:
+        """Normalize answers for comparison.
+
+        Args:
+            answers: Raw answers
+
+        Returns:
+            List of normalized answer strings
+        """
+        if not self._normalize_answers:
+            return [str(a) for a in answers]
+
+        normalized = []
+        for ans in answers:
+            ans_str = str(ans).lower().strip()
+            # Remove extra whitespace
+            ans_str = re.sub(r'\s+', ' ', ans_str)
+            # Remove common variations
+            ans_str = ans_str.strip('.,;:!?')
+            normalized.append(ans_str)
+
+        return normalized
+
+    def _calculate_confidence(
+        self,
+        consistency_score: float,
+        votes: int,
+        total: int,
+    ) -> float:
+        """Calculate confidence based on consistency.
+
+        Args:
+            consistency_score: Fraction agreeing with consensus
+            votes: Number of votes for consensus
+            total: Total number of answers
+
+        Returns:
+            Confidence score 0-1
+        """
+        # Base confidence on consistency
+        base = consistency_score
+
+        # Bonus for more votes (more certainty)
+        vote_bonus = (votes - 1) / (total - 1) if total > 1 else 0.0
+
+        # Combine with weights
+        confidence = (base * 0.7) + (vote_bonus * 0.3)
+
+        return round(confidence, 3)
+
+    def generate_diversity_prompts(
+        self,
+        base_prompt: str,
+        strategy: PromptStrategy = PromptStrategy.COT,
+    ) -> List[str]:
+        """Generate diverse prompts for self-consistency checking.
+
+        Args:
+            base_prompt: The base prompt to diversify
+            strategy: Prompt strategy to use
+
+        Returns:
+            List of diverse prompts
+        """
+        diversifiers = [
+            "",  # Original
+            "Think step by step and explain your reasoning.",
+            "Consider alternative approaches and justify your answer.",
+            "Analyze the problem from first principles.",
+            "Use a different method to verify your answer.",
+        ]
+
+        prompts = []
+        for i, diver in enumerate(diversifiers[:self._num_paths]):
+            if i == 0:
+                prompts.append(base_prompt)
+            else:
+                # Insert diversifier into the prompt
+                prompts.append(f"{base_prompt}\n\n{diver}")
+
+        return prompts[:self._num_paths]
+
+
+def check_self_consistency(
+    answers: List[Any],
+    reasoning_paths: Optional[List[str]] = None,
+    num_paths: int = 3,
+) -> ConsistencyResult:
+    """Convenience function for self-consistency checking.
+
+    Args:
+        answers: List of answers to check
+        reasoning_paths: Optional reasoning paths
+        num_paths: Expected number of paths
+
+    Returns:
+        ConsistencyResult with consensus and metrics
+    """
+    checker = SelfConsistencyChecker(num_paths=num_paths)
+    return checker.check(answers, reasoning_paths)

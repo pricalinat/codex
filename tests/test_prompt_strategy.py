@@ -312,5 +312,139 @@ class TestPromptSection(unittest.TestCase):
         self.assertTrue(section.required)
 
 
+class TestSelfConsistencyChecker(unittest.TestCase):
+    def test_check_perfect_consensus(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker(num_paths=3)
+        answers = ["environment_difference", "environment_difference", "environment_difference"]
+
+        result = checker.check(answers)
+
+        self.assertEqual(result.consensus_answer, "environment_difference")
+        self.assertEqual(result.consistency_score, 1.0)
+        self.assertEqual(result.answer_votes["environment_difference"], 3)
+        self.assertEqual(len(result.disagreeing_indices), 0)
+
+    def test_check_partial_consensus(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker(num_paths=4)
+        answers = ["environment_difference", "environment_difference", "race_condition", "data_issue"]
+
+        result = checker.check(answers)
+
+        self.assertEqual(result.consensus_answer, "environment_difference")
+        self.assertEqual(result.consistency_score, 0.5)  # 2/4
+        self.assertEqual(result.answer_votes["environment_difference"], 2)
+        self.assertEqual(len(result.disagreeing_indices), 2)
+
+    def test_check_no_consensus(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        # Use unique values that normalize to different strings
+        checker = SelfConsistencyChecker(num_paths=3, normalize_answers=False)
+        answers = ["answer_A", "answer_B", "answer_C"]
+
+        result = checker.check(answers)
+
+        self.assertIn(result.consensus_answer, ["answer_A", "answer_B", "answer_C"])
+        self.assertEqual(result.consistency_score, 1/3)
+        self.assertEqual(len(result.disagreeing_indices), 2)
+
+    def test_check_with_reasoning_paths(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker(num_paths=3)
+        answers = ["root_cause_A", "root_cause_A", "root_cause_B"]
+        reasoning = [
+            "Error suggests database is not available in CI",
+            "Missing database configuration causes connection failure",
+            "The test setup doesn't include proper fixtures"
+        ]
+
+        result = checker.check(answers, reasoning)
+
+        self.assertEqual(len(result.reasoning_paths), 3)
+        self.assertIn("database", result.reasoning_paths[0])
+
+    def test_check_empty_answers(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker()
+        result = checker.check([])
+
+        self.assertIsNone(result.consensus_answer)
+        self.assertEqual(result.consistency_score, 0.0)
+        self.assertEqual(len(result.answer_votes), 0)
+
+    def test_normalization_case_insensitive(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker(normalize_answers=True)
+        answers = ["Environment_Difference", "ENVIRONMENT_DIFFERENCE", "environment_difference"]
+
+        result = checker.check(answers)
+
+        self.assertEqual(result.consistency_score, 1.0)
+
+    def test_normalization_whitespace(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker(normalize_answers=True)
+        answers = ["answer ", " answer", "answer"]
+
+        result = checker.check(answers)
+
+        self.assertEqual(result.consistency_score, 1.0)
+
+    def test_confidence_calculation(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker()
+        # Perfect consensus
+        answers = ["A", "A", "A"]
+        result = checker.check(answers)
+
+        self.assertEqual(result.confidence, 1.0)
+
+    def test_generate_diversity_prompts(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker(num_paths=3)
+        base = "What is the root cause?"
+
+        prompts = checker.generate_diversity_prompts(base)
+
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(prompts[0], base)  # Original
+        self.assertIn("step by step", prompts[1])
+
+    def test_to_dict(self):
+        from src.test_analysis_assistant.prompt_strategy import SelfConsistencyChecker
+
+        checker = SelfConsistencyChecker()
+        answers = ["A", "A", "B"]
+        result = checker.check(answers)
+
+        d = result.to_dict()
+
+        self.assertIn("consensus_answer", d)
+        self.assertIn("consistency_score", d)
+        self.assertIn("confidence", d)
+        self.assertIn("answer_votes", d)
+
+
+class TestCheckSelfConsistency(unittest.TestCase):
+    def test_convenience_function(self):
+        from src.test_analysis_assistant.prompt_strategy import check_self_consistency
+
+        answers = ["root_cause", "root_cause", "root_cause"]
+        result = check_self_consistency(answers)
+
+        self.assertEqual(result.consensus_answer, "root_cause")
+        self.assertEqual(result.consistency_score, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
