@@ -615,6 +615,41 @@ class RAGAnalyzer:
             confidence_analysis=confidence_meta,
         )
 
+    def generate_plan(
+        self,
+        test_report_content: str,
+        query_for_context: Optional[str] = None,
+    ) -> "ActionablePlan":
+        """Generate an actionable plan from test analysis.
+
+        This is a convenience method that runs analysis and generates
+        prioritized remediation steps with confidence scoring.
+
+        Args:
+            test_report_content: Raw test report (JUnit XML or pytest text)
+            query_for_context: Optional additional query for retrieval context
+
+        Returns:
+            ActionablePlan with prioritized steps and confidence scoring
+        """
+        # Import locally to avoid circular dependency
+        from .actionable_plan import ActionablePlan, generate_actionable_plan
+
+        # Run analysis first
+        result = self.analyze(test_report_content, query_for_context)
+
+        # Get ranked context for evidence if available
+        ranked_context = None
+        if self._initialized and self._engine._chunks:
+            ranked_context = self._engine.query(
+                query_for_context or "failure clustering root cause",
+                top_k=10,
+                diversify=True,
+            )
+
+        # Generate actionable plan
+        return generate_actionable_plan(result, ranked_context)
+
     def _build_analysis_queries(
         self,
         base_result: AnalysisResult,
@@ -943,6 +978,77 @@ def rag_analyze(
         )
 
     return analyzer.analyze(test_report_content, query_for_context=query)
+
+
+def rag_plan(
+    test_report_content: str,
+    repo_path: Optional[str] = None,
+    requirements_docs: Optional[Sequence[tuple]] = None,
+    system_analysis_docs: Optional[Sequence[tuple]] = None,
+    knowledge_docs: Optional[Sequence[tuple]] = None,
+    artifact_bundles: Optional[Sequence[ArtifactBundle]] = None,
+    ingestion_records: Optional[Sequence[IngestionRecord]] = None,
+    query: Optional[str] = None,
+    use_hybrid: bool = True,
+    lexical_weight: float = 0.5,
+    chunker_type: ChunkerType = ChunkerType.AUTO,
+    generate_source_summaries: bool = False,
+    prefer_pipeline_for_records: bool = True,
+) -> "ActionablePlan":
+    """Convenience function to generate an actionable plan from test analysis.
+
+    This function runs RAG analysis and generates prioritized remediation steps
+    with confidence scoring.
+
+    Args:
+        test_report_content: Raw test report (JUnit XML or pytest text)
+        repo_path: Optional path to repository
+        requirements_docs: Optional list of (source_id, markdown) tuples
+        system_analysis_docs: Optional list of (source_id, content) tuples
+        knowledge_docs: Optional list of (source_id, content) tuples
+        artifact_bundles: Optional mixed-modality extraction payloads
+        ingestion_records: Optional normalized ingestion records
+        query: Optional additional query
+        use_hybrid: Whether to use hybrid (lexical + semantic) retrieval
+        lexical_weight: Weight for lexical search when using hybrid mode (0-1)
+        chunker_type: Chunker strategy (basic, code_aware, auto)
+        generate_source_summaries: Whether to synthesize per-source summary chunks
+        prefer_pipeline_for_records: Route ingestion records through unified
+            pipeline first when possible, with fallback to direct ingestion
+
+    Returns:
+        ActionablePlan with prioritized steps and confidence scoring
+    """
+    # Import locally to avoid circular dependency
+    from .actionable_plan import ActionablePlan
+
+    analyzer = RAGAnalyzer(
+        use_hybrid=use_hybrid,
+        lexical_weight=lexical_weight,
+        chunker_type=chunker_type,
+    )
+
+    # Initialize corpus
+    if (
+        repo_path
+        or requirements_docs
+        or system_analysis_docs
+        or knowledge_docs
+        or artifact_bundles
+        or ingestion_records
+    ):
+        analyzer.initialize_corpus(
+            repo_path=repo_path,
+            requirements_docs=requirements_docs,
+            system_analysis_docs=system_analysis_docs,
+            knowledge_docs=knowledge_docs,
+            artifact_bundles=artifact_bundles,
+            ingestion_records=ingestion_records,
+            generate_source_summaries=generate_source_summaries,
+            prefer_pipeline_for_records=prefer_pipeline_for_records,
+        )
+
+    return analyzer.generate_plan(test_report_content, query_for_context=query)
 
 
 def _method_supports_keyword(method: Any, keyword: str) -> bool:

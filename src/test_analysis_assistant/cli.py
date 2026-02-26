@@ -3,10 +3,11 @@ import json
 from pathlib import Path
 from typing import Optional, Sequence
 
+from .actionable_plan import ActionablePlan, build_plan_prompt, generate_actionable_plan
 from .analyzer import analyze_report_text
 from .hybrid_analyzer import HybridAnalyzer, hybrid_analyze, HybridInsight
 from .llm_integration import LLMProvider
-from .rag_analyzer import RAGAnalyzer, rag_analyze
+from .rag_analyzer import RAGAnalyzer, rag_analyze, rag_plan
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -88,6 +89,45 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to knowledge document(s).",
     )
 
+    # Plan command - generate actionable remediation plan
+    plan = subparsers.add_parser("plan", help="Generate actionable remediation plan from test analysis.")
+    plan.add_argument("--input", required=True, help="Path to junit xml or pytest text report.")
+    plan.add_argument(
+        "--repo",
+        help="Path to repository for context ingestion.",
+    )
+    plan.add_argument(
+        "--requirements",
+        action="append",
+        dest="requirements",
+        help="Path to requirements markdown file(s). Can be specified multiple times.",
+    )
+    plan.add_argument(
+        "--requirements-text",
+        help="Inline requirements text (markdown format).",
+    )
+    plan.add_argument(
+        "--knowledge",
+        action="append",
+        dest="knowledge",
+        help="Path to knowledge document(s). Can be specified multiple times.",
+    )
+    plan.add_argument(
+        "--query",
+        help="Additional query for retrieval context.",
+    )
+    plan.add_argument(
+        "--format",
+        choices=["json", "pretty"],
+        default="json",
+        help="Output format: compact json or human-readable json.",
+    )
+    plan.add_argument(
+        "--prompt-only",
+        action="store_true",
+        help="Only output the LLM prompt, not the full plan.",
+    )
+
     # Hybrid-analyze command - RAG + LLM analysis
     hybrid = subparsers.add_parser("hybrid-analyze", help="Analyze with RAG + LLM augmentation.")
     hybrid.add_argument("--input", required=True, help="Path to junit xml or pytest text report.")
@@ -165,6 +205,8 @@ def main() -> int:
         return _handle_hybrid_analyze(args)
     elif args.command == "ingest":
         return _handle_ingest(args)
+    elif args.command == "plan":
+        return _handle_plan(args)
     else:
         parser.print_help()
         return 2
@@ -310,6 +352,75 @@ def _handle_ingest(args) -> int:
         print(f"error: ingestion failed: {exc}")
         return 1
 
+    return 0
+
+
+def _handle_plan(args) -> int:
+    """Handle actionable plan generation command."""
+    report_path = Path(args.input)
+    if not report_path.exists():
+        print(f"error: input file not found: {report_path}")
+        return 1
+
+    try:
+        content = report_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: reading report: {exc}")
+        return 1
+
+    # Load documents
+    requirements_docs = []
+    if args.requirements:
+        requirements_docs.extend(_load_docs_from_paths(args.requirements))
+    if args.requirements_text:
+        requirements_docs.append(("inline:requirements", args.requirements_text))
+
+    knowledge_docs = []
+    if args.knowledge:
+        knowledge_docs.extend(_load_docs_from_paths(args.knowledge))
+
+    # Run RAG analysis to get actionable plan
+    try:
+        plan = rag_plan(
+            test_report_content=content,
+            repo_path=args.repo,
+            requirements_docs=requirements_docs if requirements_docs else None,
+            knowledge_docs=knowledge_docs if knowledge_docs else None,
+            query=args.query,
+        )
+    except Exception as exc:
+        print(f"error: plan generation failed: {exc}")
+        return 1
+
+    if args.prompt_only:
+        print(build_plan_prompt(plan))
+        return 0
+
+    # Convert plan to dict for JSON output
+    plan_dict = {
+        "title": plan.title,
+        "summary": plan.summary,
+        "overall_confidence": plan.overall_confidence,
+        "risk_level": plan.risk_level,
+        "steps": [
+            {
+                "step_id": s.step_id,
+                "description": s.description,
+                "priority": s.priority,
+                "estimated_effort": s.estimated_effort,
+                "confidence": s.confidence,
+                "related_failures": s.related_failures,
+                "related_gaps": s.related_gaps,
+                "evidence_sources": s.evidence_sources,
+            }
+            for s in plan.steps
+        ],
+        "prerequisites": plan.prerequisites,
+        "missing_evidence": plan.missing_evidence,
+    }
+
+    indent = 2 if args.format == "pretty" else None
+    print(json.dumps(plan_dict, ensure_ascii=False, indent=indent))
     return 0
 
 

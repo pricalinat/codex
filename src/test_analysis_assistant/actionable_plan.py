@@ -1,16 +1,18 @@
 """Actionable plan generation with confidence scoring for test analysis."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from .models import AnalysisResult
-from .rag_analyzer import (
-    RAGAnalysisResult,
-    RetrievalInsight,
-    RequirementTrace,
-    TestGapAnalysis,
-)
 from .retrieval import RankedChunk
+
+if TYPE_CHECKING:
+    from .rag_analyzer import (
+        RAGAnalysisResult,
+        RetrievalInsight,
+        RequirementTrace,
+        TestGapAnalysis,
+    )
 
 
 @dataclass
