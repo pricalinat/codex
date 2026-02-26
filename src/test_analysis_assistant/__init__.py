@@ -80,12 +80,14 @@ from .retrieval import (
     IngestDocument,
     MultiSourceIngestor,
     RetrievalEngine,
+    SentenceTransformerEmbeddingProvider,
     SourceType,
     TFIDFEmbeddingProvider,
     build_analysis_prompt,
     build_analysis_prompt_from_evidence,
     compute_enhanced_confidence,
     create_code_aware_engine,
+    create_embedding_provider,
     create_hybrid_engine,
 )
 from .query_reformulator import (
@@ -126,6 +128,7 @@ from .multimodal import (
     OCRResult,
     ProcessedArtifact,
     TableExtractor,
+    TesseractOCRProcessor,
 )
 
 __all__ = [
@@ -150,6 +153,8 @@ __all__ = [
     "HybridRetrievalEngine",
     "DummyEmbeddingProvider",
     "TFIDFEmbeddingProvider",
+    "SentenceTransformerEmbeddingProvider",
+    "create_embedding_provider",
     "create_hybrid_engine",
     "ActionablePlan",
     "ActionableStep",
@@ -220,6 +225,7 @@ __all__ = [
     # Multimodal ingestion exports
     "ExtractedTable",
     "ImageOCRProcessor",
+    "TesseractOCRProcessor",
     "ModalityType",
     "MultimodalIngestor",
     "OCRResult",

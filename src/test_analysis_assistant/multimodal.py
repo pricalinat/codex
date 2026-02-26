@@ -417,6 +417,236 @@ class ImageOCRProcessor:
         )
 
 
+class TesseractOCRProcessor(ImageOCRProcessor):
+    """Production-grade OCR processor using Tesseract.
+
+    This processor uses pytesseract for actual OCR text extraction from images.
+    Falls back gracefully if pytesseract or Tesseract OCR engine is not available.
+
+    Supported features:
+    - Multiple language support (eng, spa, fra, deu, etc.)
+    - Configurable PSM (page segmentation mode)
+    - Confidence scores for extracted text
+    - Bounding box extraction for text regions
+    """
+
+    # Common language codes supported by Tesseract
+    SUPPORTED_LANGUAGES = {
+        "eng": "English",
+        "spa": "Spanish",
+        "fra": "French",
+        "deu": "German",
+        "ita": "Italian",
+        "por": "Portuguese",
+        "rus": "Russian",
+        "jpn": "Japanese",
+        "kor": "Korean",
+        "chi_sim": "Chinese (Simplified)",
+        "chi_tra": "Chinese (Traditional)",
+    }
+
+    def __init__(
+        self,
+        language: str = "eng",
+        psm: int = 3,
+        oem: int = 3,
+    ) -> None:
+        """Initialize Tesseract OCR processor.
+
+        Args:
+            language: Language code for OCR (default: eng)
+            psm: Page segmentation mode (default: 3 = Fully automatic)
+            oem: OCR engine mode (default: 3 = Default, using LSTM only)
+        """
+        super().__init__(language=language)
+        self._psm = psm
+        self._oem = oem
+        self._is_available = False
+        self._load_tesseract()
+
+    def _load_tesseract(self) -> None:
+        """Load pytesseract and verify Tesseract is available."""
+        try:
+            import pytesseract
+            # Verify Tesseract is actually installed
+            version = pytesseract.get_tesseract_version()
+            self._is_available = True
+        except ImportError:
+            self._is_available = False
+            import sys
+            print(
+                "Warning: pytesseract not installed. Run: pip install pytesseract",
+                file=sys.stderr
+            )
+        except Exception:
+            self._is_available = False
+            import sys
+            print(
+                "Warning: Tesseract OCR engine not found. "
+                "Install Tesseract: https://github.com/tesseract-ocr/tesseract",
+                file=sys.stderr
+            )
+
+    @property
+    def is_available(self) -> bool:
+        """Check if Tesseract OCR is available."""
+        return self._is_available
+
+    @property
+    def supported_languages(self) -> Dict[str, str]:
+        """Get supported language codes and names."""
+        return self.SUPPORTED_LANGUAGES
+
+    def process_image_bytes(self, image_data: bytes, image_id: str = "image") -> OCRResult:
+        """Process image from bytes.
+
+        Args:
+            image_data: Raw image bytes
+            image_id: Identifier for the image
+
+        Returns:
+            OCR result with extracted text
+        """
+        if not self._is_available:
+            return super().process_image_bytes(image_data, image_id)
+
+        try:
+            import pytesseract
+            from PIL import Image
+            import io
+
+            # Load image from bytes
+            image = Image.open(io.BytesIO(image_data))
+
+            # Configure OCR
+            config = f"--psm {self._psm} --oem {self._oem}"
+
+            # Extract text
+            text = pytesseract.image_to_string(
+                image,
+                lang=self._language,
+                config=config
+            )
+
+            # Get confidence data
+            data = pytesseract.image_to_data(
+                image,
+                lang=self._language,
+                config=config,
+                output_type=pytesseract.Output.DICT
+            )
+
+            # Calculate average confidence
+            confidences = [
+                int(conf) for conf in data.get("conf", [])
+                if conf != "-1"  # -1 means not recognized
+            ]
+            avg_confidence = sum(confidences) / len(confidences) / 100.0 if confidences else 0.0
+
+            # Extract bounding boxes
+            bounding_boxes = []
+            n_boxes = len(data["text"])
+            for i in range(n_boxes):
+                if int(data["conf"][i]) > 0:  # Only include recognized text
+                    bounding_boxes.append({
+                        "text": data["text"][i],
+                        "confidence": float(data["conf"][i]) / 100.0,
+                        "left": data["left"][i],
+                        "top": data["top"][i],
+                        "width": data["width"][i],
+                        "height": data["height"][i],
+                    })
+
+            return OCRResult(
+                image_id=image_id,
+                text=text.strip(),
+                language=self._language,
+                ocr_confidence=avg_confidence,
+                bounding_boxes=bounding_boxes,
+                metadata={"processor": "tesseract", "psm": self._psm, "oem": self._oem},
+            )
+
+        except ImportError as e:
+            import sys
+            print(f"Warning: Missing dependency for OCR: {e}", file=sys.stderr)
+            return OCRResult(
+                image_id=image_id,
+                text="[OCR failed: Missing PIL or pytesseract]",
+                language=self._language,
+                ocr_confidence=0.0,
+            )
+        except Exception as e:
+            import sys
+            print(f"Warning: OCR processing failed: {e}", file=sys.stderr)
+            return OCRResult(
+                image_id=image_id,
+                text=f"[OCR failed: {str(e)}]",
+                language=self._language,
+                ocr_confidence=0.0,
+            )
+
+    def process_image_path(self, image_path: str) -> OCRResult:
+        """Process image from file path.
+
+        Args:
+            image_path: Path to image file
+
+        Returns:
+            OCR result with extracted text
+        """
+        if not self._is_available:
+            return super().process_image_path(image_path)
+
+        try:
+            import pytesseract
+            from PIL import Image
+
+            # Load image
+            image = Image.open(image_path)
+
+            # Configure OCR
+            config = f"--psm {self._psm} --oem {self._oem}"
+
+            # Extract text
+            text = pytesseract.image_to_string(
+                image,
+                lang=self._language,
+                config=config
+            )
+
+            # Get confidence
+            data = pytesseract.image_to_data(
+                image,
+                lang=self._language,
+                config=config,
+                output_type=pytesseract.Output.DICT
+            )
+
+            confidences = [
+                int(conf) for conf in data.get("conf", [])
+                if conf != "-1"
+            ]
+            avg_confidence = sum(confidences) / len(confidences) / 100.0 if confidences else 0.0
+
+            return OCRResult(
+                image_id=image_path,
+                text=text.strip(),
+                language=self._language,
+                ocr_confidence=avg_confidence,
+                metadata={"processor": "tesseract", "path": image_path, "psm": self._psm},
+            )
+
+        except Exception as e:
+            import sys
+            print(f"Warning: OCR processing failed: {e}", file=sys.stderr)
+            return OCRResult(
+                image_id=image_path,
+                text=f"[OCR failed: {str(e)}]",
+                language=self._language,
+                ocr_confidence=0.0,
+            )
+
+
 class PDFProcessor:
     """Processes PDF documents for text extraction.
 

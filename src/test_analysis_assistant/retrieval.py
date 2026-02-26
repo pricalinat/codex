@@ -6168,6 +6168,174 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
+    """Production-grade embedding provider using sentence-transformers.
+
+    This provider uses pre-trained transformer models for high-quality
+    semantic embeddings. Falls back gracefully if sentence-transformers
+    is not installed.
+
+    Supported models (configurable):
+    - all-MiniLM-L6-v2: Fast, 384 dimensions (default)
+    - all-mpnet-base-v2: Higher quality, 768 dimensions
+    - paraphrase-multilingual-MiniLM-L12-v2: Multilingual support
+    """
+
+    DEFAULT_MODEL = "all-MiniLM-L6-v2"
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_MODEL,
+        device: Optional[str] = None,
+        normalize_embeddings: bool = True,
+    ) -> None:
+        """Initialize the sentence-transformer provider.
+
+        Args:
+            model_name: Name of the sentence-transformer model to use
+            device: Device to use ('cpu', 'cuda', or None for auto)
+            normalize_embeddings: Whether to normalize embeddings to unit length
+        """
+        self._model_name = model_name
+        self._device = device
+        self._normalize = normalize_embeddings
+        self._model = None
+        self._is_available = False
+        self._load_model()
+
+    def _load_model(self) -> None:
+        """Load the sentence-transformer model if available."""
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._model = SentenceTransformer(self._model_name, device=self._device)
+            self._is_available = True
+        except ImportError:
+            self._is_available = False
+            import sys
+            print(
+                f"Warning: sentence-transformers not installed. "
+                f"Run: pip install sentence-transformers",
+                file=sys.stderr
+            )
+        except Exception as e:
+            self._is_available = False
+            import sys
+            print(
+                f"Warning: Failed to load model '{self._model_name}': {e}",
+                file=sys.stderr
+            )
+
+    @property
+    def is_available(self) -> bool:
+        """Check if the embedding provider is available."""
+        return self._is_available
+
+    @property
+    def embedding_dimension(self) -> int:
+        """Get the embedding dimension for the current model."""
+        if not self._is_available or self._model is None:
+            return 0
+        return self._model.get_sentence_embedding_dimension()
+
+    def encode(self, texts: List[str]) -> List[List[float]]:
+        """Encode texts using sentence-transformer model.
+
+        Args:
+            texts: List of text strings to encode
+
+        Returns:
+            List of embedding vectors
+        """
+        if not self._is_available or not self._model:
+            return self._fallback_encode(texts)
+
+        if not texts:
+            return []
+
+        try:
+            embeddings = self._model.encode(
+                texts,
+                normalize_embeddings=self._normalize,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+            )
+            return [emb.tolist() for emb in embeddings]
+        except Exception as e:
+            import sys
+            print(f"Warning: Encoding failed: {e}", file=sys.stderr)
+            return self._fallback_encode(texts)
+
+    def prepare_corpus(self, texts: List[str]) -> List[List[float]]:
+        """Fit any corpus-specific state and return corpus embeddings.
+
+        For sentence-transformers, this is the same as encode() since
+        the model is pre-trained.
+
+        Args:
+            texts: List of corpus texts
+
+        Returns:
+            List of embedding vectors
+        """
+        return self.encode(texts)
+
+    def encode_query(self, text: str) -> List[float]:
+        """Encode query text in the same vector space as corpus embeddings.
+
+        Args:
+            text: Query text to encode
+
+        Returns:
+            Query embedding vector
+        """
+        vectors = self.encode([text])
+        return vectors[0] if vectors else []
+
+    def _fallback_encode(self, texts: List[str]) -> List[List[float]]:
+        """Fallback encoding using TF-IDF when model is unavailable."""
+        fallback = TFIDFEmbeddingProvider(max_features=256)
+        return fallback.prepare_corpus(texts)
+
+
+def create_embedding_provider(
+    provider_type: str = "auto",
+    **kwargs,
+) -> EmbeddingProvider:
+    """Factory function to create embedding providers.
+
+    Args:
+        provider_type: Type of provider ('auto', 'dummy', 'tfidf', 'sentence-transformer')
+        **kwargs: Provider-specific configuration
+
+    Returns:
+        EmbeddingProvider instance
+
+    Examples:
+        >>> provider = create_embedding_provider('sentence-transformer', model_name='all-mpnet-base-v2')
+        >>> provider = create_embedding_provider('tfidf', max_features=512)
+        >>> provider = create_embedding_provider('auto')  # Best available
+    """
+    if provider_type == "auto":
+        # Try sentence-transformer first, then TF-IDF, then dummy
+        try:
+            return SentenceTransformerEmbeddingProvider(**kwargs)
+        except Exception:
+            pass
+        try:
+            return TFIDFEmbeddingProvider(**kwargs)
+        except Exception:
+            return DummyEmbeddingProvider()
+
+    elif provider_type == "sentence-transformer":
+        return SentenceTransformerEmbeddingProvider(**kwargs)
+    elif provider_type == "tfidf":
+        return TFIDFEmbeddingProvider(**kwargs)
+    elif provider_type == "dummy":
+        return DummyEmbeddingProvider()
+    else:
+        raise ValueError(f"Unknown provider type: {provider_type}")
+
+
 class HybridRetrievalEngine(RetrievalEngine):
     """Enhanced retrieval engine with hybrid (lexical + semantic) search.
 
