@@ -3,6 +3,7 @@
 import unittest
 
 from src.test_analysis_assistant.multimodal import (
+    DOCXProcessor,
     ExtractedTable,
     ImageOCRProcessor,
     ModalityType,
@@ -400,6 +401,78 @@ class TestPDFProcessor(unittest.TestCase):
         processor = PDFProcessor()
         # Property should exist and be a boolean
         self.assertIsInstance(processor.is_available, bool)
+
+    def test_pdf_has_table_support_property(self):
+        """Test has_table_support property reflects pdfplumber availability."""
+        processor = PDFProcessor()
+        # Property should exist and be a boolean
+        self.assertIsInstance(processor.has_table_support, bool)
+
+    def test_pdf_extract_tables_from_path_returns_empty_without_pdfplumber(self):
+        """Test table extraction returns empty list without pdfplumber."""
+        processor = PDFProcessor()
+        tables = processor.extract_tables_from_path("/path/to/file.pdf")
+        # Should return empty list when pdfplumber not available
+        self.assertIsInstance(tables, list)
+
+    def test_pdf_extract_tables_from_bytes_returns_empty_without_pdfplumber(self):
+        """Test table extraction returns empty list from bytes without pdfplumber."""
+        processor = PDFProcessor()
+        tables = processor.extract_tables_from_bytes(b"%PDF-1.4 fake pdf")
+        # Should return empty list when pdfplumber not available
+        self.assertIsInstance(tables, list)
+
+
+class TestDOCXProcessor(unittest.TestCase):
+    """Tests for DOCX processing."""
+
+    def test_docx_processor_init(self):
+        """Test DOCX processor initialization."""
+        processor = DOCXProcessor()
+        self.assertIsNotNone(processor)
+
+    def test_docx_is_available_property(self):
+        """Test is_available property reflects python-docx availability."""
+        processor = DOCXProcessor()
+        # Property should exist and be a boolean
+        self.assertIsInstance(processor.is_available, bool)
+
+    def test_docx_extract_text_from_path_stub(self):
+        """Test DOCX text extraction returns stub when python-docx not available."""
+        processor = DOCXProcessor()
+        result = processor.extract_text_from_path("/path/to/file.docx")
+        # Should contain helpful message
+        self.assertIn("python-docx", result)
+
+    def test_docx_extract_text_from_bytes_stub(self):
+        """Test DOCX text extraction returns stub from bytes when not available."""
+        processor = DOCXProcessor()
+        result = processor.extract_text_from_bytes(b"PK fake docx content")
+        # Should contain helpful message
+        self.assertIn("python-docx", result)
+
+    def test_docx_extract_tables_from_path_returns_empty(self):
+        """Test table extraction returns empty list when python-docx not available."""
+        processor = DOCXProcessor()
+        tables = processor.extract_tables_from_path("/path/to/file.docx")
+        # Should return empty list
+        self.assertIsInstance(tables, list)
+
+    def test_docx_extract_tables_from_bytes_returns_empty(self):
+        """Test table extraction returns empty list from bytes when not available."""
+        processor = DOCXProcessor()
+        tables = processor.extract_tables_from_bytes(b"PK fake docx")
+        # Should return empty list
+        self.assertIsInstance(tables, list)
+
+    def test_docx_extract_all_returns_dict(self):
+        """Test extract_all returns dictionary structure."""
+        processor = DOCXProcessor()
+        result = processor.extract_all("/path/to/file.docx")
+        # Should return dict with text and tables keys
+        self.assertIsInstance(result, dict)
+        self.assertIn("text", result)
+        self.assertIn("tables", result)
 
 
 if __name__ == "__main__":

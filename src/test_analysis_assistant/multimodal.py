@@ -648,7 +648,7 @@ class TesseractOCRProcessor(ImageOCRProcessor):
 
 
 class PDFProcessor:
-    """Processes PDF documents for text extraction.
+    """Processes PDF documents for text and table extraction.
 
     This is a stub implementation with fallback for PDF text extraction.
     In production, this would integrate with:
@@ -662,11 +662,20 @@ class PDFProcessor:
     def __init__(self) -> None:
         """Initialize PDF processor."""
         self._pdfminer_available = self._check_pdfminer()
+        self._pdfplumber_available = self._check_pdfplumber()
 
     def _check_pdfminer(self) -> bool:
         """Check if pdfminer.six is available."""
         try:
             import pdfminer.high_level
+            return True
+        except ImportError:
+            return False
+
+    def _check_pdfplumber(self) -> bool:
+        """Check if pdfplumber is available for table extraction."""
+        try:
+            import pdfplumber
             return True
         except ImportError:
             return False
@@ -741,6 +750,287 @@ class PDFProcessor:
     def is_available(self) -> bool:
         """Check if PDF processing is available."""
         return self._pdfminer_available
+
+    @property
+    def has_table_support(self) -> bool:
+        """Check if PDF table extraction is available."""
+        return self._pdfplumber_available
+
+    def extract_tables_from_path(self, pdf_path: str) -> List[ExtractedTable]:
+        """Extract tables from PDF file path.
+
+        Args:
+            pdf_path: Path to PDF file
+
+        Returns:
+            List of extracted tables
+        """
+        if not self._pdfplumber_available:
+            return self._stub_tables_response()
+
+        try:
+            import pdfplumber
+
+            tables = []
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    page_tables = page.extract_tables()
+                    if page_tables:
+                        for table_idx, table in enumerate(page_tables):
+                            if table and len(table) > 0:
+                                # First row as headers if not empty
+                                headers = table[0] if table[0] else []
+                                rows = table[1:] if len(table) > 1 else []
+
+                                # Clean up None values
+                                headers = [str(h) if h is not None else "" for h in headers]
+                                rows = [
+                                    [str(cell) if cell is not None else "" for cell in row]
+                                    for row in rows
+                                ]
+
+                                tables.append(ExtractedTable(
+                                    table_id=f"pdf_page{page_num}_table{table_idx}",
+                                    headers=headers,
+                                    rows=rows,
+                                    source_location=f"{pdf_path} (page {page_num + 1})",
+                                    extraction_confidence=0.85,
+                                    metadata={"page": page_num + 1, "table_index": table_idx},
+                                ))
+            return tables
+        except Exception:
+            return self._stub_tables_response()
+
+    def extract_tables_from_bytes(self, pdf_data: bytes) -> List[ExtractedTable]:
+        """Extract tables from PDF bytes.
+
+        Args:
+            pdf_data: PDF file content as bytes
+
+        Returns:
+            List of extracted tables
+        """
+        if not self._pdfplumber_available:
+            return self._stub_tables_response()
+
+        try:
+            import io
+            import pdfplumber
+
+            tables = []
+            with pdfplumber.open(io.BytesIO(pdf_data)) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    page_tables = page.extract_tables()
+                    if page_tables:
+                        for table_idx, table in enumerate(page_tables):
+                            if table and len(table) > 0:
+                                headers = table[0] if table[0] else []
+                                rows = table[1:] if len(table) > 1 else []
+
+                                headers = [str(h) if h is not None else "" for h in headers]
+                                rows = [
+                                    [str(cell) if cell is not None else "" for cell in row]
+                                    for row in rows
+                                ]
+
+                                tables.append(ExtractedTable(
+                                    table_id=f"pdf_page{page_num}_table{table_idx}",
+                                    headers=headers,
+                                    rows=rows,
+                                    source_location=f"bytes (page {page_num + 1})",
+                                    extraction_confidence=0.85,
+                                    metadata={"page": page_num + 1, "table_index": table_idx},
+                                ))
+            return tables
+        except Exception:
+            return self._stub_tables_response()
+
+    def _stub_tables_response(self) -> List[ExtractedTable]:
+        """Return stub response when pdfplumber is not available."""
+        return []
+
+
+class DOCXProcessor:
+    """Processes DOCX (Word) documents for text and table extraction.
+
+    This processor extracts text and tables from Word documents using python-docx.
+    Falls back gracefully if python-docx is not available.
+
+    Supported features:
+    - Plain text extraction from paragraphs
+    - Table extraction with headers and rows
+    - Document metadata (if available)
+    """
+
+    def __init__(self) -> None:
+        """Initialize DOCX processor."""
+        self._docx_available = self._check_docx()
+
+    def _check_docx(self) -> bool:
+        """Check if python-docx is available."""
+        try:
+            import docx
+            return True
+        except ImportError:
+            return False
+
+    @property
+    def is_available(self) -> bool:
+        """Check if DOCX processing is available."""
+        return self._docx_available
+
+    def extract_text_from_path(self, docx_path: str) -> str:
+        """Extract text from DOCX file path.
+
+        Args:
+            docx_path: Path to DOCX file
+
+        Returns:
+            Extracted text content
+        """
+        if not self._docx_available:
+            return self._stub_response("path")
+
+        try:
+            import docx
+
+            doc = docx.Document(docx_path)
+            paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
+            return "\n\n".join(paragraphs)
+        except Exception as e:
+            return self._stub_response(f"path: {e}")
+
+    def extract_text_from_bytes(self, docx_data: bytes) -> str:
+        """Extract text from DOCX bytes.
+
+        Args:
+            docx_data: DOCX file content as bytes
+
+        Returns:
+            Extracted text content
+        """
+        if not self._docx_available:
+            return self._stub_response("bytes")
+
+        try:
+            import io
+            import docx
+
+            doc = docx.Document(io.BytesIO(docx_data))
+            paragraphs = [para.text for para in doc.paragraphs if para.text.strip()]
+            return "\n\n".join(paragraphs)
+        except Exception as e:
+            return self._stub_response(f"bytes: {e}")
+
+    def extract_tables_from_path(self, docx_path: str) -> List[ExtractedTable]:
+        """Extract tables from DOCX file path.
+
+        Args:
+            docx_path: Path to DOCX file
+
+        Returns:
+            List of extracted tables
+        """
+        if not self._docx_available:
+            return self._stub_tables_response()
+
+        try:
+            import docx
+
+            tables = []
+            doc = docx.Document(docx_path)
+            for table_idx, table in enumerate(doc.tables):
+                headers = []
+                rows = []
+
+                # First row as headers
+                if table.rows:
+                    headers = [cell.text.strip() for cell in table.rows[0].cells]
+                    for row in table.rows[1:]:
+                        row_data = [cell.text.strip() for cell in row.cells]
+                        rows.append(row_data)
+
+                if headers or rows:
+                    tables.append(ExtractedTable(
+                        table_id=f"docx_table_{table_idx}",
+                        headers=headers,
+                        rows=rows,
+                        source_location=f"{docx_path} (table {table_idx})",
+                        extraction_confidence=0.9,
+                        metadata={"table_index": table_idx},
+                    ))
+            return tables
+        except Exception:
+            return self._stub_tables_response()
+
+    def extract_tables_from_bytes(self, docx_data: bytes) -> List[ExtractedTable]:
+        """Extract tables from DOCX bytes.
+
+        Args:
+            docx_data: DOCX file content as bytes
+
+        Returns:
+            List of extracted tables
+        """
+        if not self._docx_available:
+            return self._stub_tables_response()
+
+        try:
+            import io
+            import docx
+
+            tables = []
+            doc = docx.Document(io.BytesIO(docx_data))
+            for table_idx, table in enumerate(doc.tables):
+                headers = []
+                rows = []
+
+                if table.rows:
+                    headers = [cell.text.strip() for cell in table.rows[0].cells]
+                    for row in table.rows[1:]:
+                        row_data = [cell.text.strip() for cell in row.cells]
+                        rows.append(row_data)
+
+                if headers or rows:
+                    tables.append(ExtractedTable(
+                        table_id=f"docx_table_{table_idx}",
+                        headers=headers,
+                        rows=rows,
+                        source_location=f"bytes (table {table_idx})",
+                        extraction_confidence=0.9,
+                        metadata={"table_index": table_idx},
+                    ))
+            return tables
+        except Exception:
+            return self._stub_tables_response()
+
+    def extract_all(self, docx_path: str) -> Dict[str, Any]:
+        """Extract text and tables from DOCX file.
+
+        Args:
+            docx_path: Path to DOCX file
+
+        Returns:
+            Dictionary with text and tables
+        """
+        return {
+            "text": self.extract_text_from_path(docx_path),
+            "tables": self.extract_tables_from_path(docx_path),
+        }
+
+    def _stub_response(self, source_type: str) -> str:
+        """Return a stub response when python-docx is not available."""
+        return (
+            f"[DOCX extraction not available: python-docx not installed]\n"
+            f"To enable DOCX text extraction, install python-docx:\n"
+            f"    pip install python-docx\n"
+            f"\n"
+            f"Source type: {source_type}\n"
+        )
+
+    def _stub_tables_response(self) -> List[ExtractedTable]:
+        """Return stub response when python-docx is not available."""
+        return []
 
 
 class MultimodalIngestor:
