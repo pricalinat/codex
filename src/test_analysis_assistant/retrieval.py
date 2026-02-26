@@ -920,7 +920,48 @@ class RetrievalEngine:
 
     def _expand_query_variants(self, query_text: str, max_variants: int = 4) -> List[Tuple[str, float]]:
         plan = self.build_query_plan(query_text)
-        variants: List[Tuple[str, float]] = [(query_text, 1.0)]
+        cross_goal_variant = "failure clustering root cause test gap risk prioritization actionable plan"
+        variants: List[Tuple[str, float]] = [(query_text, 1.0), (cross_goal_variant, 0.45)]
+
+        # Integrate query-understanding reformulations when available.
+        # This remains optional and falls back to deterministic local rules.
+        try:
+            from .query_understanding import QueryUnderstandingEngine
+        except Exception:
+            QueryUnderstandingEngine = None
+
+        if QueryUnderstandingEngine is not None:
+            try:
+                understanding = QueryUnderstandingEngine(
+                    enable_synonym_expansion=True,
+                    enable_decomposition=True,
+                    max_variants=max(4, max_variants),
+                ).understand(query_text)
+            except Exception:
+                understanding = None
+
+            if understanding is not None:
+                expanded_query = str(understanding.expanded_query or "").strip()
+                if expanded_query and expanded_query.lower() != query_text.lower():
+                    confidence = float(getattr(understanding.intent, "confidence", 0.5))
+                    expanded_weight = max(0.64, min(0.9, 0.72 + (confidence * 0.18)))
+                    variants.append((expanded_query, round(expanded_weight, 4)))
+
+                for item in list(understanding.contextual_variants or [])[1:3]:
+                    variant_query = str(getattr(item, "query", "") or "").strip()
+                    if not variant_query:
+                        continue
+                    contextual_weight = max(0.45, min(0.82, float(getattr(item, "weight", 0.6)) * 0.85))
+                    variants.append((variant_query, round(contextual_weight, 4)))
+
+                for sub_query in list(understanding.decomposed_queries or [])[1:3]:
+                    normalized_subquery = str(sub_query or "").strip()
+                    if normalized_subquery:
+                        variants.append((normalized_subquery, 0.62))
+
+                entities = _dedupe([str(entity).strip() for entity in understanding.intent.entities if str(entity).strip()])
+                if entities:
+                    variants.append((f"{query_text} {' '.join(entities[:3])}", 0.58))
 
         intent_expansions = {
             "failure_clustering": "cluster recurring flaky failure patterns and shared signatures",
@@ -934,15 +975,6 @@ class RetrievalEngine:
             if expansion:
                 variants.append((f"{query_text} {expansion}", 0.82))
 
-        # Always add one cross-goal pivot query to increase cross-source evidence
-        # coverage when the corpus is sparse or vocabulary is fragmented.
-        variants.append(
-            (
-                "failure clustering root cause test gap risk prioritization actionable plan",
-                0.45,
-            )
-        )
-
         if "table" in plan.preferred_modalities:
             variants.append((f"{query_text} table matrix evidence", 0.60))
         if "image" in plan.preferred_modalities or "image_ocr_stub" in plan.preferred_modalities:
@@ -952,16 +984,30 @@ class RetrievalEngine:
         if plan.target_symbols:
             variants.append((f"{query_text} function symbol {' '.join(plan.target_symbols[:2])}", 0.66))
 
-        deduped: List[Tuple[str, float]] = []
-        seen = set()
-        for variant in variants:
-            if variant[0] in seen:
+        merged_weights: Dict[str, float] = {}
+        for variant_query, weight in variants:
+            normalized_query = str(variant_query or "").strip()
+            if not normalized_query:
                 continue
-            seen.add(variant[0])
-            deduped.append(variant)
-            if len(deduped) >= max(1, max_variants):
+            merged_weights[normalized_query] = max(merged_weights.get(normalized_query, 0.0), float(weight))
+
+        ordered: List[Tuple[str, float]] = []
+        normalized_original = query_text.strip()
+        if normalized_original in merged_weights:
+            ordered.append(
+                (normalized_original, round(max(0.0, min(1.0, merged_weights.pop(normalized_original))), 4))
+            )
+        if max_variants > 1 and cross_goal_variant in merged_weights:
+            ordered.append(
+                (cross_goal_variant, round(max(0.0, min(1.0, merged_weights.pop(cross_goal_variant))), 4))
+            )
+
+        for variant_query, weight in sorted(merged_weights.items(), key=lambda item: (-item[1], item[0])):
+            ordered.append((variant_query, round(max(0.0, min(1.0, weight)), 4)))
+            if len(ordered) >= max(1, max_variants):
                 break
-        return deduped
+
+        return ordered[: max(1, max_variants)]
 
 
 class MultiSourceIngestor:

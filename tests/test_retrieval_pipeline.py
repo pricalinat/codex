@@ -511,6 +511,24 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertNotIn("req-plan", baseline_sources)
         self.assertIn("req-plan", expanded_sources)
 
+    def test_expand_query_variants_uses_query_understanding_synonyms(self):
+        engine = RetrievalEngine()
+
+        variants = engine._expand_query_variants(
+            "how to fix import error in auth module",
+            max_variants=8,
+        )
+
+        variant_queries = [query for query, _ in variants]
+        self.assertIn("how to fix import error in auth module", variant_queries)
+        self.assertTrue(
+            any(
+                token in query
+                for query in variant_queries
+                for token in ("exception", "bug", "issue", "fault")
+            )
+        )
+
     def test_retrieve_evidence_computes_aggregate_confidence(self):
         docs = [
             IngestDocument(
