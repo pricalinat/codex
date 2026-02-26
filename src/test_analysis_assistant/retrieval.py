@@ -504,6 +504,7 @@ class RetrievalEngine:
 
         limit = max(1, top_k)
         top = _select_diverse_top(scored, limit, plan=plan) if diversify else scored[:limit]
+        top = _rescue_structural_targets(top, scored, plan=plan, top_k=limit)
 
         if not top:
             return []
@@ -5366,6 +5367,129 @@ def _select_diverse_top(
     return selected
 
 
+def _collect_structural_target_coverage(
+    plan: QueryPlan,
+    ranked: Sequence[RankedChunk],
+) -> Tuple[set, set]:
+    covered_paths: set = set()
+    covered_symbols: set = set()
+    wanted_paths = {Path(path).as_posix() for path in plan.target_paths}
+    wanted_symbols = {symbol.lower() for symbol in plan.target_symbols}
+
+    for item in ranked:
+        chunk_paths, chunk_symbols = _chunk_structural_signals(item.chunk)
+        chunk_symbol_set = {symbol.lower() for symbol in chunk_symbols}
+        for path in wanted_paths:
+            if any(_path_match(path, candidate) for candidate in chunk_paths):
+                covered_paths.add(path)
+        for symbol in wanted_symbols:
+            if symbol in chunk_symbol_set:
+                covered_symbols.add(symbol)
+
+    return covered_paths, covered_symbols
+
+
+def _choose_structural_replacement_index(
+    selected: Sequence[RankedChunk],
+    plan: QueryPlan,
+    covered_paths: set,
+    covered_symbols: set,
+) -> int:
+    if len(selected) <= 1:
+        return 0
+
+    sorted_by_score = sorted(enumerate(selected), key=lambda pair: pair[1].score)
+    for idx, _ in sorted_by_score:
+        if idx == 0:
+            continue
+        remaining = [item for keep_idx, item in enumerate(selected) if keep_idx != idx]
+        remaining_paths, remaining_symbols = _collect_structural_target_coverage(plan, remaining)
+        if remaining_paths == covered_paths and remaining_symbols == covered_symbols:
+            return idx
+
+    return len(selected) - 1
+
+
+def _rescue_structural_targets(
+    selected: Sequence[RankedChunk],
+    candidates: Sequence[RankedChunk],
+    plan: QueryPlan,
+    top_k: int,
+) -> List[RankedChunk]:
+    if top_k <= 0 or not selected or not candidates:
+        return list(selected)
+    if not plan.target_paths and not plan.target_symbols:
+        return list(selected)
+
+    rescued = list(selected)[: max(1, top_k)]
+    selected_ids = {item.chunk.chunk_id for item in rescued}
+    wanted_paths = {Path(path).as_posix() for path in plan.target_paths}
+    wanted_symbols = {symbol.lower() for symbol in plan.target_symbols}
+
+    max_replacements = max(1, min(2, len(rescued)))
+    replacements = 0
+
+    while replacements < max_replacements:
+        covered_paths, covered_symbols = _collect_structural_target_coverage(plan, rescued)
+        missing_paths = wanted_paths.difference(covered_paths)
+        missing_symbols = wanted_symbols.difference(covered_symbols)
+        if not missing_paths and not missing_symbols:
+            break
+
+        best_candidate: Optional[RankedChunk] = None
+        best_value = float("-inf")
+
+        for candidate in candidates:
+            if candidate.chunk.chunk_id in selected_ids:
+                continue
+
+            chunk_paths, chunk_symbols = _chunk_structural_signals(candidate.chunk)
+            chunk_symbol_set = {symbol.lower() for symbol in chunk_symbols}
+            gained_paths = {
+                path
+                for path in missing_paths
+                if any(_path_match(path, candidate_path) for candidate_path in chunk_paths)
+            }
+            gained_symbols = missing_symbols.intersection(chunk_symbol_set)
+            if not gained_paths and not gained_symbols:
+                continue
+
+            value = (
+                (len(gained_paths) * 0.80)
+                + (len(gained_symbols) * 0.65)
+                + (candidate.score_breakdown.get("structural", 0.0) * 0.35)
+                + (candidate.score * 0.08)
+            )
+            if value > best_value:
+                best_value = value
+                best_candidate = candidate
+
+        if best_candidate is None:
+            break
+
+        replace_idx = _choose_structural_replacement_index(
+            rescued,
+            plan=plan,
+            covered_paths=covered_paths,
+            covered_symbols=covered_symbols,
+        )
+        replaced_id = rescued[replace_idx].chunk.chunk_id
+        rescued[replace_idx] = best_candidate
+        selected_ids.discard(replaced_id)
+        selected_ids.add(best_candidate.chunk.chunk_id)
+        replacements += 1
+
+    rescued.sort(
+        key=lambda candidate: (
+            -candidate.score,
+            -len(candidate.matched_terms),
+            candidate.chunk.source_id,
+            candidate.chunk.chunk_id,
+        )
+    )
+    return rescued[: max(1, top_k)]
+
+
 def _chunk_similarity(left: Chunk, right: Chunk) -> float:
     left_tokens = set(_tokenize(left.text))
     right_tokens = set(_tokenize(right.text))
@@ -5767,6 +5891,7 @@ class HybridRetrievalEngine(RetrievalEngine):
 
         limit = max(1, top_k)
         top = _select_diverse_top(scored, limit, plan=plan) if diversify else scored[:limit]
+        top = _rescue_structural_targets(top, scored, plan=plan, top_k=limit)
 
         if not top:
             return []

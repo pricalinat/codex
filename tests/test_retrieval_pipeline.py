@@ -480,6 +480,84 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("structural_coverage", evidence.confidence_factors)
         self.assertGreater(evidence.confidence_factors["structural_coverage"], 0.5)
 
+    def test_query_top1_rescues_explicit_structural_target_when_available(self):
+        docs = [
+            IngestDocument(
+                source_id="req:auth",
+                source_type=SourceType.REQUIREMENTS,
+                content=(
+                    "traceback root cause auth retry storm refresh token mitigation plan "
+                    "release blockers and ownership matrix"
+                ),
+            ),
+            IngestDocument(
+                source_id="sys:auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "traceback root cause auth retry storm refresh token cascade "
+                    "in gateway service with incident timeline"
+                ),
+            ),
+            IngestDocument(
+                source_id="repo:src/auth/token.py",
+                source_type=SourceType.REPOSITORY,
+                modality="code",
+                content="def refresh_token(token):\n    return token.strip()",
+                metadata={"path": "src/auth/token.py", "unit_name": "refresh_token"},
+            ),
+        ]
+        engine = RetrievalEngine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "traceback root cause auth retry path:src/auth/token.py function refresh_token",
+            top_k=1,
+            diversify=True,
+        )
+
+        self.assertEqual(1, len(ranked))
+        self.assertEqual("repo:src/auth/token.py", ranked[0].chunk.source_id)
+        self.assertGreaterEqual(ranked[0].score_breakdown.get("structural", 0.0), 0.9)
+
+    def test_hybrid_query_top1_rescues_explicit_structural_target_when_available(self):
+        docs = [
+            IngestDocument(
+                source_id="req:auth",
+                source_type=SourceType.REQUIREMENTS,
+                content=(
+                    "traceback root cause auth retry storm refresh token mitigation plan "
+                    "release blockers and ownership matrix"
+                ),
+            ),
+            IngestDocument(
+                source_id="sys:auth",
+                source_type=SourceType.SYSTEM_ANALYSIS,
+                content=(
+                    "traceback root cause auth retry storm refresh token cascade "
+                    "in gateway service with incident timeline"
+                ),
+            ),
+            IngestDocument(
+                source_id="repo:src/auth/token.py",
+                source_type=SourceType.REPOSITORY,
+                modality="code",
+                content="def refresh_token(token):\n    return token.strip()",
+                metadata={"path": "src/auth/token.py", "unit_name": "refresh_token"},
+            ),
+        ]
+        engine = create_hybrid_engine()
+        engine.ingest_documents(docs)
+
+        ranked = engine.query(
+            "traceback root cause auth retry path:src/auth/token.py function refresh_token",
+            top_k=1,
+            diversify=True,
+        )
+
+        self.assertEqual(1, len(ranked))
+        self.assertEqual("repo:src/auth/token.py", ranked[0].chunk.source_id)
+        self.assertGreaterEqual(ranked[0].score_breakdown.get("structural", 0.0), 0.9)
+
     def test_retrieve_analysis_evidence_pack_builds_focus_and_merged_results(self):
         docs = [
             IngestDocument(
