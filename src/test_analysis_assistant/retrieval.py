@@ -993,12 +993,56 @@ class MultiSourceIngestor:
         self,
         records: Sequence[IngestionRecord],
         generate_source_summaries: bool = False,
+        prefer_pipeline: bool = False,
+        pipeline: Optional[Any] = None,
     ) -> List[Chunk]:
         docs: List[IngestDocument] = []
         for record in records:
             docs.extend(_normalize_ingestion_record_to_docs(record))
         if not docs:
             return []
+        if prefer_pipeline:
+            return self._ingest_docs_with_pipeline(
+                docs=docs,
+                generate_source_summaries=generate_source_summaries,
+                pipeline=pipeline,
+            )
+        return self._engine.ingest_documents(
+            docs,
+            generate_source_summaries=generate_source_summaries,
+        )
+
+    def _ingest_docs_with_pipeline(
+        self,
+        docs: Sequence[IngestDocument],
+        generate_source_summaries: bool = False,
+        pipeline: Optional[Any] = None,
+    ) -> List[Chunk]:
+        """Run normalized docs through unified pipeline and index prechunked output.
+
+        Falls back to direct ingestion when the pipeline is unavailable,
+        fails, or returns no chunks.
+        """
+        pipeline_runner = pipeline
+        if pipeline_runner is None:
+            try:
+                pipeline_runner = _create_default_unified_pipeline()
+            except Exception:
+                pipeline_runner = None
+
+        if pipeline_runner is not None:
+            try:
+                pipeline_result = pipeline_runner.process_batch(docs)
+                pipeline_chunks = list(getattr(pipeline_result, "chunks", []) or [])
+                if pipeline_chunks:
+                    return self._engine.ingest_prechunked(
+                        pipeline_chunks,
+                        generate_source_summaries=generate_source_summaries,
+                    )
+            except Exception:
+                # Degrade gracefully to direct ingestion for robustness.
+                pass
+
         return self._engine.ingest_documents(
             docs,
             generate_source_summaries=generate_source_summaries,
@@ -1632,6 +1676,17 @@ def _extract_text_units(doc: IngestDocument) -> List[ExtractedUnit]:
             )
         ]
     return [ExtractedUnit(text=str(doc.content), modality=doc.modality or "text", extraction_confidence=0.8)]
+
+
+def _create_default_unified_pipeline() -> Any:
+    """Create the default unified ingestion pipeline lazily.
+
+    Import is deferred to avoid module import cycles because
+    `ingestion_pipeline` depends on retrieval data structures.
+    """
+    from .ingestion_pipeline import create_unified_pipeline
+
+    return create_unified_pipeline()
 
 
 def _normalize_ingestion_record(record: IngestionRecord) -> IngestDocument:

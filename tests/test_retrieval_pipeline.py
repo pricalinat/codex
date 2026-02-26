@@ -1902,6 +1902,63 @@ Missing negative authorization tests are release blocking.
             self.assertEqual("pipeline_verified_sidecar", image_chunk.metadata.get("ingestion_route"))
             self.assertTrue(image_chunk.metadata.get("ocr_sidecar_path", "").endswith(".ocr.txt"))
 
+    def test_ingest_records_prefer_pipeline_indexes_detected_prechunked_metadata(self):
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:req-auth",
+                    source_type=SourceType.REQUIREMENTS,
+                    payload=(
+                        "# Authentication Requirements\n"
+                        "The service shall block release when retry storms appear.\n"
+                        "Missing negative credential tests must be flagged."
+                    ),
+                )
+            ],
+            prefer_pipeline=True,
+        )
+
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertTrue(any(chunk.metadata.get("ingestion_route") == "pipeline_detected" for chunk in chunks))
+        self.assertTrue(any("detection_category" in chunk.metadata for chunk in chunks))
+        self.assertTrue(any("recommended_chunker" in chunk.metadata for chunk in chunks))
+
+        ranked = engine.query("authentication retry storms release risk", top_k=1, diversify=False)
+        self.assertGreaterEqual(len(ranked), 1)
+        self.assertIn("detection", ranked[0].score_breakdown)
+
+    def test_ingest_records_prefer_pipeline_falls_back_when_pipeline_returns_no_chunks(self):
+        class EmptyPipeline:
+            def process_batch(self, documents):
+                class Result:
+                    chunks = []
+                    success = False
+                    errors = ["pipeline unavailable"]
+
+                return Result()
+
+        engine = RetrievalEngine()
+        ingestor = MultiSourceIngestor(engine)
+
+        chunks = ingestor.ingest_records(
+            [
+                IngestionRecord(
+                    source_id="record:kb-auth",
+                    source_type=SourceType.KNOWLEDGE,
+                    payload="Fallback path still indexes this document for auth retry mitigation.",
+                )
+            ],
+            prefer_pipeline=True,
+            pipeline=EmptyPipeline(),
+        )
+
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertTrue(any(chunk.metadata.get("ingestion_route") == "normalized_record" for chunk in chunks))
+        self.assertTrue(all("detection_category" not in chunk.metadata for chunk in chunks))
+
     def test_sidecar_ocr_improves_ingestion_route_quality_vs_stub(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
