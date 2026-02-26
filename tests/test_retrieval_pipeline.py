@@ -196,6 +196,43 @@ class TestRetrievalPipeline(unittest.TestCase):
         self.assertIn("src/auth/token.py", incident.chunk.metadata.get("referenced_paths", []))
         self.assertGreater(incident.score_breakdown.get("citation_graph", 0.0), 0.0)
 
+    def test_source_bundle_resolves_path_only_references_to_linked_sources(self):
+        engine = RetrievalEngine()
+        engine.ingest_documents(
+            [
+                IngestDocument(
+                    source_id="repo:src/auth/token.py",
+                    source_type=SourceType.REPOSITORY,
+                    modality="code",
+                    content="def refresh_token(token): return token.strip()",
+                    metadata={"path": "src/auth/token.py"},
+                ),
+                IngestDocument(
+                    source_id="incident:auth-token",
+                    source_type=SourceType.SYSTEM_ANALYSIS,
+                    modality="text",
+                    content=(
+                        "Auth incident analysis points to path:src/auth/token.py "
+                        "as the root-cause candidate."
+                    ),
+                ),
+            ]
+        )
+
+        evidence = engine.retrieve_evidence(
+            "auth token root cause path trace",
+            top_k=4,
+            diversify=False,
+            use_expansion=False,
+            adaptive_recovery=False,
+        )
+
+        bundles = {bundle.source_id: bundle for bundle in evidence.source_bundles}
+        self.assertIn("incident:auth-token", bundles)
+        incident_bundle = bundles["incident:auth-token"]
+        self.assertIn("repo:src/auth/token.py", incident_bundle.linked_sources)
+        self.assertGreater(incident_bundle.traceability_score, 0.0)
+
     def test_build_query_plan_extracts_structural_targets(self):
         engine = RetrievalEngine()
 

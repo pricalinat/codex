@@ -4077,6 +4077,11 @@ def _build_source_bundles(
     if not ranked:
         return []
 
+    path_to_sources: Dict[str, set] = {}
+    for item in ranked:
+        for path_value in _chunk_structural_paths(item.chunk):
+            path_to_sources.setdefault(path_value, set()).add(item.chunk.source_id)
+
     grouped: Dict[str, Dict[str, Any]] = {}
     query_tokens = set(plan.tokens)
     for item in ranked:
@@ -4099,6 +4104,16 @@ def _build_source_bundles(
         entry["matched_terms"].update(item.matched_terms)
         entry["chunk_ids"].append(item.chunk.chunk_id)
         entry["linked_sources"].update(_chunk_referenced_sources(item.chunk))
+        for referenced_path in _coerce_str_list(item.chunk.metadata.get("referenced_paths")):
+            normalized_path = _normalize_reference_path(referenced_path)
+            if not normalized_path:
+                continue
+            entry["linked_sources"].update(
+                _resolve_linked_sources_from_referenced_path(
+                    normalized_path=normalized_path,
+                    path_to_sources=path_to_sources,
+                )
+            )
 
         # Earlier ranked chunks contribute more strongly to source confidence.
         weight = 1.0 / (1.0 + len(entry["chunk_ids"]) * 0.6)
@@ -4143,6 +4158,34 @@ def _build_source_bundles(
         )
     )
     return bundles[: max(1, max_bundles)]
+
+
+def _chunk_structural_paths(chunk: Chunk) -> List[str]:
+    paths: List[str] = []
+    for raw in (
+        chunk.metadata.get("path"),
+        chunk.metadata.get("origin_path"),
+        chunk.source_id[5:] if str(chunk.source_id).startswith("repo:") else "",
+    ):
+        normalized = _normalize_reference_path(str(raw or ""))
+        if normalized:
+            paths.append(normalized)
+    return _dedupe(paths)
+
+
+def _resolve_linked_sources_from_referenced_path(
+    normalized_path: str,
+    path_to_sources: Dict[str, set],
+) -> List[str]:
+    exact_hits = set(path_to_sources.get(normalized_path, set()))
+    if exact_hits:
+        return sorted(exact_hits)
+
+    suffix_hits: set = set()
+    for known_path, source_ids in path_to_sources.items():
+        if known_path.endswith(normalized_path) or normalized_path.endswith(known_path):
+            suffix_hits.update(source_ids)
+    return sorted(suffix_hits)
 
 
 def _should_apply_recovery(
